@@ -27,6 +27,9 @@ static uint32_t enc_br(uint8_t op, uint8_t a, uint8_t b, int8_t off) {
          | ((uint32_t)b << 16)
          | ((uint32_t)(uint8_t)off << 24);
 }
+static uint32_t enc_syscall(uint16_t id) {
+    return (uint32_t)CVM_OP_SYSCALL | ((uint32_t)id << 16);
+}
 
 /* --- Build a binary blob in memory --------------------------------------- */
 
@@ -37,47 +40,107 @@ static void put_u32(uint8_t *p, uint32_t v) {
     p[3] = (uint8_t)(v >> 24);
 }
 
-static uint8_t *build_blob(const uint32_t *code, uint32_t code_count,
-                           uint32_t bss_size, uint32_t entry,
-                           size_t *out_len)
+static uint8_t *build_blob_full(const uint32_t *code, uint32_t code_count,
+                                uint32_t bss_size, uint32_t entry,
+                                const char * const *imports, uint32_t import_count,
+                                const uint8_t *data, uint32_t data_size,
+                                size_t *out_len)
 {
-    uint32_t section_count = 1 + (bss_size > 0 ? 1 : 0);
-    uint32_t header_size   = 24;
-    uint32_t section_size  = 16;
-    uint32_t table_off     = header_size;
-    uint32_t code_off      = table_off + section_count * section_size;
-    uint32_t code_size     = code_count * 4u;
-    size_t   total         = (size_t)code_off + code_size;
+    uint32_t header_size  = 24;
+    uint32_t section_size = 16;
+
+    /* Compute IMPORTS section size up front. */
+    uint32_t imports_size = 0;
+    if (import_count > 0) {
+        imports_size = 4u + import_count * 4u;
+        for (uint32_t i = 0; i < import_count; ++i)
+            imports_size += (uint32_t)strlen(imports[i]) + 1u;
+    }
+
+    uint32_t section_count =
+          1u                                /* CODE always */
+        + (bss_size > 0 ? 1u : 0u)
+        + (import_count > 0 ? 1u : 0u)
+        + (data_size > 0 ? 1u : 0u);
+
+    uint32_t table_off = header_size;
+    uint32_t cursor    = table_off + section_count * section_size;
+    uint32_t code_off  = cursor;
+    uint32_t code_size = code_count * 4u;
+    cursor += code_size;
+    uint32_t data_off = data_size > 0 ? cursor : 0;
+    cursor += data_size;
+    uint32_t imports_off = imports_size > 0 ? cursor : 0;
+    cursor += imports_size;
+    size_t total = cursor;
 
     uint8_t *buf = (uint8_t *)calloc(1, total);
     if (!buf) { fprintf(stderr, "calloc failed\n"); exit(1); }
 
     buf[0] = 'C'; buf[1] = 'V'; buf[2] = 'M'; buf[3] = '1';
-    put_u32(buf + 4,  0x00010000u);    /* version */
-    put_u32(buf + 8,  0u);             /* flags */
+    put_u32(buf + 4,  0x00010000u);
+    put_u32(buf + 8,  0u);
     put_u32(buf + 12, section_count);
     put_u32(buf + 16, table_off);
     put_u32(buf + 20, entry);
 
-    /* CODE section */
-    put_u32(buf + table_off + 0,  CVM_SEC_CODE);
-    put_u32(buf + table_off + 4,  code_off);
-    put_u32(buf + table_off + 8,  code_size);
-    put_u32(buf + table_off + 12, 0u);
+    uint32_t te = table_off;
+    put_u32(buf + te + 0, CVM_SEC_CODE);
+    put_u32(buf + te + 4, code_off);
+    put_u32(buf + te + 8, code_size);
+    put_u32(buf + te + 12, 0u);
+    te += section_size;
 
+    if (data_size > 0) {
+        put_u32(buf + te + 0, CVM_SEC_DATA);
+        put_u32(buf + te + 4, data_off);
+        put_u32(buf + te + 8, data_size);
+        put_u32(buf + te + 12, 0u);
+        te += section_size;
+    }
     if (bss_size > 0) {
-        uint32_t bss_entry = table_off + section_size;
-        put_u32(buf + bss_entry + 0,  CVM_SEC_BSS);
-        put_u32(buf + bss_entry + 4,  0u);
-        put_u32(buf + bss_entry + 8,  bss_size);
-        put_u32(buf + bss_entry + 12, 0u);
+        put_u32(buf + te + 0, CVM_SEC_BSS);
+        put_u32(buf + te + 4, 0u);
+        put_u32(buf + te + 8, bss_size);
+        put_u32(buf + te + 12, 0u);
+        te += section_size;
+    }
+    if (import_count > 0) {
+        put_u32(buf + te + 0, CVM_SEC_IMPORTS);
+        put_u32(buf + te + 4, imports_off);
+        put_u32(buf + te + 8, imports_size);
+        put_u32(buf + te + 12, 0u);
+        te += section_size;
     }
 
     for (uint32_t i = 0; i < code_count; ++i)
         put_u32(buf + code_off + i * 4u, code[i]);
 
+    if (data_size > 0)
+        memcpy(buf + data_off, data, data_size);
+
+    if (import_count > 0) {
+        uint8_t *p = buf + imports_off;
+        put_u32(p, import_count);
+        uint32_t name_cursor = 4u + import_count * 4u;
+        for (uint32_t i = 0; i < import_count; ++i) {
+            put_u32(p + 4u + i * 4u, name_cursor);
+            size_t L = strlen(imports[i]);
+            memcpy(p + name_cursor, imports[i], L + 1);
+            name_cursor += (uint32_t)L + 1u;
+        }
+    }
+
     *out_len = total;
     return buf;
+}
+
+static uint8_t *build_blob(const uint32_t *code, uint32_t code_count,
+                           uint32_t bss_size, uint32_t entry,
+                           size_t *out_len)
+{
+    return build_blob_full(code, code_count, bss_size, entry,
+                           NULL, 0, NULL, 0, out_len);
 }
 
 /* --- Test harness -------------------------------------------------------- */
@@ -227,6 +290,170 @@ static void test_bad_addr(void) {
     CHECK(r == CVM_E_BAD_ADDR, "bad addr: got %s", cvm_strerror(r));
 }
 
+/* --- Syscall tests ------------------------------------------------------- */
+
+struct print_capture {
+    int32_t value;
+    int     calls;
+};
+
+static int sys_print_int(struct cvm_image *img, int32_t *regs, void *user_data) {
+    (void)img;
+    struct print_capture *cap = (struct print_capture *)user_data;
+    cap->value = regs[0];
+    cap->calls++;
+    regs[0] = 0;  /* return 0 */
+    return 0;
+}
+
+static int sys_add(struct cvm_image *img, int32_t *regs, void *user_data) {
+    (void)img; (void)user_data;
+    regs[0] = regs[0] + regs[1];
+    return 0;
+}
+
+static int sys_print_string(struct cvm_image *img, int32_t *regs, void *user_data) {
+    char *out = (char *)user_data;
+    uint32_t addr = (uint32_t)regs[0];
+    if (addr >= img->heap_size) return 1;
+    char buf[64];
+    size_t max = sizeof(buf) - 1;
+    size_t avail = (size_t)(img->heap_size - addr);
+    if (avail < max) max = avail;
+    if (cvm_heap_read(img, addr, buf, max) != CVM_OK) return 1;
+    size_t i = 0;
+    for (; i < max && buf[i]; ++i) out[i] = buf[i];
+    out[i] = 0;
+    regs[0] = (int32_t)i;
+    return 0;
+}
+
+static int sys_trap(struct cvm_image *img, int32_t *regs, void *user_data) {
+    (void)img; (void)regs; (void)user_data;
+    return 1;  /* trap */
+}
+
+static void test_syscall_hello_int(void) {
+    /* Call cvm_sys_print_int(42), then HALT R0 (which the handler set to 0). */
+    uint32_t code[] = {
+        enc_i16(CVM_OP_MOVI, 0, 42),
+        enc_syscall(0),
+        enc_r  (CVM_OP_HALT, 0, 0, 0),
+    };
+    const char *imports[] = { "cvm_sys_print_int" };
+
+    size_t len;
+    uint8_t *blob = build_blob_full(code, 3, 0, 0, imports, 1, NULL, 0, &len);
+    struct cvm_image img;
+    int r = cvm_load(blob, len, &img);
+    CHECK(r == CVM_OK, "hello: load %s", cvm_strerror(r));
+
+    struct print_capture cap = { 0, 0 };
+    r = cvm_link(&img, "cvm_sys_print_int", sys_print_int, &cap);
+    CHECK(r == CVM_OK, "hello: link %s", cvm_strerror(r));
+
+    int32_t v = -1;
+    r = cvm_run(&img, &v);
+    CHECK(r == CVM_OK,    "hello: run %s", cvm_strerror(r));
+    CHECK(cap.calls == 1, "hello: calls=%d", cap.calls);
+    CHECK(cap.value == 42,"hello: value=%d", cap.value);
+    CHECK(v == 0,         "hello: halt=%d", v);
+
+    cvm_image_free(&img);
+    free(blob);
+}
+
+static void test_syscall_two_args(void) {
+    /* cvm_sys_add(13, 29) → 42 */
+    uint32_t code[] = {
+        enc_i16(CVM_OP_MOVI, 0, 13),
+        enc_i16(CVM_OP_MOVI, 1, 29),
+        enc_syscall(0),
+        enc_r  (CVM_OP_HALT, 0, 0, 0),
+    };
+    const char *imports[] = { "cvm_sys_add" };
+    size_t len;
+    uint8_t *blob = build_blob_full(code, 4, 0, 0, imports, 1, NULL, 0, &len);
+    struct cvm_image img;
+    CHECK(cvm_load(blob, len, &img) == CVM_OK, "two: load");
+    CHECK(cvm_link(&img, "cvm_sys_add", sys_add, NULL) == CVM_OK, "two: link");
+    int32_t v = 0;
+    int r = cvm_run(&img, &v);
+    CHECK(r == CVM_OK, "two: run %s", cvm_strerror(r));
+    CHECK(v == 42,     "two: got %d", v);
+    cvm_image_free(&img); free(blob);
+}
+
+static void test_syscall_print_string(void) {
+    /* DATA contains "hi!\0" at offset 0; bytecode passes addr 0 to print_string. */
+    static const uint8_t data[] = { 'h','i','!',0, 0,0,0,0 };
+    uint32_t code[] = {
+        enc_i16(CVM_OP_MOVI, 0, 0),
+        enc_syscall(0),
+        enc_r  (CVM_OP_HALT, 0, 0, 0),
+    };
+    const char *imports[] = { "cvm_sys_print_string" };
+    size_t len;
+    uint8_t *blob = build_blob_full(code, 3, 0, 0, imports, 1,
+                                    data, sizeof(data), &len);
+    struct cvm_image img;
+    CHECK(cvm_load(blob, len, &img) == CVM_OK, "str: load");
+    char captured[64] = {0};
+    CHECK(cvm_link(&img, "cvm_sys_print_string", sys_print_string, captured) == CVM_OK,
+          "str: link");
+    int32_t v = 0;
+    int r = cvm_run(&img, &v);
+    CHECK(r == CVM_OK,                 "str: run %s", cvm_strerror(r));
+    CHECK(strcmp(captured, "hi!") == 0,"str: captured='%s'", captured);
+    CHECK(v == 3,                      "str: halt len=%d", v);
+    cvm_image_free(&img); free(blob);
+}
+
+static void test_syscall_unlinked(void) {
+    uint32_t code[] = {
+        enc_syscall(0),
+        enc_r(CVM_OP_HALT, 0, 0, 0),
+    };
+    const char *imports[] = { "cvm_sys_missing" };
+    size_t len;
+    uint8_t *blob = build_blob_full(code, 2, 0, 0, imports, 1, NULL, 0, &len);
+    struct cvm_image img;
+    CHECK(cvm_load(blob, len, &img) == CVM_OK, "unlinked: load");
+    int32_t v = 0;
+    int r = cvm_run(&img, &v);
+    CHECK(r == CVM_E_UNLINKED_SYSCALL, "unlinked: got %s", cvm_strerror(r));
+    cvm_image_free(&img); free(blob);
+}
+
+static void test_syscall_no_such_import(void) {
+    const char *imports[] = { "cvm_sys_real" };
+    uint32_t code[] = { enc_r(CVM_OP_HALT, 0, 0, 0) };
+    size_t len;
+    uint8_t *blob = build_blob_full(code, 1, 0, 0, imports, 1, NULL, 0, &len);
+    struct cvm_image img;
+    CHECK(cvm_load(blob, len, &img) == CVM_OK, "nosuch: load");
+    int r = cvm_link(&img, "cvm_sys_imaginary", sys_print_int, NULL);
+    CHECK(r == CVM_E_NO_SUCH_IMPORT, "nosuch: got %s", cvm_strerror(r));
+    cvm_image_free(&img); free(blob);
+}
+
+static void test_syscall_trap(void) {
+    uint32_t code[] = {
+        enc_syscall(0),
+        enc_r(CVM_OP_HALT, 0, 0, 0),
+    };
+    const char *imports[] = { "cvm_sys_trap" };
+    size_t len;
+    uint8_t *blob = build_blob_full(code, 2, 0, 0, imports, 1, NULL, 0, &len);
+    struct cvm_image img;
+    CHECK(cvm_load(blob, len, &img) == CVM_OK, "trap: load");
+    CHECK(cvm_link(&img, "cvm_sys_trap", sys_trap, NULL) == CVM_OK, "trap: link");
+    int32_t v = 0;
+    int r = cvm_run(&img, &v);
+    CHECK(r == CVM_E_SYSCALL_TRAP, "trap: got %s", cvm_strerror(r));
+    cvm_image_free(&img); free(blob);
+}
+
 static void test_loader_rejects(void) {
     /* Bad magic */
     uint8_t bogus[24] = {0};
@@ -249,6 +476,12 @@ int main(void) {
     test_jmp();
     test_bad_addr();
     test_loader_rejects();
+    test_syscall_hello_int();
+    test_syscall_two_args();
+    test_syscall_print_string();
+    test_syscall_unlinked();
+    test_syscall_no_such_import();
+    test_syscall_trap();
 
     if (g_failures) {
         fprintf(stderr, "%d test(s) failed\n", g_failures);

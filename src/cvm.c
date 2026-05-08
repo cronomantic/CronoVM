@@ -96,9 +96,29 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
     uint64_t heap_total = (uint64_t)data_size + (uint64_t)bss_size;
     if (heap_total > 0xFFFFFFFFu) return CVM_E_BAD_SECTION;
 
-    uint32_t *code = (uint32_t *)malloc((size_t)code_size);
-    uint8_t  *heap = NULL;
-    void     *imports = NULL;
+    /* Pre-validate IMPORTS layout before any allocation. */
+    uint32_t import_count = 0;
+    if (imports_size > 0) {
+        if (imports_size < 4) return CVM_E_BAD_IMPORTS;
+        const uint8_t *ip = base + imports_off;
+        import_count = read_u32_le(ip);
+        if (import_count > 0xFFFFu) return CVM_E_BAD_IMPORTS;
+        uint64_t entries_end = 4u + (uint64_t)import_count * 4u;
+        if (entries_end > imports_size) return CVM_E_BAD_IMPORTS;
+        for (uint32_t i = 0; i < import_count; ++i) {
+            uint32_t name_off = read_u32_le(ip + 4u + (size_t)i * 4u);
+            if (name_off >= imports_size) return CVM_E_BAD_IMPORTS;
+            if (memchr(ip + name_off, 0, imports_size - name_off) == NULL)
+                return CVM_E_BAD_IMPORTS;
+        }
+    }
+
+    uint32_t       *code         = (uint32_t *)malloc((size_t)code_size);
+    uint8_t        *heap         = NULL;
+    char           *import_blob  = NULL;
+    char          **import_names = NULL;
+    cvm_syscall_fn *import_fns   = NULL;
+    void          **import_ud    = NULL;
     if (!code) goto oom;
 
     if (heap_total > 0) {
@@ -106,8 +126,14 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
         if (!heap) goto oom;
     }
     if (imports_size > 0) {
-        imports = malloc((size_t)imports_size);
-        if (!imports) goto oom;
+        import_blob = (char *)malloc((size_t)imports_size);
+        if (!import_blob) goto oom;
+        if (import_count > 0) {
+            import_names = (char **)calloc(import_count, sizeof(char *));
+            import_fns   = (cvm_syscall_fn *)calloc(import_count, sizeof(cvm_syscall_fn));
+            import_ud    = (void **)calloc(import_count, sizeof(void *));
+            if (!import_names || !import_fns || !import_ud) goto oom;
+        }
     }
 
     for (uint32_t i = 0; i < code_count; ++i)
@@ -115,22 +141,35 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
 
     if (data_size) memcpy(heap, base + data_off, data_size);
     if (bss_size)  memset(heap + data_size, 0, bss_size);
-    if (imports_size) memcpy(imports, base + imports_off, imports_size);
 
-    out->code         = code;
-    out->code_count   = code_count;
-    out->heap         = heap;
-    out->heap_size    = (uint32_t)heap_total;
-    out->data_size    = data_size;
-    out->entry        = entry;
-    out->imports      = imports;
-    out->imports_size = imports_size;
+    if (imports_size > 0) {
+        memcpy(import_blob, base + imports_off, imports_size);
+        for (uint32_t i = 0; i < import_count; ++i) {
+            uint32_t name_off = read_u32_le((uint8_t *)import_blob + 4u + (size_t)i * 4u);
+            import_names[i] = import_blob + name_off;
+        }
+    }
+
+    out->code             = code;
+    out->code_count       = code_count;
+    out->heap             = heap;
+    out->heap_size        = (uint32_t)heap_total;
+    out->data_size        = data_size;
+    out->entry            = entry;
+    out->import_count     = import_count;
+    out->import_names     = import_names;
+    out->import_fns       = import_fns;
+    out->import_userdata  = import_ud;
+    out->_import_blob     = import_blob;
     return CVM_OK;
 
 oom:
     free(code);
     free(heap);
-    free(imports);
+    free(import_blob);
+    free(import_names);
+    free(import_fns);
+    free(import_ud);
     return CVM_E_NOMEM;
 }
 
@@ -138,8 +177,41 @@ void cvm_image_free(struct cvm_image *img) {
     if (!img) return;
     free(img->code);
     free(img->heap);
-    free(img->imports);
+    free(img->import_names);
+    free(img->import_fns);
+    free(img->import_userdata);
+    free(img->_import_blob);
     memset(img, 0, sizeof(*img));
+}
+
+int cvm_link(struct cvm_image *img, const char *name,
+             cvm_syscall_fn fn, void *user_data)
+{
+    if (!img || !name) return CVM_E_NO_SUCH_IMPORT;
+    for (uint32_t i = 0; i < img->import_count; ++i) {
+        if (strcmp(img->import_names[i], name) == 0) {
+            img->import_fns[i]      = fn;
+            img->import_userdata[i] = user_data;
+            return CVM_OK;
+        }
+    }
+    return CVM_E_NO_SUCH_IMPORT;
+}
+
+int cvm_heap_read(struct cvm_image *img, uint32_t addr, void *out, size_t n) {
+    if (!img || !out) return CVM_E_BAD_ADDR;
+    if (addr > img->heap_size || (size_t)(img->heap_size - addr) < n)
+        return CVM_E_BAD_ADDR;
+    memcpy(out, img->heap + addr, n);
+    return CVM_OK;
+}
+
+int cvm_heap_write(struct cvm_image *img, uint32_t addr, const void *in, size_t n) {
+    if (!img || !in) return CVM_E_BAD_ADDR;
+    if (addr > img->heap_size || (size_t)(img->heap_size - addr) < n)
+        return CVM_E_BAD_ADDR;
+    memcpy(img->heap + addr, in, n);
+    return CVM_OK;
 }
 
 const char *cvm_strerror(int result) {
@@ -153,10 +225,15 @@ const char *cvm_strerror(int result) {
     case CVM_E_NO_CODE:     return "missing code section";
     case CVM_E_BAD_ENTRY:   return "entry out of range";
     case CVM_E_NOMEM:       return "out of memory";
-    case CVM_E_BAD_OPCODE:  return "unknown opcode";
-    case CVM_E_BAD_PC:      return "pc out of range";
-    case CVM_E_BAD_ADDR:    return "memory access out of bounds";
-    default:                return "unknown error";
+    case CVM_E_BAD_OPCODE:       return "unknown opcode";
+    case CVM_E_BAD_PC:           return "pc out of range";
+    case CVM_E_BAD_ADDR:         return "memory access out of bounds";
+    case CVM_E_BAD_IMPORTS:      return "malformed imports section";
+    case CVM_E_NO_SUCH_IMPORT:   return "no import with that name";
+    case CVM_E_BAD_SYSCALL:      return "syscall id out of range";
+    case CVM_E_UNLINKED_SYSCALL: return "syscall has no host handler";
+    case CVM_E_SYSCALL_TRAP:     return "syscall handler returned a trap";
+    default:                     return "unknown error";
     }
 }
 
@@ -198,17 +275,18 @@ int cvm_run(struct cvm_image *img, int32_t *return_value) {
 
 #if CVM_THREADED
     static const void *const jt[256] = {
-        [CVM_OP_HALT] = &&L_HALT,
-        [CVM_OP_MOVI] = &&L_MOVI,
-        [CVM_OP_MOV]  = &&L_MOV,
-        [CVM_OP_ADD]  = &&L_ADD,
-        [CVM_OP_SUB]  = &&L_SUB,
-        [CVM_OP_MUL]  = &&L_MUL,
-        [CVM_OP_LDW]  = &&L_LDW,
-        [CVM_OP_STW]  = &&L_STW,
-        [CVM_OP_JMP]  = &&L_JMP,
-        [CVM_OP_BEQ]  = &&L_BEQ,
-        [CVM_OP_BNE]  = &&L_BNE,
+        [CVM_OP_HALT]    = &&L_HALT,
+        [CVM_OP_MOVI]    = &&L_MOVI,
+        [CVM_OP_MOV]     = &&L_MOV,
+        [CVM_OP_ADD]     = &&L_ADD,
+        [CVM_OP_SUB]     = &&L_SUB,
+        [CVM_OP_MUL]     = &&L_MUL,
+        [CVM_OP_LDW]     = &&L_LDW,
+        [CVM_OP_STW]     = &&L_STW,
+        [CVM_OP_JMP]     = &&L_JMP,
+        [CVM_OP_BEQ]     = &&L_BEQ,
+        [CVM_OP_BNE]     = &&L_BNE,
+        [CVM_OP_SYSCALL] = &&L_SYSCALL,
     };
 
 #  define DISPATCH() do {                                  \
@@ -269,6 +347,15 @@ int cvm_run(struct cvm_image *img, int32_t *return_value) {
     L_BNE:
         if (R[a] != R[b]) pc = (uint32_t)((int32_t)pc + (int32_t)(int8_t)c);
         DISPATCH();
+    L_SYSCALL: {
+        uint32_t id = (uint32_t)(uint16_t)(inst >> 16);
+        if (id >= img->import_count)        return CVM_E_BAD_SYSCALL;
+        cvm_syscall_fn fn = img->import_fns[id];
+        if (!fn)                            return CVM_E_UNLINKED_SYSCALL;
+        if (fn(img, R, img->import_userdata[id]) != 0)
+            return CVM_E_SYSCALL_TRAP;
+        DISPATCH();
+    }
 
 #  undef DISPATCH
 
@@ -319,6 +406,15 @@ int cvm_run(struct cvm_image *img, int32_t *return_value) {
         case CVM_OP_BNE:
             if (R[a] != R[b]) pc = (uint32_t)((int32_t)pc + (int32_t)(int8_t)c);
             break;
+        case CVM_OP_SYSCALL: {
+            uint32_t id = (uint32_t)(uint16_t)(inst >> 16);
+            if (id >= img->import_count)        return CVM_E_BAD_SYSCALL;
+            cvm_syscall_fn fn = img->import_fns[id];
+            if (!fn)                            return CVM_E_UNLINKED_SYSCALL;
+            if (fn(img, R, img->import_userdata[id]) != 0)
+                return CVM_E_SYSCALL_TRAP;
+            break;
+        }
         default:
             return CVM_E_BAD_OPCODE;
         }

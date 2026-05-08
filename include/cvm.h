@@ -52,6 +52,11 @@ enum cvm_result {
     CVM_E_BAD_OPCODE,
     CVM_E_BAD_PC,
     CVM_E_BAD_ADDR,
+    CVM_E_BAD_IMPORTS,
+    CVM_E_NO_SUCH_IMPORT,
+    CVM_E_BAD_SYSCALL,
+    CVM_E_UNLINKED_SYSCALL,
+    CVM_E_SYSCALL_TRAP,
 };
 
 /* ---------------------------------------------------------------------------
@@ -72,27 +77,43 @@ enum cvm_result {
  *     JMP   ABC=imm24 (signed)             pc += imm24   (relative to next ins)
  *     BEQ   A=rs1, B=rs2, C=imm8 (signed)  if R[A]==R[B] pc += imm8
  *     BNE                                  if R[A]!=R[B] pc += imm8
+ *     SYSCALL  BC=imm16 (unsigned)         invoke import #imm16
  *
  * All arithmetic is 32-bit two's-complement with wrap-around semantics.
  * Branch offsets are in instructions, relative to the instruction *after*
  * the branch (so offset 0 means fall through).
+ *
+ * SYSCALL invokes the host handler registered for import index imm16.
+ * Args go in R0..R7, return value in R0. See docs/syscalls.md.
  * ------------------------------------------------------------------------- */
 
 enum cvm_opcode {
-    CVM_OP_HALT = 0x00,
-    CVM_OP_MOVI = 0x01,
-    CVM_OP_MOV  = 0x02,
-    CVM_OP_ADD  = 0x03,
-    CVM_OP_SUB  = 0x04,
-    CVM_OP_MUL  = 0x05,
-    CVM_OP_LDW  = 0x06,
-    CVM_OP_STW  = 0x07,
-    CVM_OP_JMP  = 0x08,
-    CVM_OP_BEQ  = 0x09,
-    CVM_OP_BNE  = 0x0A,
+    CVM_OP_HALT    = 0x00,
+    CVM_OP_MOVI    = 0x01,
+    CVM_OP_MOV     = 0x02,
+    CVM_OP_ADD     = 0x03,
+    CVM_OP_SUB     = 0x04,
+    CVM_OP_MUL     = 0x05,
+    CVM_OP_LDW     = 0x06,
+    CVM_OP_STW     = 0x07,
+    CVM_OP_JMP     = 0x08,
+    CVM_OP_BEQ     = 0x09,
+    CVM_OP_BNE     = 0x0A,
+    CVM_OP_SYSCALL = 0x0B,
 };
 
 #define CVM_REG_COUNT 256
+#define CVM_SYSCALL_MAX_ARGS 8
+
+struct cvm_image;
+
+/* Host-provided syscall handler. Reads args from regs[0..N-1] (where N is the
+ * arity declared by the host for that syscall) and writes the return value
+ * to regs[0]. Returns 0 on success, nonzero to trap the VM with
+ * CVM_E_SYSCALL_TRAP. See docs/syscalls.md. */
+typedef int (*cvm_syscall_fn)(struct cvm_image *img,
+                              int32_t *regs,
+                              void *user_data);
 
 struct cvm_image {
     uint32_t *code;
@@ -106,17 +127,49 @@ struct cvm_image {
 
     uint32_t  entry;
 
-    /* Raw IMPORTS blob — shape is deferred until the syscall ABI is pinned. */
-    void     *imports;
-    uint32_t  imports_size;
+    /* Imports: parsed from the IMPORTS section. import_names[i] is the
+     * NUL-terminated symbol the host should resolve via cvm_link. The fn /
+     * userdata arrays are NULL until cvm_link sets them. */
+    uint32_t          import_count;
+    char            **import_names;
+    cvm_syscall_fn   *import_fns;
+    void            **import_userdata;
+    char             *_import_blob;   /* internal: backing storage for names */
 };
+
+/* ---------------------------------------------------------------------------
+ * Loader / lifecycle
+ * ------------------------------------------------------------------------- */
 
 int  cvm_load(const void *bytes, size_t len, struct cvm_image *out);
 void cvm_image_free(struct cvm_image *img);
 const char *cvm_strerror(int result);
 
-/* Run img to completion. On CVM_OK, *return_value (if non-null) holds the
- * value of the register named in the HALT instruction's A field. */
+/* ---------------------------------------------------------------------------
+ * Linking — bind a host C function to the named import.
+ *
+ *   Returns CVM_OK on success, CVM_E_NO_SUCH_IMPORT if no import has that
+ *   name. Repeated calls with the same name overwrite the prior handler.
+ * ------------------------------------------------------------------------- */
+
+int cvm_link(struct cvm_image *img,
+             const char *name,
+             cvm_syscall_fn fn,
+             void *user_data);
+
+/* ---------------------------------------------------------------------------
+ * Heap helpers (bounds-checked) for syscalls that read/write VM memory.
+ * Return CVM_OK on success or CVM_E_BAD_ADDR on out-of-range access.
+ * ------------------------------------------------------------------------- */
+
+int cvm_heap_read (struct cvm_image *img, uint32_t addr, void *out, size_t n);
+int cvm_heap_write(struct cvm_image *img, uint32_t addr, const void *in, size_t n);
+
+/* ---------------------------------------------------------------------------
+ * Run img to completion. On CVM_OK, *return_value (if non-null) holds the
+ * value of the register named in the HALT instruction's A field.
+ * ------------------------------------------------------------------------- */
+
 int  cvm_run(struct cvm_image *img, int32_t *return_value);
 
 #ifdef __cplusplus
