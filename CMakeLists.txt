@@ -24,3 +24,6 @@ target_compile_options(test_vm PRIVATE
     $<$<C_COMPILER_ID:MSVC>:/W4>
 )
 add_test(NAME vm_basic COMMAND test_vm)
+
+# --- Optional: translator (requires LLVM dev install with llvm-config) ----
+add_subdirectory(tools/translator)
