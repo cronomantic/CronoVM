@@ -7,7 +7,7 @@ mechanism is open by design.
 
 ## End-to-end flow
 
-```
+```text
        user.c                     game.bin                   host program
    ┌───────────────┐          ┌──────────────┐          ┌──────────────────┐
    │ cvm_sys_print │  clang   │  IMPORTS:    │  load    │ cvm_link(img,    │
@@ -37,10 +37,10 @@ by string match, so a hand-assembled binary may use any names it likes.
 ## Calling convention (v1.0)
 
 | Slot | Carries |
-|------|---------|
+| ---- | ------- |
 | `R0..R7` | Arguments (left to right). At most 8 args. |
-| `R0`     | Return value, written by the handler. |
-| `R8..`   | Caller-saved scratch — handlers should not rely on these being preserved. |
+| `R0` | Return value, written by the handler. |
+| `R8..` | Caller-saved scratch — handlers should not rely on these being preserved. |
 
 Argument and return types are 32-bit. Wider types and aggregates will be
 addressed when the calling convention work lands; for now, passing pointers
@@ -108,7 +108,7 @@ responsible for binding everything the binary needs. (The host can iterate
 
 ## IMPORTS section layout
 
-```
+```text
 offset 0    u32   import_count
 offset 4    u32 × import_count   name_offset[i]   (offset within section)
             u8[]                 NUL-terminated name strings

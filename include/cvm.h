@@ -168,9 +168,17 @@ int cvm_heap_write(struct cvm_image *img, uint32_t addr, const void *in, size_t 
 /* ---------------------------------------------------------------------------
  * Run img to completion. On CVM_OK, *return_value (if non-null) holds the
  * value of the register named in the HALT instruction's A field.
+ *
+ * cvm_run_args additionally seeds R[0..arg_count-1] with the supplied
+ * values before the first instruction executes — useful while a proper
+ * CALL/RET ABI is still being designed and the host needs to invoke a
+ * translated function with arguments.
  * ------------------------------------------------------------------------- */
 
 int  cvm_run(struct cvm_image *img, int32_t *return_value);
+int  cvm_run_args(struct cvm_image *img,
+                  const int32_t *args, uint32_t arg_count,
+                  int32_t *return_value);
 
 #ifdef __cplusplus
 }

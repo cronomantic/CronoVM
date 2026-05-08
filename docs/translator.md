@@ -4,27 +4,49 @@ The translator is the tool that turns LLVM bitcode (produced by Clang) into
 CronoVM bytecode. It lives in `tools/translator/` and is built as
 `cvm-translate`.
 
-```
+```text
 user.c ──[ clang -emit-llvm ]──▶ user.bc ──[ cvm-translate ]──▶ game.bin
 ```
 
 The translator is **not** part of the runtime. The VM binary you ship with
 your game has zero LLVM dependency.
 
-## Status (step 4)
+## Status (step 5)
 
-This step builds only the **parsing + subset validation** half of the
-translator. It reads a `.bc` file, walks its module, and reports any IR
-construct outside the supported subset. It does not yet emit bytecode —
-that's step 5.
+The parsing + subset validation half is complete, and codegen now exists
+for a deliberately narrow case: **a single function with straight-line
+scalar arithmetic, integer parameters, and a single `ret`**. Anything else
+is rejected with a clear message. Multi-block control flow, allocas, and
+calls between user functions are work for steps 6–7 (calling convention
+and broader codegen coverage).
 
-```
-$ cvm-translate build/add.bc
+```text
+$ cvm-translate build/add.bc                 # validate only
 module: tests/fixtures/add.c
-function add(i32, i32) -> i32 [1 block, 8 instructions]
-function sub_mul(i32, i32, i32) -> i32 [1 block, 12 instructions]
+function add(i32, i32) -> i32 [1 block, 2 instructions]
 translator: ok
+
+$ cvm-translate build/add.bc -o build/add.bin
+module: tests/fixtures/add.c
+function add(i32, i32) -> i32 [1 block, 2 instructions]
+translator: wrote build/add.bin (2 instructions)
 ```
+
+The `add(int, int)` example produces exactly two CronoVM instructions:
+
+```text
+ADD  R2, R0, R1     ; R2 = R0 + R1     (params arrive in R0..R(N-1))
+HALT R2             ; return R2
+```
+
+## Required input: -O1 (or higher)
+
+Until alloca lowering lands, **bitcode for codegen must be compiled with
+`-O1` or higher** so Clang's `mem2reg` pass has run and the IR is in clean
+SSA form. With `-O0`, parameters live in `alloca` stack slots and
+`load`/`store` shuffles them around — codegen will reject this.
+
+Validation alone (no `-o`) accepts any optimisation level.
 
 ## Supported IR subset (v1.0)
 
@@ -42,11 +64,11 @@ the translator rejects with a clear message; that's a feature, not a bug.
 ### Types rejected
 
 | Type | Reason |
-|------|--------|
-| `i64` and wider integers       | deferred to int64 opcodes |
+| ---- | ------ |
+| `i64` and wider integers | deferred to int64 opcodes |
 | `half`, `float`, `double`, etc. | deferred to float64 opcodes |
-| vectors (`<N x T>`)            | not in the subset; games target scalars |
-| address spaces other than 0    | not supported |
+| vectors (`<N x T>`) | not in the subset; games target scalars |
+| address spaces other than 0 | not supported |
 | `token`, `x86_amx`, target_ext | not in the subset |
 
 ### Instructions accepted
@@ -63,36 +85,33 @@ the translator rejects with a clear message; that's a feature, not a bug.
 ### Instructions rejected
 
 | Family | Examples | Reason |
-|--------|----------|--------|
+| ------ | -------- | ------ |
 | floating-point | `fadd`, `fmul`, `fcmp`, `sitofp`, ... | deferred to float64 |
-| exceptions     | `invoke`, `landingpad`, `resume`, `cleanuppad` | not in subset |
+| exceptions | `invoke`, `landingpad`, `resume`, `cleanuppad` | not in subset |
 | atomics/fences | `cmpxchg`, `atomicrmw`, `fence` | not in subset |
-| vectors        | `extractelement`, `shufflevector`, ... | not in subset |
-| variadic       | `va_arg` | not in subset |
+| vectors | `extractelement`, `shufflevector`, ... | not in subset |
+| variadic | `va_arg` | not in subset |
 | indirect calls | `indirectbr`, `callbr` | not in subset |
 | `freeze`, `addrspacecast` | | not yet supported |
 
 ## Invoking the translator
 
-```
-cvm-translate <input.bc>
+```text
+cvm-translate [-o <out.bin>] <input.bc>
 ```
 
 Exit codes:
-- `0` — input is in the supported subset
-- `1` — input has issues; messages on stderr
+
+- `0` — success (validated, and emitted if `-o` was supplied)
+- `1` — input has issues, or write failed; messages on stderr
 - `2` — usage error
 
 The expected pipeline (until `gamecc` is built) is:
 
 ```sh
-clang -emit-llvm -O0 -c user.c -o user.bc
-cvm-translate user.bc
+clang -emit-llvm -O1 -c user.c -o user.bc
+cvm-translate user.bc -o game.bin
 ```
-
-`-O0` is fine for now — the IR Clang emits at any optimisation level is
-within the subset as long as the source code is. Higher `-O` produces
-smaller IR with more aggressive transforms; the translator handles either.
 
 ## Adding new IR support
 
@@ -102,8 +121,9 @@ When the time comes to broaden the subset (e.g. enabling `i64`):
 2. Add the opcodes to the interpreter in `src/cvm.c`.
 3. Update `type_in_subset` and `opcode_in_subset` in
    `tools/translator/translator.c` to admit the construct.
-4. Once codegen lands (step 5+), update the codegen table.
+4. Update the codegen table in `cg_function` to lower it.
 
-Order matters: bytecode/interpreter first, translator validation second.
-The subset is the contract — it should always be the *intersection* of what
-the interpreter understands and what the translator promises to handle.
+Order matters: bytecode/interpreter first, translator validation second,
+codegen last. The subset is the contract — it should always be the
+*intersection* of what the interpreter understands and what the translator
+promises to handle.

@@ -258,11 +258,21 @@ const char *cvm_strerror(int result) {
 #endif
 
 int cvm_run(struct cvm_image *img, int32_t *return_value) {
+    return cvm_run_args(img, NULL, 0, return_value);
+}
+
+int cvm_run_args(struct cvm_image *img,
+                 const int32_t *args, uint32_t arg_count,
+                 int32_t *return_value)
+{
     if (!img || !img->code || img->code_count == 0) return CVM_E_BAD_PC;
     if (img->entry >= img->code_count)              return CVM_E_BAD_ENTRY;
+    if (arg_count > CVM_REG_COUNT)                  return CVM_E_BAD_ADDR;
 
     int32_t  R[CVM_REG_COUNT];
     memset(R, 0, sizeof(R));
+    if (args && arg_count > 0)
+        memcpy(R, args, arg_count * sizeof(int32_t));
 
     const uint32_t *code       = img->code;
     const uint32_t  code_count = img->code_count;

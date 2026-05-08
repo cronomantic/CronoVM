@@ -25,5 +25,12 @@ target_compile_options(test_vm PRIVATE
 )
 add_test(NAME vm_basic COMMAND test_vm)
 
+add_executable(test_e2e tests/test_e2e.c)
+target_link_libraries(test_e2e PRIVATE cvm)
+target_compile_options(test_e2e PRIVATE
+    $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic>
+    $<$<C_COMPILER_ID:MSVC>:/W4>
+)
+
 # --- Optional: translator (requires LLVM dev install with llvm-config) ----
 add_subdirectory(tools/translator)

@@ -3,7 +3,7 @@
 CronoVM is **register-based**, with a flat 256-entry register file (`R0..R255`)
 of 32-bit signed integers. Every instruction is **32 bits, little-endian**:
 
-```
+```text
  31           24 23           16 15            8 7             0
 +---------------+---------------+---------------+---------------+
 |       C       |       B       |       A       |    opcode     |
@@ -16,20 +16,20 @@ an offset of `0` means "fall through to the next instruction".
 
 ## Opcode table
 
-| ID   | Mnemonic  | Form              | Effect |
-|-----:|-----------|-------------------|--------|
-| 0x00 | `HALT`    | `A`               | Stop. Return value is `R[A]`. |
-| 0x01 | `MOVI`    | `A, imm16`        | `R[A] = sext(imm16)` |
-| 0x02 | `MOV`     | `A, B`            | `R[A] = R[B]` |
-| 0x03 | `ADD`     | `A, B, C`         | `R[A] = R[B] + R[C]` |
-| 0x04 | `SUB`     | `A, B, C`         | `R[A] = R[B] - R[C]` |
-| 0x05 | `MUL`     | `A, B, C`         | `R[A] = R[B] * R[C]` |
-| 0x06 | `LDW`     | `A, B`            | `R[A] = *(i32*)(heap + R[B])` |
-| 0x07 | `STW`     | `B, C`            | `*(i32*)(heap + R[B]) = R[C]` |
-| 0x08 | `JMP`     | `imm24 (signed)`  | `pc += imm24` |
-| 0x09 | `BEQ`     | `A, B, imm8`      | if `R[A] == R[B]` then `pc += imm8` |
-| 0x0A | `BNE`     | `A, B, imm8`      | if `R[A] != R[B]` then `pc += imm8` |
-| 0x0B | `SYSCALL` | `imm16`           | Invoke import #imm16. See [syscalls.md](syscalls.md). |
+| ID | Mnemonic | Form | Effect |
+| -: | -------- | ---- | ------ |
+| 0x00 | `HALT` | `A` | Stop. Return value is `R[A]`. |
+| 0x01 | `MOVI` | `A, imm16` | `R[A] = sext(imm16)` |
+| 0x02 | `MOV` | `A, B` | `R[A] = R[B]` |
+| 0x03 | `ADD` | `A, B, C` | `R[A] = R[B] + R[C]` |
+| 0x04 | `SUB` | `A, B, C` | `R[A] = R[B] - R[C]` |
+| 0x05 | `MUL` | `A, B, C` | `R[A] = R[B] * R[C]` |
+| 0x06 | `LDW` | `A, B` | `R[A] = *(i32*)(heap + R[B])` |
+| 0x07 | `STW` | `B, C` | `*(i32*)(heap + R[B]) = R[C]` |
+| 0x08 | `JMP` | `imm24 (signed)` | `pc += imm24` |
+| 0x09 | `BEQ` | `A, B, imm8` | if `R[A] == R[B]` then `pc += imm8` |
+| 0x0A | `BNE` | `A, B, imm8` | if `R[A] != R[B]` then `pc += imm8` |
+| 0x0B | `SYSCALL` | `imm16` | Invoke import #imm16. See [syscalls.md](syscalls.md). |
 
 ### Forms
 
@@ -55,14 +55,14 @@ calls are not yet defined.
 
 ## Errors raised by the interpreter
 
-| Code                       | When |
-|----------------------------|------|
-| `CVM_E_BAD_OPCODE`         | Fetched word's low byte is not a defined opcode. |
-| `CVM_E_BAD_PC`             | `pc` advanced past the end of CODE. |
-| `CVM_E_BAD_ADDR`           | `LDW`/`STW` would read or write outside the heap. |
-| `CVM_E_BAD_SYSCALL`        | `SYSCALL imm16` references an out-of-range import. |
-| `CVM_E_UNLINKED_SYSCALL`   | Import has no host handler bound. |
-| `CVM_E_SYSCALL_TRAP`       | Host handler returned non-zero. |
+| Code | When |
+| ---- | ---- |
+| `CVM_E_BAD_OPCODE` | Fetched word's low byte is not a defined opcode. |
+| `CVM_E_BAD_PC` | `pc` advanced past the end of CODE. |
+| `CVM_E_BAD_ADDR` | `LDW`/`STW` would read or write outside the heap. |
+| `CVM_E_BAD_SYSCALL` | `SYSCALL imm16` references an out-of-range import. |
+| `CVM_E_UNLINKED_SYSCALL` | Import has no host handler bound. |
+| `CVM_E_SYSCALL_TRAP` | Host handler returned non-zero. |
 
 ## What's not here yet
 
