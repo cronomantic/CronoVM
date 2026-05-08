@@ -45,20 +45,27 @@ appear in any order after the section table.
 | 3 | `BSS` | no | Zero-filled bytes appended after DATA on the heap. `file_off` must be 0. |
 | 4 | `IMPORTS` | no | Symbol table of host syscalls; see [syscalls.md](syscalls.md). |
 | 5 | `DEBUG` | no | Opaque blob ignored by the loader. |
+| 6 | `HEAP_RESERVE` | no | Zero-filled free region appended after BSS for the user-side allocator; see [memory.md](memory.md). `file_off` must be 0. |
 
 Each type may appear at most once except `DEBUG`. CODE is required.
 
 ## Heap layout
 
 After loading, the heap is a single contiguous allocation of
-`data_size + bss_size` bytes:
+`data_size + bss_size + heap_reserve` bytes:
 
 ```text
-heap +----+----+----+----+----+----+----+----+
-     | DATA bytes        | zeroed BSS bytes  |
-     +----+----+----+----+----+----+----+----+
-0                     data_size           heap_size
+heap +----+----+----+----+----+----+----+----+----+----+
+     | DATA bytes  | zeroed BSS  | free region for      |
+     |             |             | the user allocator   |
+     +----+----+----+----+----+----+----+----+----+----+
+0          data_size      data_size+bss_size       heap_size
 ```
+
+`heap_reserve` is the size of the free region; it comes from the optional
+`HEAP_RESERVE` section. Binaries that don't include the section get a
+heap of just `data_size + bss_size` bytes and have no run-time allocation
+budget. See [memory.md](memory.md).
 
 VM-side addresses are 32-bit byte offsets into this region. Loads and stores
 are bounds-checked.

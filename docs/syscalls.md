@@ -34,6 +34,22 @@ import by the translator. Other functions are translated to bytecode normally.
 This is a **translator-side convention**; the runtime resolves imports purely
 by string match, so a hand-assembled binary may use any names it likes.
 
+## Built-in syscalls
+
+A handful of syscalls describe properties of the loaded image itself and
+have no host-policy involved. The runtime registers default handlers for
+them on every load, so the host doesn't need to bind them (though it may
+override them):
+
+| Name | Returns | Purpose |
+| ---- | ------- | ------- |
+| `cvm_sys_heap_start` | first byte after DATA+BSS | Start of the free region; see [memory.md](memory.md). |
+| `cvm_sys_heap_size` | size of the free region in bytes | Equal to the binary's `HEAP_RESERVE` section size, or 0 if absent. |
+
+These exist because the user-side allocator needs to know where its
+working memory lives, and the answer depends on the loaded image, not on
+host policy.
+
 ## Calling convention (v1.0)
 
 | Slot | Carries |
@@ -83,10 +99,13 @@ To expose a new host capability:
 
 1. **Pick a name** with the `cvm_sys_` prefix, e.g. `cvm_sys_play_sound`.
 2. **Declare it** in a header the user code includes:
+
    ```c
    extern void cvm_sys_play_sound(int32_t channel, int32_t freq);
    ```
+
 3. **Write the handler** in your host program:
+
    ```c
    static int my_play_sound(struct cvm_image *img, int32_t *regs, void *ud) {
        (void)img;
@@ -96,7 +115,9 @@ To expose a new host capability:
        return 0;
    }
    ```
+
 4. **Bind it** before calling `cvm_run`:
+
    ```c
    cvm_link(&img, "cvm_sys_play_sound", my_play_sound, &my_engine);
    ```
