@@ -15,3 +15,12 @@ target_compile_options(cvm PRIVATE
     $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic>
     $<$<C_COMPILER_ID:MSVC>:/W4>
 )
+
+enable_testing()
+add_executable(test_vm tests/test_vm.c)
+target_link_libraries(test_vm PRIVATE cvm)
+target_compile_options(test_vm PRIVATE
+    $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic>
+    $<$<C_COMPILER_ID:MSVC>:/W4>
+)
+add_test(NAME vm_basic COMMAND test_vm)

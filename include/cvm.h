@@ -49,7 +49,50 @@ enum cvm_result {
     CVM_E_NO_CODE,
     CVM_E_BAD_ENTRY,
     CVM_E_NOMEM,
+    CVM_E_BAD_OPCODE,
+    CVM_E_BAD_PC,
+    CVM_E_BAD_ADDR,
 };
+
+/* ---------------------------------------------------------------------------
+ * Instruction set (v1.0)
+ *
+ * Every instruction is 32 bits, little-endian:
+ *     [ opcode:8 | A:8 | B:8 | C:8 ]
+ *
+ * Field interpretation per opcode (R = 256-entry i32 register file):
+ *     HALT  A=rs1                          stop, return R[A]
+ *     MOVI  A=rd, BC=imm16 (signed)        R[A] = sext(imm16)
+ *     MOV   A=rd, B=rs1                    R[A] = R[B]
+ *     ADD   A=rd, B=rs1, C=rs2             R[A] = R[B] + R[C]
+ *     SUB                                  R[A] = R[B] - R[C]
+ *     MUL                                  R[A] = R[B] * R[C]
+ *     LDW   A=rd, B=rs1                    R[A] = *(i32*)(heap + R[B])
+ *     STW   B=rs1, C=rs2                   *(i32*)(heap + R[B]) = R[C]
+ *     JMP   ABC=imm24 (signed)             pc += imm24   (relative to next ins)
+ *     BEQ   A=rs1, B=rs2, C=imm8 (signed)  if R[A]==R[B] pc += imm8
+ *     BNE                                  if R[A]!=R[B] pc += imm8
+ *
+ * All arithmetic is 32-bit two's-complement with wrap-around semantics.
+ * Branch offsets are in instructions, relative to the instruction *after*
+ * the branch (so offset 0 means fall through).
+ * ------------------------------------------------------------------------- */
+
+enum cvm_opcode {
+    CVM_OP_HALT = 0x00,
+    CVM_OP_MOVI = 0x01,
+    CVM_OP_MOV  = 0x02,
+    CVM_OP_ADD  = 0x03,
+    CVM_OP_SUB  = 0x04,
+    CVM_OP_MUL  = 0x05,
+    CVM_OP_LDW  = 0x06,
+    CVM_OP_STW  = 0x07,
+    CVM_OP_JMP  = 0x08,
+    CVM_OP_BEQ  = 0x09,
+    CVM_OP_BNE  = 0x0A,
+};
+
+#define CVM_REG_COUNT 256
 
 struct cvm_image {
     uint32_t *code;
@@ -71,6 +114,10 @@ struct cvm_image {
 int  cvm_load(const void *bytes, size_t len, struct cvm_image *out);
 void cvm_image_free(struct cvm_image *img);
 const char *cvm_strerror(int result);
+
+/* Run img to completion. On CVM_OK, *return_value (if non-null) holds the
+ * value of the register named in the HALT instruction's A field. */
+int  cvm_run(struct cvm_image *img, int32_t *return_value);
 
 #ifdef __cplusplus
 }

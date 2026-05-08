@@ -9,5 +9,6 @@ out/
 *.ilk
 .cache/
 .vscode/
+.claude/
 compile_commands.json
 CMakeUserPresets.json

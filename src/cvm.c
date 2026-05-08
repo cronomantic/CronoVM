@@ -153,6 +153,183 @@ const char *cvm_strerror(int result) {
     case CVM_E_NO_CODE:     return "missing code section";
     case CVM_E_BAD_ENTRY:   return "entry out of range";
     case CVM_E_NOMEM:       return "out of memory";
+    case CVM_E_BAD_OPCODE:  return "unknown opcode";
+    case CVM_E_BAD_PC:      return "pc out of range";
+    case CVM_E_BAD_ADDR:    return "memory access out of bounds";
     default:                return "unknown error";
     }
 }
+
+/* --- Interpreter --------------------------------------------------------- */
+
+#if defined(__GNUC__) || defined(__clang__)
+#  define CVM_THREADED 1
+#else
+#  define CVM_THREADED 0
+#endif
+
+#if CVM_THREADED
+#  if defined(__clang__)
+#    pragma clang diagnostic push
+#    pragma clang diagnostic ignored "-Wpedantic"
+#    pragma clang diagnostic ignored "-Wgnu-label-as-value"
+#    pragma clang diagnostic ignored "-Wgnu-designator"
+#  elif defined(__GNUC__)
+#    pragma GCC diagnostic push
+#    pragma GCC diagnostic ignored "-Wpedantic"
+#  endif
+#endif
+
+int cvm_run(struct cvm_image *img, int32_t *return_value) {
+    if (!img || !img->code || img->code_count == 0) return CVM_E_BAD_PC;
+    if (img->entry >= img->code_count)              return CVM_E_BAD_ENTRY;
+
+    int32_t  R[CVM_REG_COUNT];
+    memset(R, 0, sizeof(R));
+
+    const uint32_t *code       = img->code;
+    const uint32_t  code_count = img->code_count;
+    uint8_t        *heap       = img->heap;
+    const uint32_t  heap_size  = img->heap_size;
+    uint32_t        pc         = img->entry;
+
+    uint32_t inst;
+    uint8_t  op, a, b, c;
+
+#if CVM_THREADED
+    static const void *const jt[256] = {
+        [CVM_OP_HALT] = &&L_HALT,
+        [CVM_OP_MOVI] = &&L_MOVI,
+        [CVM_OP_MOV]  = &&L_MOV,
+        [CVM_OP_ADD]  = &&L_ADD,
+        [CVM_OP_SUB]  = &&L_SUB,
+        [CVM_OP_MUL]  = &&L_MUL,
+        [CVM_OP_LDW]  = &&L_LDW,
+        [CVM_OP_STW]  = &&L_STW,
+        [CVM_OP_JMP]  = &&L_JMP,
+        [CVM_OP_BEQ]  = &&L_BEQ,
+        [CVM_OP_BNE]  = &&L_BNE,
+    };
+
+#  define DISPATCH() do {                                  \
+        if (pc >= code_count) return CVM_E_BAD_PC;         \
+        inst = code[pc++];                                 \
+        op = (uint8_t)(inst & 0xFFu);                      \
+        a  = (uint8_t)((inst >>  8) & 0xFFu);              \
+        b  = (uint8_t)((inst >> 16) & 0xFFu);              \
+        c  = (uint8_t)((inst >> 24) & 0xFFu);              \
+        if (!jt[op]) return CVM_E_BAD_OPCODE;              \
+        goto *jt[op];                                      \
+    } while (0)
+
+    DISPATCH();
+
+    L_HALT:
+        if (return_value) *return_value = R[a];
+        return CVM_OK;
+    L_MOVI:
+        R[a] = (int32_t)(int16_t)(uint16_t)(inst >> 16);
+        DISPATCH();
+    L_MOV:
+        R[a] = R[b];
+        DISPATCH();
+    L_ADD:
+        R[a] = (int32_t)((uint32_t)R[b] + (uint32_t)R[c]);
+        DISPATCH();
+    L_SUB:
+        R[a] = (int32_t)((uint32_t)R[b] - (uint32_t)R[c]);
+        DISPATCH();
+    L_MUL:
+        R[a] = (int32_t)((uint32_t)R[b] * (uint32_t)R[c]);
+        DISPATCH();
+    L_LDW: {
+        uint32_t addr = (uint32_t)R[b];
+        if (addr > heap_size || heap_size - addr < 4u) return CVM_E_BAD_ADDR;
+        int32_t v;
+        memcpy(&v, heap + addr, 4);
+        R[a] = v;
+        DISPATCH();
+    }
+    L_STW: {
+        uint32_t addr = (uint32_t)R[b];
+        if (addr > heap_size || heap_size - addr < 4u) return CVM_E_BAD_ADDR;
+        int32_t v = R[c];
+        memcpy(heap + addr, &v, 4);
+        DISPATCH();
+    }
+    L_JMP: {
+        int32_t off = (int32_t)((inst >> 8) & 0xFFFFFFu);
+        if (off & 0x800000) off -= 0x1000000;
+        pc = (uint32_t)((int32_t)pc + off);
+        DISPATCH();
+    }
+    L_BEQ:
+        if (R[a] == R[b]) pc = (uint32_t)((int32_t)pc + (int32_t)(int8_t)c);
+        DISPATCH();
+    L_BNE:
+        if (R[a] != R[b]) pc = (uint32_t)((int32_t)pc + (int32_t)(int8_t)c);
+        DISPATCH();
+
+#  undef DISPATCH
+
+#else  /* !CVM_THREADED — switch fallback for MSVC */
+
+    for (;;) {
+        if (pc >= code_count) return CVM_E_BAD_PC;
+        inst = code[pc++];
+        op = (uint8_t)(inst & 0xFFu);
+        a  = (uint8_t)((inst >>  8) & 0xFFu);
+        b  = (uint8_t)((inst >> 16) & 0xFFu);
+        c  = (uint8_t)((inst >> 24) & 0xFFu);
+        switch (op) {
+        case CVM_OP_HALT:
+            if (return_value) *return_value = R[a];
+            return CVM_OK;
+        case CVM_OP_MOVI:
+            R[a] = (int32_t)(int16_t)(uint16_t)(inst >> 16);
+            break;
+        case CVM_OP_MOV:  R[a] = R[b]; break;
+        case CVM_OP_ADD:  R[a] = (int32_t)((uint32_t)R[b] + (uint32_t)R[c]); break;
+        case CVM_OP_SUB:  R[a] = (int32_t)((uint32_t)R[b] - (uint32_t)R[c]); break;
+        case CVM_OP_MUL:  R[a] = (int32_t)((uint32_t)R[b] * (uint32_t)R[c]); break;
+        case CVM_OP_LDW: {
+            uint32_t addr = (uint32_t)R[b];
+            if (addr > heap_size || heap_size - addr < 4u) return CVM_E_BAD_ADDR;
+            int32_t v;
+            memcpy(&v, heap + addr, 4);
+            R[a] = v;
+            break;
+        }
+        case CVM_OP_STW: {
+            uint32_t addr = (uint32_t)R[b];
+            if (addr > heap_size || heap_size - addr < 4u) return CVM_E_BAD_ADDR;
+            int32_t v = R[c];
+            memcpy(heap + addr, &v, 4);
+            break;
+        }
+        case CVM_OP_JMP: {
+            int32_t off = (int32_t)((inst >> 8) & 0xFFFFFFu);
+            if (off & 0x800000) off -= 0x1000000;
+            pc = (uint32_t)((int32_t)pc + off);
+            break;
+        }
+        case CVM_OP_BEQ:
+            if (R[a] == R[b]) pc = (uint32_t)((int32_t)pc + (int32_t)(int8_t)c);
+            break;
+        case CVM_OP_BNE:
+            if (R[a] != R[b]) pc = (uint32_t)((int32_t)pc + (int32_t)(int8_t)c);
+            break;
+        default:
+            return CVM_E_BAD_OPCODE;
+        }
+    }
+#endif
+}
+
+#if CVM_THREADED
+#  if defined(__clang__)
+#    pragma clang diagnostic pop
+#  elif defined(__GNUC__)
+#    pragma GCC diagnostic pop
+#  endif
+#endif
