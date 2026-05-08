@@ -11,33 +11,32 @@ user.c ──[ clang -emit-llvm ]──▶ user.bc ──[ cvm-translate ]──
 The translator is **not** part of the runtime. The VM binary you ship with
 your game has zero LLVM dependency.
 
-## Status (step 5)
+## Status (step 6a)
 
-The parsing + subset validation half is complete, and codegen now exists
-for a deliberately narrow case: **a single function with straight-line
-scalar arithmetic, integer parameters, and a single `ret`**. Anything else
-is rejected with a clear message. Multi-block control flow, allocas, and
-calls between user functions are work for steps 6–7 (calling convention
-and broader codegen coverage).
-
-```text
-$ cvm-translate build/add.bc                 # validate only
-module: tests/fixtures/add.c
-function add(i32, i32) -> i32 [1 block, 2 instructions]
-translator: ok
-
-$ cvm-translate build/add.bc -o build/add.bin
-module: tests/fixtures/add.c
-function add(i32, i32) -> i32 [1 block, 2 instructions]
-translator: wrote build/add.bin (2 instructions)
-```
-
-The `add(int, int)` example produces exactly two CronoVM instructions:
+Codegen now covers **scalar i32 arithmetic, comparisons, conditional and
+unconditional branches, multi-block control flow with phi nodes, and
+`select`** — enough to compile a recognisable function body with
+branches and loops. Calls between user functions, allocas, and
+non-i32 widths still error out with a precise message; those land
+alongside the calling-convention work.
 
 ```text
-ADD  R2, R0, R1     ; R2 = R0 + R1     (params arrive in R0..R(N-1))
-HALT R2             ; return R2
+$ cvm-translate build/fib.bc -o build/fib.bin
+module: tests/fixtures/fib.c
+function fib(i32) -> i32 [3 blocks, 11 instructions]
+translator: wrote build/fib.bin (26 instructions)
 ```
+
+Each translated function begins with a one-instruction prologue that
+materialises a zero register; that register lets `BNE`/`BEQ` stand in for
+"branch if non-zero" / "branch if zero" without dedicated opcodes. See
+[isa.md](isa.md) for the full encoding rules.
+
+Phi elimination is done by emitting register-to-register `MOV`s on each
+predecessor's terminator. When the moves on a single edge form a cycle
+(e.g. a loop back-edge that rotates state), the codegen detects the
+conflict and round-trips through fresh temporary registers — wasteful but
+always correct. A future pass can break cycles in-place without temps.
 
 ## Required input: -O1 (or higher)
 
@@ -71,7 +70,10 @@ the translator rejects with a clear message; that's a feature, not a bug.
 | address spaces other than 0 | not supported |
 | `token`, `x86_amx`, target_ext | not in the subset |
 
-### Instructions accepted
+### Instructions accepted by validation
+
+The validator (no `-o`) accepts a wider set than codegen currently lowers;
+the gap is what's still being implemented:
 
 - terminators: `ret`, `br`, `switch`, `unreachable`
 - arithmetic: `add`, `sub`, `mul`, `udiv`, `sdiv`, `urem`, `srem`,
@@ -81,6 +83,12 @@ the translator rejects with a clear message; that's a feature, not a bug.
 - comparison and select: `icmp`, `select`
 - aggregates: `extractvalue`, `insertvalue`
 - structural: `phi`, `call`
+
+### Instructions currently lowered by codegen
+
+`add`, `sub`, `mul`, `icmp` (all 10 predicates), `select`, `br` (both
+forms), `phi`, `ret`. Calls (including LLVM intrinsics like `llvm.abs`,
+`llvm.smax`) are not yet lowered — that's a near-term step.
 
 ### Instructions rejected
 

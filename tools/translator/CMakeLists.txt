@@ -43,7 +43,7 @@ set(_fixture_dir ${CMAKE_SOURCE_DIR}/tests/fixtures)
 set(_fixture_out ${CMAKE_CURRENT_BINARY_DIR})
 
 set(_fixture_targets "")
-foreach(name add reject_double)
+foreach(name add pick fib reject_double)
     set(_src ${_fixture_dir}/${name}.c)
     set(_bc  ${_fixture_out}/${name}.bc)
     add_custom_command(
@@ -56,15 +56,20 @@ foreach(name add reject_double)
 endforeach()
 add_custom_target(translator_fixtures DEPENDS ${_fixture_targets})
 
-# Emit add.bin via the translator. Depends on cvm-translate + add.bc.
-set(_add_bin ${_fixture_out}/add.bin)
-add_custom_command(
-    OUTPUT  ${_add_bin}
-    COMMAND $<TARGET_FILE:cvm-translate> ${_fixture_out}/add.bc -o ${_add_bin}
-    DEPENDS cvm-translate ${_fixture_out}/add.bc
-    VERBATIM
-)
-add_custom_target(translator_emit_add DEPENDS ${_add_bin})
+# Emit each .bin via the translator. Depends on cvm-translate + the .bc.
+set(_emit_targets "")
+foreach(name add pick fib)
+    set(_bc  ${_fixture_out}/${name}.bc)
+    set(_bin ${_fixture_out}/${name}.bin)
+    add_custom_command(
+        OUTPUT  ${_bin}
+        COMMAND $<TARGET_FILE:cvm-translate> ${_bc} -o ${_bin}
+        DEPENDS cvm-translate ${_bc}
+        VERBATIM
+    )
+    list(APPEND _emit_targets ${_bin})
+endforeach()
+add_custom_target(translator_emit_fixtures DEPENDS ${_emit_targets})
 
 add_test(NAME translator_build_fixtures
          COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
@@ -83,12 +88,17 @@ set_tests_properties(translator_reject_double PROPERTIES
                      FIXTURES_REQUIRED bc_fixtures
                      WILL_FAIL TRUE)
 
-add_test(NAME translator_emit_add
+add_test(NAME translator_emit_fixtures
          COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
-                                  --target translator_emit_add)
-set_tests_properties(translator_emit_add PROPERTIES
-                     FIXTURES_SETUP add_bin
+                                  --target translator_emit_fixtures)
+set_tests_properties(translator_emit_fixtures PROPERTIES
+                     FIXTURES_SETUP emitted_bins
                      FIXTURES_REQUIRED bc_fixtures)
 
-add_test(NAME e2e_add COMMAND test_e2e ${_add_bin})
-set_tests_properties(e2e_add PROPERTIES FIXTURES_REQUIRED add_bin)
+add_test(NAME e2e_add        COMMAND test_e2e ${_fixture_out}/add.bin  12 7 5)
+add_test(NAME e2e_pick_true  COMMAND test_e2e ${_fixture_out}/pick.bin  7 1 7 9)
+add_test(NAME e2e_pick_false COMMAND test_e2e ${_fixture_out}/pick.bin  9 0 7 9)
+add_test(NAME e2e_fib_10     COMMAND test_e2e ${_fixture_out}/fib.bin  55 10)
+add_test(NAME e2e_fib_0      COMMAND test_e2e ${_fixture_out}/fib.bin   0 0)
+set_tests_properties(e2e_add e2e_pick_true e2e_pick_false e2e_fib_10 e2e_fib_0
+                     PROPERTIES FIXTURES_REQUIRED emitted_bins)

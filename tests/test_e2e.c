@@ -21,15 +21,26 @@ static uint8_t *slurp(const char *path, size_t *out_len) {
     return buf;
 }
 
+/* Usage: test_e2e <bin> <expected> [args...]
+ *   <expected>   integer the program must return via HALT
+ *   [args...]    seed for R0..R(N-1) before run
+ */
 int main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "usage: test_e2e <path-to-bin>\n");
+    if (argc < 3) {
+        fprintf(stderr, "usage: test_e2e <bin> <expected> [args...]\n");
         return 2;
     }
 
     size_t len = 0;
     uint8_t *blob = slurp(argv[1], &len);
     if (!blob) return 1;
+
+    int32_t expected = (int32_t)strtol(argv[2], NULL, 0);
+    int32_t args[8] = {0};
+    int     n_args  = argc - 3;
+    if (n_args > 8) n_args = 8;
+    for (int i = 0; i < n_args; ++i)
+        args[i] = (int32_t)strtol(argv[3 + i], NULL, 0);
 
     struct cvm_image img;
     int r = cvm_load(blob, len, &img);
@@ -39,11 +50,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    int32_t args[]   = { 7, 5 };
-    int32_t expected = 12;
-    int32_t got      = 0;
-
-    r = cvm_run_args(&img, args, 2, &got);
+    int32_t got = 0;
+    r = cvm_run_args(&img, args, (uint32_t)n_args, &got);
     cvm_image_free(&img);
     free(blob);
 
@@ -52,10 +60,9 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (got != expected) {
-        fprintf(stderr, "FAIL: add(7,5) returned %d, expected %d\n",
-                got, expected);
+        fprintf(stderr, "FAIL: returned %d, expected %d\n", got, expected);
         return 1;
     }
-    printf("e2e ok: add(7,5) = %d\n", got);
+    printf("e2e ok: returned %d\n", got);
     return 0;
 }

@@ -78,6 +78,12 @@ enum cvm_result {
  *     BEQ   A=rs1, B=rs2, C=imm8 (signed)  if R[A]==R[B] pc += imm8
  *     BNE                                  if R[A]!=R[B] pc += imm8
  *     SYSCALL  BC=imm16 (unsigned)         invoke import #imm16
+ *     CMP_EQ   A=rd, B=rs1, C=rs2          R[A] = (R[B] == R[C]) ? 1 : 0
+ *     CMP_NE                               R[A] = (R[B] != R[C]) ? 1 : 0
+ *     CMP_LT                               R[A] = (R[B] <  R[C]) ? 1 : 0   (signed)
+ *     CMP_LE                               R[A] = (R[B] <= R[C]) ? 1 : 0   (signed)
+ *     CMP_LTU                              same as CMP_LT but unsigned
+ *     CMP_LEU                              same as CMP_LE but unsigned
  *
  * All arithmetic is 32-bit two's-complement with wrap-around semantics.
  * Branch offsets are in instructions, relative to the instruction *after*
@@ -100,6 +106,15 @@ enum cvm_opcode {
     CVM_OP_BEQ     = 0x09,
     CVM_OP_BNE     = 0x0A,
     CVM_OP_SYSCALL = 0x0B,
+
+    /* Comparisons: R[A] = (R[B] cmp R[C]) ? 1 : 0
+     * Signed by default; *_U variants treat operands as uint32_t. */
+    CVM_OP_CMP_EQ  = 0x0C,
+    CVM_OP_CMP_NE  = 0x0D,
+    CVM_OP_CMP_LT  = 0x0E,
+    CVM_OP_CMP_LE  = 0x0F,
+    CVM_OP_CMP_LTU = 0x10,
+    CVM_OP_CMP_LEU = 0x11,
 };
 
 #define CVM_REG_COUNT 256

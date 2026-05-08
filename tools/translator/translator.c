@@ -311,18 +311,38 @@ static void print_function_summary(LLVMValueRef fn) {
 
 /* --- codegen ------------------------------------------------------------- */
 
+struct cg_fixup {
+    uint32_t inst_index;
+    LLVMBasicBlockRef target;
+    int      shift;     /* bit position of the imm field */
+    int      bits;      /* width of the imm field (8 or 24) */
+};
+
 struct cg {
     uint32_t *code;
     uint32_t  count;
     uint32_t  cap;
 
-    /* SSA value -> physical register, parallel arrays. Linear scan is fine
-     * for the function sizes we currently target. */
+    /* SSA value -> physical register, parallel arrays. */
     LLVMValueRef *vals;
     uint8_t      *regs;
     int           map_count;
     int           map_cap;
     int           next_reg;
+
+    /* Block enumeration and starting offsets in code[]. */
+    LLVMBasicBlockRef *blocks;
+    uint32_t          *block_offsets;
+    int                block_count;
+    int                block_cap;
+
+    /* Pending branch fixups, resolved after all blocks emitted. */
+    struct cg_fixup *fixups;
+    int              fixup_count;
+    int              fixup_cap;
+
+    uint8_t           zero_reg;       /* register holding 0, for branch tests */
+    LLVMBasicBlockRef cur_block;      /* updated during emit walk */
 
     int           had_error;
     const char   *fn_name;
@@ -338,6 +358,15 @@ static uint32_t enc_i16(uint8_t op, uint8_t a, int16_t imm) {
     return (uint32_t)op
          | ((uint32_t)a << 8)
          | ((uint32_t)(uint16_t)imm << 16);
+}
+static uint32_t enc_i24(uint8_t op, int32_t imm) {
+    return (uint32_t)op | (((uint32_t)imm & 0xFFFFFFu) << 8);
+}
+static uint32_t enc_br(uint8_t op, uint8_t a, uint8_t b, int8_t off) {
+    return (uint32_t)op
+         | ((uint32_t)a << 8)
+         | ((uint32_t)b << 16)
+         | ((uint32_t)(uint8_t)off << 24);
 }
 
 static void cg_emit(struct cg *cg, uint32_t inst) {
@@ -379,8 +408,11 @@ static uint8_t cg_assign(struct cg *cg, LLVMValueRef v, uint8_t r) {
     return r;
 }
 
-/* Returns the physical register currently holding `v`. If `v` is a constant
- * not yet materialised, emits a MOVI for it and remembers the binding. */
+/* Look up the physical register holding `v`. For constants, materialise a
+ * fresh register at the call site each time — this is wasteful in registers
+ * but always correct across multi-block control flow (a cached constant from
+ * one block may not dominate uses in another). A future pass can hoist
+ * shared constants to the function prologue. */
 static uint8_t cg_reg_for(struct cg *cg, LLVMValueRef v) {
     int idx = cg_lookup(cg, v);
     if (idx >= 0) return cg->regs[idx];
@@ -396,13 +428,185 @@ static uint8_t cg_reg_for(struct cg *cg, LLVMValueRef v) {
         }
         uint8_t r = cg_alloc_reg(cg);
         cg_emit(cg, enc_i16(CVM_OP_MOVI, r, (int16_t)imm));
-        return cg_assign(cg, v, r);
+        return r;
     }
 
     ERR(cg->fn_name,
         "operand has no register assigned (use-before-def or unsupported value kind)");
     cg->had_error = 1;
     return 0;
+}
+
+/* --- block + fixup helpers ---------------------------------------------- */
+
+static int cg_find_block(struct cg *cg, LLVMBasicBlockRef bb) {
+    for (int i = 0; i < cg->block_count; ++i)
+        if (cg->blocks[i] == bb) return i;
+    return -1;
+}
+
+static void cg_register_block(struct cg *cg, LLVMBasicBlockRef bb) {
+    if (cg->block_count == cg->block_cap) {
+        cg->block_cap = cg->block_cap ? cg->block_cap * 2 : 8;
+        cg->blocks = (LLVMBasicBlockRef *)realloc(cg->blocks,
+                              cg->block_cap * sizeof(*cg->blocks));
+        cg->block_offsets = (uint32_t *)realloc(cg->block_offsets,
+                              cg->block_cap * sizeof(*cg->block_offsets));
+        if (!cg->blocks || !cg->block_offsets) { perror("realloc"); exit(1); }
+    }
+    cg->blocks[cg->block_count] = bb;
+    cg->block_offsets[cg->block_count] = 0;
+    cg->block_count++;
+}
+
+static void cg_queue_fixup(struct cg *cg, uint32_t inst_index,
+                           LLVMBasicBlockRef target, int shift, int bits)
+{
+    if (cg->fixup_count == cg->fixup_cap) {
+        cg->fixup_cap = cg->fixup_cap ? cg->fixup_cap * 2 : 16;
+        cg->fixups = (struct cg_fixup *)realloc(cg->fixups,
+                                cg->fixup_cap * sizeof(*cg->fixups));
+        if (!cg->fixups) { perror("realloc"); exit(1); }
+    }
+    cg->fixups[cg->fixup_count].inst_index = inst_index;
+    cg->fixups[cg->fixup_count].target = target;
+    cg->fixups[cg->fixup_count].shift = shift;
+    cg->fixups[cg->fixup_count].bits = bits;
+    cg->fixup_count++;
+}
+
+static int cg_resolve_fixups(struct cg *cg) {
+    for (int i = 0; i < cg->fixup_count; ++i) {
+        struct cg_fixup *fx = &cg->fixups[i];
+        int b = cg_find_block(cg, fx->target);
+        if (b < 0) {
+            ERR(cg->fn_name, "internal: fixup target block not found");
+            return 1;
+        }
+        int32_t target_off = (int32_t)cg->block_offsets[b];
+        int32_t pc_after   = (int32_t)fx->inst_index + 1;
+        int32_t rel        = target_off - pc_after;
+        int32_t maxv       = (int32_t)(((uint32_t)1 << (fx->bits - 1)) - 1u);
+        int32_t minv       = -maxv - 1;
+        if (rel < minv || rel > maxv) {
+            ERR(cg->fn_name,
+                "branch offset %d out of range [%d..%d] for %d-bit field "
+                "(trampolining not yet implemented)",
+                rel, minv, maxv, fx->bits);
+            return 1;
+        }
+        uint32_t mask = (fx->bits == 32) ? 0xFFFFFFFFu
+                                         : ((uint32_t)1 << fx->bits) - 1u;
+        cg->code[fx->inst_index] |= ((uint32_t)rel & mask) << fx->shift;
+    }
+    return 0;
+}
+
+/* For an edge from `from` to `to`, emit MOVs that copy each phi's incoming
+ * value into the phi's pre-allocated register.
+ *
+ * Phi semantics are *parallel*: all incoming values are read at the moment
+ * of the edge transition, then assigned simultaneously. Sequential MOV
+ * emission breaks this when a destination is also another move's source
+ * (loop back-edges with rotating state, e.g. a := b; b := a). To preserve
+ * parallel semantics we detect any such conflict and round-trip through
+ * temporary registers — wasteful, but always correct. */
+static void cg_emit_phi_moves(struct cg *cg,
+                              LLVMBasicBlockRef from, LLVMBasicBlockRef to)
+{
+    struct { uint8_t src; uint8_t dst; } moves[256];
+    int nmoves = 0;
+
+    for (LLVMValueRef inst = LLVMGetFirstInstruction(to);
+         inst && LLVMGetInstructionOpcode(inst) == LLVMPHI;
+         inst = LLVMGetNextInstruction(inst))
+    {
+        unsigned n = LLVMCountIncoming(inst);
+        for (unsigned k = 0; k < n; ++k) {
+            if (LLVMGetIncomingBlock(inst, k) != from) continue;
+            LLVMValueRef src = LLVMGetIncomingValue(inst, k);
+            uint8_t src_reg = cg_reg_for(cg, src);
+            int phi_idx = cg_lookup(cg, inst);
+            if (phi_idx < 0) {
+                ERR(cg->fn_name, "internal: phi register not pre-allocated");
+                cg->had_error = 1;
+                return;
+            }
+            uint8_t phi_reg = cg->regs[phi_idx];
+            if (src_reg == phi_reg) break;       /* no-op */
+            if (nmoves >= (int)(sizeof moves / sizeof moves[0])) {
+                ERR(cg->fn_name,
+                    "internal: too many phi moves on a single edge");
+                cg->had_error = 1;
+                return;
+            }
+            moves[nmoves].src = src_reg;
+            moves[nmoves].dst = phi_reg;
+            nmoves++;
+            break;
+        }
+    }
+
+    /* Conflict iff any destination is also a source in the same batch. */
+    int conflict = 0;
+    for (int i = 0; i < nmoves && !conflict; ++i)
+        for (int j = 0; j < nmoves && !conflict; ++j)
+            if (i != j && moves[i].dst == moves[j].src) conflict = 1;
+
+    if (!conflict) {
+        for (int i = 0; i < nmoves; ++i)
+            cg_emit(cg, enc_r(CVM_OP_MOV, moves[i].dst, moves[i].src, 0));
+        return;
+    }
+
+    /* Round-trip through temps: read all sources, then write all destinations. */
+    uint8_t temps[256];
+    for (int i = 0; i < nmoves; ++i) {
+        temps[i] = cg_alloc_reg(cg);
+        if (cg->had_error) return;
+        cg_emit(cg, enc_r(CVM_OP_MOV, temps[i], moves[i].src, 0));
+    }
+    for (int i = 0; i < nmoves; ++i)
+        cg_emit(cg, enc_r(CVM_OP_MOV, moves[i].dst, temps[i], 0));
+}
+
+static int icmp_to_op(LLVMIntPredicate p, int *swap_out) {
+    *swap_out = 0;
+    switch (p) {
+    case LLVMIntEQ:  return CVM_OP_CMP_EQ;
+    case LLVMIntNE:  return CVM_OP_CMP_NE;
+    case LLVMIntSLT: return CVM_OP_CMP_LT;
+    case LLVMIntSLE: return CVM_OP_CMP_LE;
+    case LLVMIntSGT: *swap_out = 1; return CVM_OP_CMP_LT;
+    case LLVMIntSGE: *swap_out = 1; return CVM_OP_CMP_LE;
+    case LLVMIntULT: return CVM_OP_CMP_LTU;
+    case LLVMIntULE: return CVM_OP_CMP_LEU;
+    case LLVMIntUGT: *swap_out = 1; return CVM_OP_CMP_LTU;
+    case LLVMIntUGE: *swap_out = 1; return CVM_OP_CMP_LEU;
+    default: return -1;
+    }
+}
+
+static void cg_pre_alloc_function(struct cg *cg, LLVMValueRef fn) {
+    unsigned np = LLVMCountParams(fn);
+    for (unsigned i = 0; i < np; ++i) {
+        LLVMValueRef p = LLVMGetParam(fn, i);
+        cg_assign(cg, p, cg_alloc_reg(cg));   /* R0..R(N-1) */
+    }
+    cg->zero_reg = cg_alloc_reg(cg);          /* dedicated zero register */
+
+    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn);
+         bb; bb = LLVMGetNextBasicBlock(bb))
+    {
+        cg_register_block(cg, bb);
+        for (LLVMValueRef i = LLVMGetFirstInstruction(bb);
+             i; i = LLVMGetNextInstruction(i))
+        {
+            LLVMTypeRef ty = LLVMTypeOf(i);
+            if (LLVMGetTypeKind(ty) == LLVMVoidTypeKind) continue;
+            cg_assign(cg, i, cg_alloc_reg(cg));
+        }
+    }
 }
 
 static int cg_function(struct cg *cg, LLVMValueRef fn) {
@@ -415,55 +619,115 @@ static int cg_function(struct cg *cg, LLVMValueRef fn) {
         cg->had_error = 1;
         return 1;
     }
-    for (unsigned i = 0; i < n_params; ++i) {
-        LLVMValueRef p = LLVMGetParam(fn, i);
-        cg_assign(cg, p, cg_alloc_reg(cg));   /* R0, R1, ... */
-    }
 
-    unsigned bb_count = LLVMCountBasicBlocks(fn);
-    if (bb_count != 1) {
-        ERR(cg->fn_name,
-            "multi-block control flow not yet supported (got %u blocks)",
-            bb_count);
-        cg->had_error = 1;
-        return 1;
-    }
+    cg_pre_alloc_function(cg, fn);
+    if (cg->had_error) return 1;
 
-    LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn);
-    for (LLVMValueRef i = LLVMGetFirstInstruction(bb);
-         i; i = LLVMGetNextInstruction(i))
-    {
-        LLVMOpcode op = LLVMGetInstructionOpcode(i);
-        switch (op) {
-        case LLVMAdd:
-        case LLVMSub:
-        case LLVMMul: {
-            uint8_t lhs = cg_reg_for(cg, LLVMGetOperand(i, 0));
-            uint8_t rhs = cg_reg_for(cg, LLVMGetOperand(i, 1));
-            uint8_t dst = cg_alloc_reg(cg);
-            cg_assign(cg, i, dst);
-            uint8_t cv = (op == LLVMAdd) ? CVM_OP_ADD
-                       : (op == LLVMSub) ? CVM_OP_SUB
-                                         : CVM_OP_MUL;
-            cg_emit(cg, enc_r(cv, dst, lhs, rhs));
-            break;
-        }
-        case LLVMRet: {
-            if (LLVMGetNumOperands(i) == 0) {
-                cg_emit(cg, enc_r(CVM_OP_HALT, 0, 0, 0));
-            } else {
-                uint8_t r = cg_reg_for(cg, LLVMGetOperand(i, 0));
-                cg_emit(cg, enc_r(CVM_OP_HALT, r, 0, 0));
+    /* Prologue: materialise the zero register once. */
+    cg_emit(cg, enc_i16(CVM_OP_MOVI, cg->zero_reg, 0));
+
+    for (int b = 0; b < cg->block_count && !cg->had_error; ++b) {
+        LLVMBasicBlockRef bb = cg->blocks[b];
+        cg->block_offsets[b] = cg->count;
+        cg->cur_block = bb;
+
+        for (LLVMValueRef i = LLVMGetFirstInstruction(bb);
+             i && !cg->had_error; i = LLVMGetNextInstruction(i))
+        {
+            LLVMOpcode op = LLVMGetInstructionOpcode(i);
+            switch (op) {
+            case LLVMPHI:
+                /* phis are eliminated by emit_phi_moves on predecessor edges. */
+                break;
+
+            case LLVMAdd:
+            case LLVMSub:
+            case LLVMMul: {
+                uint8_t lhs = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                uint8_t rhs = cg_reg_for(cg, LLVMGetOperand(i, 1));
+                uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                uint8_t cv = (op == LLVMAdd) ? CVM_OP_ADD
+                           : (op == LLVMSub) ? CVM_OP_SUB
+                                             : CVM_OP_MUL;
+                cg_emit(cg, enc_r(cv, dst, lhs, rhs));
+                break;
             }
-            break;
-        }
-        default:
-            ERR(cg->fn_name,
-                "%s: codegen not implemented yet", opcode_name(op));
-            cg->had_error = 1;
-            return 1;
+
+            case LLVMICmp: {
+                LLVMIntPredicate p = LLVMGetICmpPredicate(i);
+                int swap = 0;
+                int op2 = icmp_to_op(p, &swap);
+                if (op2 < 0) {
+                    ERR(cg->fn_name, "unsupported icmp predicate");
+                    cg->had_error = 1;
+                    break;
+                }
+                uint8_t lhs = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                uint8_t rhs = cg_reg_for(cg, LLVMGetOperand(i, 1));
+                uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                if (swap) cg_emit(cg, enc_r((uint8_t)op2, dst, rhs, lhs));
+                else      cg_emit(cg, enc_r((uint8_t)op2, dst, lhs, rhs));
+                break;
+            }
+
+            case LLVMSelect: {
+                uint8_t cond = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                uint8_t a    = cg_reg_for(cg, LLVMGetOperand(i, 1));
+                uint8_t b2   = cg_reg_for(cg, LLVMGetOperand(i, 2));
+                uint8_t dst  = cg->regs[cg_lookup(cg, i)];
+                /* Inline branch pattern, 4 instructions:
+                 *   BEQ cond, zero, +2   ; if false, skip true-MOV
+                 *   MOV dst, a           ; true value
+                 *   JMP +1               ; over the false-MOV
+                 *   MOV dst, b           ; false value */
+                cg_emit(cg, enc_br(CVM_OP_BEQ, cond, cg->zero_reg, 2));
+                cg_emit(cg, enc_r (CVM_OP_MOV, dst, a, 0));
+                cg_emit(cg, enc_i24(CVM_OP_JMP, 1));
+                cg_emit(cg, enc_r (CVM_OP_MOV, dst, b2, 0));
+                break;
+            }
+
+            case LLVMBr: {
+                if (LLVMIsConditional(i)) {
+                    uint8_t cond_reg = cg_reg_for(cg, LLVMGetCondition(i));
+                    LLVMBasicBlockRef true_bb  = LLVMGetSuccessor(i, 0);
+                    LLVMBasicBlockRef false_bb = LLVMGetSuccessor(i, 1);
+                    cg_emit_phi_moves(cg, cg->cur_block, true_bb);
+                    cg_emit_phi_moves(cg, cg->cur_block, false_bb);
+                    cg_queue_fixup(cg, cg->count, true_bb, 24, 8);
+                    cg_emit(cg, enc_br(CVM_OP_BNE, cond_reg, cg->zero_reg, 0));
+                    cg_queue_fixup(cg, cg->count, false_bb, 8, 24);
+                    cg_emit(cg, enc_i24(CVM_OP_JMP, 0));
+                } else {
+                    LLVMBasicBlockRef target = LLVMGetSuccessor(i, 0);
+                    cg_emit_phi_moves(cg, cg->cur_block, target);
+                    cg_queue_fixup(cg, cg->count, target, 8, 24);
+                    cg_emit(cg, enc_i24(CVM_OP_JMP, 0));
+                }
+                break;
+            }
+
+            case LLVMRet: {
+                if (LLVMGetNumOperands(i) == 0) {
+                    cg_emit(cg, enc_r(CVM_OP_HALT, 0, 0, 0));
+                } else {
+                    uint8_t r = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                    cg_emit(cg, enc_r(CVM_OP_HALT, r, 0, 0));
+                }
+                break;
+            }
+
+            default:
+                ERR(cg->fn_name,
+                    "%s: codegen not implemented yet", opcode_name(op));
+                cg->had_error = 1;
+                break;
+            }
         }
     }
+
+    if (!cg->had_error && cg_resolve_fixups(cg) != 0)
+        cg->had_error = 1;
     return cg->had_error ? 1 : 0;
 }
 
@@ -611,6 +875,9 @@ int main(int argc, char **argv) {
         free(cg.code);
         free(cg.vals);
         free(cg.regs);
+        free(cg.blocks);
+        free(cg.block_offsets);
+        free(cg.fixups);
     }
 
     LLVMDisposeModule(mod);

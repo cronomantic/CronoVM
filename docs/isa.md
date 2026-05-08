@@ -30,6 +30,12 @@ an offset of `0` means "fall through to the next instruction".
 | 0x09 | `BEQ` | `A, B, imm8` | if `R[A] == R[B]` then `pc += imm8` |
 | 0x0A | `BNE` | `A, B, imm8` | if `R[A] != R[B]` then `pc += imm8` |
 | 0x0B | `SYSCALL` | `imm16` | Invoke import #imm16. See [syscalls.md](syscalls.md). |
+| 0x0C | `CMP_EQ` | `A, B, C` | `R[A] = (R[B] == R[C]) ? 1 : 0` |
+| 0x0D | `CMP_NE` | `A, B, C` | `R[A] = (R[B] != R[C]) ? 1 : 0` |
+| 0x0E | `CMP_LT` | `A, B, C` | `R[A] = (R[B] <  R[C]) ? 1 : 0` (signed) |
+| 0x0F | `CMP_LE` | `A, B, C` | `R[A] = (R[B] <= R[C]) ? 1 : 0` (signed) |
+| 0x10 | `CMP_LTU` | `A, B, C` | unsigned `<` |
+| 0x11 | `CMP_LEU` | `A, B, C` | unsigned `<=` |
 
 ### Forms
 
@@ -64,11 +70,28 @@ calls are not yet defined.
 | `CVM_E_UNLINKED_SYSCALL` | Import has no host handler bound. |
 | `CVM_E_SYSCALL_TRAP` | Host handler returned non-zero. |
 
+## Lowering of i1 conditions
+
+LLVM's `icmp` produces an `i1` (boolean). It maps directly to the `CMP_*`
+opcodes — they live in 32-bit registers but only ever hold 0 or 1. A
+conditional `br i1 %c, %t, %f` lowers to:
+
+```text
+BNE  cond_reg, zero_reg, +offset_to_true
+JMP  +offset_to_false
+```
+
+Every translated function therefore reserves one register at entry as the
+zero register and emits `MOVI zero, 0` in the prologue. This is what
+allows `BNE`/`BEQ` to act as "branch if non-zero" / "branch if zero" without
+adding new opcodes.
+
 ## What's not here yet
 
 - `CALL` / `RET` / stack frames — pinned to the calling-convention work.
 - 64-bit and float opcodes — landing alongside the LLVM IR types they map to.
 - Indexed memory ops with displacement — the encoding has 8 bits left over;
   future revision may carve out room.
-- Long branches — current ±127 reach is plenty for hand-written code; the
-  translator will need a 16-bit form before C control flow gets large.
+- Long branches — current ±127 reach for `BEQ`/`BNE` (signed `imm8`) is
+  enough for current fixtures. When it isn't, the codegen will need to
+  trampoline through `JMP` (which has 24-bit reach).

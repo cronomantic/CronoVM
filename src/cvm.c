@@ -297,6 +297,12 @@ int cvm_run_args(struct cvm_image *img,
         [CVM_OP_BEQ]     = &&L_BEQ,
         [CVM_OP_BNE]     = &&L_BNE,
         [CVM_OP_SYSCALL] = &&L_SYSCALL,
+        [CVM_OP_CMP_EQ]  = &&L_CMP_EQ,
+        [CVM_OP_CMP_NE]  = &&L_CMP_NE,
+        [CVM_OP_CMP_LT]  = &&L_CMP_LT,
+        [CVM_OP_CMP_LE]  = &&L_CMP_LE,
+        [CVM_OP_CMP_LTU] = &&L_CMP_LTU,
+        [CVM_OP_CMP_LEU] = &&L_CMP_LEU,
     };
 
 #  define DISPATCH() do {                                  \
@@ -366,6 +372,12 @@ int cvm_run_args(struct cvm_image *img,
             return CVM_E_SYSCALL_TRAP;
         DISPATCH();
     }
+    L_CMP_EQ:  R[a] = (R[b] == R[c]) ? 1 : 0; DISPATCH();
+    L_CMP_NE:  R[a] = (R[b] != R[c]) ? 1 : 0; DISPATCH();
+    L_CMP_LT:  R[a] = (R[b] <  R[c]) ? 1 : 0; DISPATCH();
+    L_CMP_LE:  R[a] = (R[b] <= R[c]) ? 1 : 0; DISPATCH();
+    L_CMP_LTU: R[a] = ((uint32_t)R[b] <  (uint32_t)R[c]) ? 1 : 0; DISPATCH();
+    L_CMP_LEU: R[a] = ((uint32_t)R[b] <= (uint32_t)R[c]) ? 1 : 0; DISPATCH();
 
 #  undef DISPATCH
 
@@ -425,6 +437,12 @@ int cvm_run_args(struct cvm_image *img,
                 return CVM_E_SYSCALL_TRAP;
             break;
         }
+        case CVM_OP_CMP_EQ:  R[a] = (R[b] == R[c]) ? 1 : 0; break;
+        case CVM_OP_CMP_NE:  R[a] = (R[b] != R[c]) ? 1 : 0; break;
+        case CVM_OP_CMP_LT:  R[a] = (R[b] <  R[c]) ? 1 : 0; break;
+        case CVM_OP_CMP_LE:  R[a] = (R[b] <= R[c]) ? 1 : 0; break;
+        case CVM_OP_CMP_LTU: R[a] = ((uint32_t)R[b] <  (uint32_t)R[c]) ? 1 : 0; break;
+        case CVM_OP_CMP_LEU: R[a] = ((uint32_t)R[b] <= (uint32_t)R[c]) ? 1 : 0; break;
         default:
             return CVM_E_BAD_OPCODE;
         }

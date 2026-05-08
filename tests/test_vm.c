@@ -290,6 +290,42 @@ static void test_bad_addr(void) {
     CHECK(r == CVM_E_BAD_ADDR, "bad addr: got %s", cvm_strerror(r));
 }
 
+static void test_cmp_signed(void) {
+    /* (-3 <  5) = 1, (-3 == -3) = 1, (-3 != 5) = 1, (-3 <= -3) = 1 -> sum = 4 */
+    uint32_t code[] = {
+        enc_i16(CVM_OP_MOVI, 0, -3),
+        enc_i16(CVM_OP_MOVI, 1, 5),
+        enc_r  (CVM_OP_CMP_LT, 2, 0, 1),  /* R2 = 1 */
+        enc_r  (CVM_OP_CMP_EQ, 3, 0, 0),  /* R3 = 1 */
+        enc_r  (CVM_OP_CMP_NE, 4, 0, 1),  /* R4 = 1 */
+        enc_r  (CVM_OP_CMP_LE, 5, 0, 0),  /* R5 = 1 */
+        enc_r  (CVM_OP_ADD,  2, 2, 3),
+        enc_r  (CVM_OP_ADD,  2, 2, 4),
+        enc_r  (CVM_OP_ADD,  2, 2, 5),
+        enc_r  (CVM_OP_HALT, 2, 0, 0),
+    };
+    int32_t v = 0;
+    int r = run_image(code, 10, 0, 0, &v);
+    CHECK(r == CVM_OK, "cmp_s: %s", cvm_strerror(r));
+    CHECK(v == 4,      "cmp_s: got %d", v);
+}
+
+static void test_cmp_unsigned(void) {
+    /* As signed, -1 < 5; as unsigned, -1 (= 0xFFFFFFFF) > 5. */
+    uint32_t code[] = {
+        enc_i16(CVM_OP_MOVI, 0, -1),
+        enc_i16(CVM_OP_MOVI, 1, 5),
+        enc_r  (CVM_OP_CMP_LT,  2, 0, 1),  /* signed: 1 */
+        enc_r  (CVM_OP_CMP_LTU, 3, 0, 1),  /* unsigned: 0 */
+        enc_r  (CVM_OP_ADD,     4, 2, 3),  /* expect 1 */
+        enc_r  (CVM_OP_HALT,    4, 0, 0),
+    };
+    int32_t v = 0;
+    int r = run_image(code, 6, 0, 0, &v);
+    CHECK(r == CVM_OK, "cmp_u: %s", cvm_strerror(r));
+    CHECK(v == 1,      "cmp_u: got %d", v);
+}
+
 /* --- Syscall tests ------------------------------------------------------- */
 
 struct print_capture {
@@ -476,6 +512,8 @@ int main(void) {
     test_jmp();
     test_bad_addr();
     test_loader_rejects();
+    test_cmp_signed();
+    test_cmp_unsigned();
     test_syscall_hello_int();
     test_syscall_two_args();
     test_syscall_print_string();
