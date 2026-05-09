@@ -46,6 +46,9 @@ an offset of `0` means "fall through to the next instruction".
 | 0x19 | `AND` | `A, B, C` | `R[A] = R[B] & R[C]` |
 | 0x1A | `OR` | `A, B, C` | `R[A] = R[B] \| R[C]` |
 | 0x1B | `XOR` | `A, B, C` | `R[A] = R[B] ^ R[C]` |
+| 0x1C | `CALL` | `imm24 (unsigned)` | push pc; `pc = FUNCS[imm24]` |
+| 0x1D | `RET` | — | `pc = pop()`; halt with `R[0]` if popped value is `0xFFFFFFFF` |
+| 0x1E | `CALLR` | `A` | push pc; `pc = FUNCS[R[A]]` (indirect call via register) |
 
 ### Forms
 
@@ -65,9 +68,29 @@ behaves and avoiding C's implementation-defined corners.
 
 ## Memory model
 
-A single contiguous heap of `data_size + bss_size` bytes. Loads and stores
-are bounds-checked: `addr + 4 <= heap_size`. There is currently no stack —
-calls are not yet defined.
+A single contiguous buffer of `data_size + bss_size + heap_reserve + stack_reserve`
+bytes. Loads and stores are bounds-checked against `mem_size = heap_size +
+stack_size`. The heap (data + bss + reserve) sits at the bottom; the stack
+region sits at the top, starting at `mem_size` and growing downward via
+`R255` (SP). See [format.md](format.md) for the section that controls
+each region's size.
+
+## Calls and the stack
+
+`CALL imm24` pushes the address of the next instruction at `R[255] -= 4`
+and jumps to `FUNCS[imm24]`. `RET` pops a 32-bit word from the stack and
+uses it as the new `pc`; if that word equals the **completion sentinel**
+`0xFFFFFFFF`, the run ends and `cvm_run` returns `R[0]`.
+
+On run start, the interpreter places `R[255] = mem_size`, then pushes the
+sentinel as the outermost return PC. Programs that don't use `CALL` get a
+zero-sized stack region and never touch SP.
+
+The user-call ABI mirrors the syscall ABI for arguments 0..7 (`R0..R7`).
+Any additional arguments (the 9th onward) are pushed by the caller on the
+stack at increasing offsets — stacked arg 0 (the 9th overall) sits at
+`SP+4` after `CALL`, stacked arg 1 at `SP+8`, and so on. The caller is
+responsible for restoring SP after `RET`. The return value lands in `R0`.
 
 ## Errors raised by the interpreter
 
@@ -75,11 +98,13 @@ calls are not yet defined.
 | ---- | ---- |
 | `CVM_E_BAD_OPCODE` | Fetched word's low byte is not a defined opcode. |
 | `CVM_E_BAD_PC` | `pc` advanced past the end of CODE. |
-| `CVM_E_BAD_ADDR` | `LDW`/`STW` would read or write outside the heap. |
+| `CVM_E_BAD_ADDR` | `LDW`/`STW`/`RET` would touch memory outside `[0, mem_size)`. |
 | `CVM_E_BAD_SYSCALL` | `SYSCALL imm16` references an out-of-range import. |
 | `CVM_E_UNLINKED_SYSCALL` | Import has no host handler bound. |
 | `CVM_E_SYSCALL_TRAP` | Host handler returned non-zero. |
 | `CVM_E_DIV_BY_ZERO` | `DIV`/`DIVU`/`MOD`/`MODU` with `R[C]==0`. |
+| `CVM_E_BAD_FUNC_INDEX` | `CALL imm24` references an out-of-range function index. |
+| `CVM_E_STACK_OVERFLOW` | `CALL` would push past the bottom of the stack region. |
 
 ## Lowering of i1 conditions
 
@@ -99,7 +124,6 @@ adding new opcodes.
 
 ## What's not here yet
 
-- `CALL` / `RET` / stack frames — pinned to the calling-convention work.
 - 64-bit and float opcodes — landing alongside the LLVM IR types they map to.
 - Indexed memory ops with displacement — the encoding has 8 bits left over;
   future revision may carve out room.

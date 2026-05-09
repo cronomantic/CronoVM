@@ -44,7 +44,8 @@ set(_fixture_out ${CMAKE_CURRENT_BINARY_DIR})
 
 set(_fixture_targets "")
 foreach(name add pick fib abs max divmod bitops counter sum_global
-             alloc_sum reject_double)
+             alloc_sum two_funcs fib_recursive many_args alloca_swap
+             fnptr dispatch_table reject_double)
     set(_src ${_fixture_dir}/${name}.c)
     set(_bc  ${_fixture_out}/${name}.bc)
     add_custom_command(
@@ -61,7 +62,9 @@ add_custom_target(translator_fixtures DEPENDS ${_fixture_targets})
 
 # Emit each .bin via the translator. Depends on cvm-translate + the .bc.
 set(_emit_targets "")
-foreach(name add pick fib abs max divmod bitops counter sum_global)
+foreach(name add pick fib abs max divmod bitops counter sum_global
+             two_funcs fib_recursive many_args alloca_swap fnptr
+             dispatch_table)
     set(_bc  ${_fixture_out}/${name}.bc)
     set(_bin ${_fixture_out}/${name}.bin)
     add_custom_command(
@@ -123,8 +126,22 @@ add_test(NAME e2e_bitops     COMMAND test_e2e ${_fixture_out}/bitops.bin 127  7 
 add_test(NAME e2e_counter    COMMAND test_e2e ${_fixture_out}/counter.bin 7  7)
 add_test(NAME e2e_sum_global COMMAND test_e2e ${_fixture_out}/sum_global.bin 55 10)
 add_test(NAME e2e_alloc_sum  COMMAND test_e2e ${_fixture_out}/alloc_sum.bin 15 5)
+add_test(NAME e2e_two_funcs  COMMAND test_e2e ${_fixture_out}/two_funcs.bin 13 7 5)
+add_test(NAME e2e_fib_rec_10 COMMAND test_e2e ${_fixture_out}/fib_recursive.bin 55 10)
+add_test(NAME e2e_fib_rec_1  COMMAND test_e2e ${_fixture_out}/fib_recursive.bin  1  1)
+add_test(NAME e2e_fib_rec_0   COMMAND test_e2e ${_fixture_out}/fib_recursive.bin  0  0)
+add_test(NAME e2e_many_args   COMMAND test_e2e ${_fixture_out}/many_args.bin    56 10 10)
+add_test(NAME e2e_alloca_swap COMMAND test_e2e ${_fixture_out}/alloca_swap.bin   3  4 7)
+add_test(NAME e2e_fnptr_add        COMMAND test_e2e ${_fixture_out}/fnptr.bin           11 1 10)
+add_test(NAME e2e_fnptr_sub        COMMAND test_e2e ${_fixture_out}/fnptr.bin            9 0 10)
+add_test(NAME e2e_dispatch_add     COMMAND test_e2e ${_fixture_out}/dispatch_table.bin  10 0 7 3)
+add_test(NAME e2e_dispatch_sub     COMMAND test_e2e ${_fixture_out}/dispatch_table.bin   4 1 7 3)
+add_test(NAME e2e_dispatch_mul     COMMAND test_e2e ${_fixture_out}/dispatch_table.bin  21 2 7 3)
 set_tests_properties(
     e2e_add e2e_pick_true e2e_pick_false e2e_fib_10 e2e_fib_0
     e2e_abs_neg e2e_abs_pos e2e_max_lhs e2e_max_rhs
     e2e_divmod e2e_bitops e2e_counter e2e_sum_global e2e_alloc_sum
+    e2e_two_funcs e2e_fib_rec_10 e2e_fib_rec_1 e2e_fib_rec_0
+    e2e_many_args e2e_alloca_swap e2e_fnptr_add e2e_fnptr_sub
+    e2e_dispatch_add e2e_dispatch_sub e2e_dispatch_mul
     PROPERTIES FIXTURES_REQUIRED emitted_bins)

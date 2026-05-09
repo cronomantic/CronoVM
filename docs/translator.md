@@ -11,26 +11,31 @@ user.c ──[ clang -emit-llvm ]──▶ user.bc ──[ cvm-translate ]──
 The translator is **not** part of the runtime. The VM binary you ship with
 your game has zero LLVM dependency.
 
-## Status (step 6a)
+## Status (step 6c)
 
-Codegen now covers **scalar i32 arithmetic, comparisons, conditional and
-unconditional branches, multi-block control flow with phi nodes, and
-`select`** — enough to compile a recognisable function body with
-branches and loops. Calls between user functions, allocas, and
-non-i32 widths still error out with a precise message; those land
-alongside the calling-convention work.
+Codegen now covers **scalar i32 arithmetic, comparisons, branches,
+multi-block control flow, `select`, calls between user functions
+(direct, recursive, with > 8 args), and entry-block allocas with
+escaping pointers**. The biggest remaining gaps are i8/i16 memory
+ops, `llvm.memcpy`/`memset`/`memmove`, indirect calls (`CALLR`),
+and 64-bit / floating-point types.
 
 ```text
-$ cvm-translate build/fib.bc -o build/fib.bin
-module: tests/fixtures/fib.c
-function fib(i32) -> i32 [3 blocks, 11 instructions]
-translator: wrote build/fib.bin (26 instructions)
+$ cvm-translate build/fib_recursive.bc -o build/fib_recursive.bin
+module: tests/fixtures/fib_recursive.c
+function vm_main(i32) -> i32 [1 block, 2 instructions]
+function fib(i32) -> i32 [4 blocks, 12 instructions]
+translator: wrote build/fib_recursive.bin (135 instructions, 0 data
+bytes, 0 imports, 2 funcs, 0 heap-reserve, 16384 stack-reserve)
 ```
 
-Each translated function begins with a one-instruction prologue that
-materialises a zero register; that register lets `BNE`/`BEQ` stand in for
-"branch if non-zero" / "branch if zero" without dedicated opcodes. See
-[isa.md](isa.md) for the full encoding rules.
+Each translated function begins with a prologue that subtracts
+`frame_size` from `R255` (SP), copies first-8 params from `R0..R7`
+into their high SSA homes, materialises a zero register and any
+alloca pointers, and then runs the function body. Every `ret`
+emits `MOV R0, retval; ADD R255, frame_size; RET` — the last
+`RET` of the entry function pops the run-completion sentinel that
+`cvm_run` pre-pushed and the run halts with `R0` as the result.
 
 Phi elimination is done by emitting register-to-register `MOV`s on each
 predecessor's terminator. When the moves on a single edge form a cycle
@@ -101,27 +106,74 @@ the gap is what's still being implemented:
 - width casts: `trunc`, `zext`, `sext` (no-op MOV — i32-only register
   model means these don't change the live value at i386-elf -O1)
 - intrinsic calls: `llvm.abs.i32`, `llvm.smax.i32`, `llvm.smin.i32`,
-  `llvm.umax.i32`, `llvm.umin.i32`
+  `llvm.umax.i32`, `llvm.umin.i32`; `llvm.lifetime.start/end` (no-ops)
 - syscall calls: any `cvm_sys_*` function call lowers to `SYSCALL`
+- user calls: direct calls to functions defined in the same module
+  lower to `CALL imm24`, with caller-saved spill, R0..R7+stack arg
+  passing, and R0 return value
+- indirect calls: when the callee is an SSA value (loaded from a
+  global, returned by another function, or selected between two
+  candidates) the codegen emits `CALLR Rcallee`. Function values
+  used as operands (`select i1 _, ptr @add, ptr @sub`) lower to
+  `MOVI Rd, func_index`
+- `alloca`: static-size, entry-block-only — the prologue materialises
+  each alloca pointer as `SP + offset`
 
-User-defined non-syscall calls and the rest of the LLVM intrinsics
-(`llvm.memcpy`, `llvm.memset`, `llvm.ctlz`, …) still error out — they
-need CALL/RET work or per-intrinsic lowerings. Likewise `alloca`,
-i8/i16 loads/stores, and `extern` data globals are pending.
+Function values stored in DATA-section globals (e.g. a `static const
+fn_t ops[N] = { f0, f1, ... };` dispatch table) are also supported:
+the constant-initialiser serialiser writes each function pointer as
+its FUNCS-table index in little-endian u32 form, and runtime code
+loads it with `LDW` and dispatches via `CALLR`. NULL function
+pointers in v1 are undefined behaviour — index 0 collides with the
+first user function — so initialise every function pointer before
+calling through it.
+
+`llvm.memcpy` / `llvm.memset` / `llvm.memmove`, i8/i16 loads/stores,
+and `extern` data globals still error out — they need new opcodes
+or per-intrinsic lowerings.
 
 ### Calling convention
 
-Inside a translated function:
+Register reservations:
 
-- `R0..R7` are reserved as **syscall argument-passing slots**. They
-  never hold SSA values directly; they're scratch around `SYSCALL`
-  instructions.
-- `R8..` is where SSA values live. Function parameters arrive in
-  `R0..R(N-1)` (host calls `cvm_run_args`) and the prologue copies
-  them up to `R8..R(8+N-1)` immediately, so the body sees stable
-  registers regardless of any later syscall clobbering R0..R7.
-- Each function's `MOVI zero` lives at the next free register after
-  the params.
+- `R0..R7` — argument slots for both syscalls and user calls. Return
+  value of either lands in `R0`. They never hold SSA values directly;
+  the prologue copies the first eight params into their high SSA
+  homes immediately so subsequent calls can clobber them.
+- `R8..R253` — SSA values, including the dedicated zero register and
+  any alloca pointers materialised in the prologue.
+- `R254` — codegen scratch (frame-size constants, spill addresses,
+  stack-arg pointers). Never holds an SSA value, so it doesn't need
+  to be saved across calls.
+- `R255` — stack pointer (SP).
+
+Frame layout (low → high addresses, from SP after prologue):
+
+```text
+[ alloca area | spill slots ]   ← cg->alloca_bytes + cg->spill_bytes
+[ saved return PC ]              ← pushed by the caller's CALL
+[ stacked args (9th onward) ]    ← pushed by the caller before CALL
+```
+
+The prologue does `SUB R255, R255, frame_size` once; every `ret`
+reverses it with `ADD R255, R255, frame_size; RET`.
+
+User-call lowering (caller side, around each `LLVMCall` to a
+non-syscall non-intrinsic):
+
+1. Spill `R8..R(ssa_reg_high-1)` to the spill area at
+   `[SP+alloca_bytes ..]`. Constants and per-instruction temps that
+   `cg_reg_for` materialised above `ssa_reg_high` are dead after
+   their parent instruction and don't need to be saved.
+2. If `narg > 8`, push the extras: `SUB SP, n*4; STW SP+i*4, arg_i`.
+3. Move first-8 args into `R0..R7`.
+4. `CALL imm24` (with the callee's index in the FUNCS table).
+5. After return: `ADD SP, n*4` to drop stacked args (caller cleans).
+6. Reload `R8..R(ssa_reg_high-1)` from the spill area.
+7. `MOV dst, R0` for the call's return value (when not `void`).
+
+Spill is currently *spill-everything*. A future pass will narrow it
+to values genuinely live across the call.
 
 ### Syscall lowering
 

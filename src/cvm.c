@@ -5,7 +5,7 @@
 
 #define CVM_HEADER_SIZE   24u
 #define CVM_SECTION_SIZE  16u
-#define CVM_MAX_SEC_TYPE  6u
+#define CVM_MAX_SEC_TYPE  8u
 
 static uint32_t read_u32_le(const uint8_t *p) {
     return  (uint32_t)p[0]
@@ -82,7 +82,9 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
     uint32_t data_off = 0, data_size = 0;
     uint32_t bss_size = 0;
     uint32_t reserve_size = 0;
+    uint32_t stack_size = 0;
     uint32_t imports_off = 0, imports_size = 0;
+    uint32_t funcs_off = 0, funcs_size = 0;
     int      has_code = 0;
 
     for (uint32_t i = 0; i < section_count; ++i) {
@@ -99,7 +101,10 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
             seen[type] = 1;
         }
 
-        if (type != CVM_SEC_BSS && type != CVM_SEC_HEAP_RESERVE) {
+        if (type != CVM_SEC_BSS
+         && type != CVM_SEC_HEAP_RESERVE
+         && type != CVM_SEC_STACK_RESERVE)
+        {
             if ((uint64_t)file_off + size > len) return CVM_E_TRUNCATED;
         } else if (file_off != 0) {
             return CVM_E_BAD_SECTION;
@@ -126,6 +131,14 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
         case CVM_SEC_HEAP_RESERVE:
             reserve_size = size;
             break;
+        case CVM_SEC_STACK_RESERVE:
+            stack_size = size;
+            break;
+        case CVM_SEC_FUNCS:
+            if (size == 0 || size % 4u != 0) return CVM_E_BAD_FUNCS;
+            funcs_off  = file_off;
+            funcs_size = size;
+            break;
         case CVM_SEC_DEBUG:
         default:
             break;
@@ -141,6 +154,11 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
                         + (uint64_t)bss_size
                         + (uint64_t)reserve_size;
     if (heap_total > 0xFFFFFFFFu) return CVM_E_BAD_SECTION;
+
+    /* Stack must leave room for at least the sentinel return PC. */
+    if (stack_size != 0 && stack_size < 4u) return CVM_E_BAD_SECTION;
+    uint64_t mem_total = heap_total + (uint64_t)stack_size;
+    if (mem_total > 0xFFFFFFFFu) return CVM_E_BAD_SECTION;
 
     /* Pre-validate IMPORTS layout before any allocation. */
     uint32_t import_count = 0;
@@ -165,11 +183,18 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
     char          **import_names = NULL;
     cvm_syscall_fn *import_fns   = NULL;
     void          **import_ud    = NULL;
+    uint32_t       *func_offsets = NULL;
+    uint32_t        func_count   = 0;
     if (!code) goto oom;
 
-    if (heap_total > 0) {
-        heap = (uint8_t *)malloc((size_t)heap_total);
+    if (mem_total > 0) {
+        heap = (uint8_t *)malloc((size_t)mem_total);
         if (!heap) goto oom;
+    }
+    if (funcs_size > 0) {
+        func_count   = funcs_size / 4u;
+        func_offsets = (uint32_t *)malloc(funcs_size);
+        if (!func_offsets) goto oom;
     }
     if (imports_size > 0) {
         import_blob = (char *)malloc((size_t)imports_size);
@@ -186,8 +211,19 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
         code[i] = read_u32_le(base + code_off + (size_t)i * 4u);
 
     if (data_size) memcpy(heap, base + data_off, data_size);
-    if (bss_size + reserve_size)
-        memset(heap + data_size, 0, (size_t)bss_size + reserve_size);
+    if (mem_total > data_size)
+        memset(heap + data_size, 0, (size_t)mem_total - (size_t)data_size);
+
+    if (func_count > 0) {
+        for (uint32_t i = 0; i < func_count; ++i) {
+            uint32_t off = read_u32_le(base + funcs_off + (size_t)i * 4u);
+            if (off >= code_count) {
+                free(code); free(heap); free(func_offsets);
+                return CVM_E_BAD_FUNCS;
+            }
+            func_offsets[i] = off;
+        }
+    }
 
     if (imports_size > 0) {
         memcpy(import_blob, base + imports_off, imports_size);
@@ -203,7 +239,11 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
     out->heap_size        = (uint32_t)heap_total;
     out->data_size        = data_size;
     out->reserve_size     = reserve_size;
+    out->stack_size       = stack_size;
+    out->mem_size         = (uint32_t)mem_total;
     out->entry            = entry;
+    out->func_offsets     = func_offsets;
+    out->func_count       = func_count;
     out->import_count     = import_count;
     out->import_names     = import_names;
     out->import_fns       = import_fns;
@@ -219,6 +259,7 @@ oom:
     free(import_names);
     free(import_fns);
     free(import_ud);
+    free(func_offsets);
     return CVM_E_NOMEM;
 }
 
@@ -230,6 +271,7 @@ void cvm_image_free(struct cvm_image *img) {
     free(img->import_fns);
     free(img->import_userdata);
     free(img->_import_blob);
+    free(img->func_offsets);
     memset(img, 0, sizeof(*img));
 }
 
@@ -283,6 +325,9 @@ const char *cvm_strerror(int result) {
     case CVM_E_UNLINKED_SYSCALL: return "syscall has no host handler";
     case CVM_E_SYSCALL_TRAP:     return "syscall handler returned a trap";
     case CVM_E_DIV_BY_ZERO:      return "division by zero";
+    case CVM_E_BAD_FUNCS:        return "malformed funcs section";
+    case CVM_E_BAD_FUNC_INDEX:   return "call target index out of range";
+    case CVM_E_STACK_OVERFLOW:   return "stack overflow";
     default:                     return "unknown error";
     }
 }
@@ -324,11 +369,25 @@ int cvm_run_args(struct cvm_image *img,
     if (args && arg_count > 0)
         memcpy(R, args, arg_count * sizeof(int32_t));
 
-    const uint32_t *code       = img->code;
-    const uint32_t  code_count = img->code_count;
-    uint8_t        *heap       = img->heap;
-    const uint32_t  heap_size  = img->heap_size;
-    uint32_t        pc         = img->entry;
+    const uint32_t *code         = img->code;
+    const uint32_t  code_count   = img->code_count;
+    uint8_t        *heap         = img->heap;
+    const uint32_t  mem_size     = img->mem_size;
+    const uint32_t *func_offsets = img->func_offsets;
+    const uint32_t  func_count   = img->func_count;
+    uint32_t        pc           = img->entry;
+
+    /* Set up SP at the very top of memory and push the run-completion
+     * sentinel as the outermost return PC. RET pops it and halts. Programs
+     * that don't use CALL/RET get a zero stack region and never touch SP. */
+    if (img->stack_size >= 4u) {
+        uint32_t sp = mem_size - 4u;
+        uint32_t sentinel = CVM_RET_SENTINEL;
+        memcpy(heap + sp, &sentinel, 4);
+        R[CVM_REG_SP] = (int32_t)sp;
+    } else {
+        R[CVM_REG_SP] = (int32_t)mem_size;
+    }
 
     uint32_t inst;
     uint8_t  op, a, b, c;
@@ -363,6 +422,9 @@ int cvm_run_args(struct cvm_image *img,
         [CVM_OP_AND]     = &&L_AND,
         [CVM_OP_OR]      = &&L_OR,
         [CVM_OP_XOR]     = &&L_XOR,
+        [CVM_OP_CALL]    = &&L_CALL,
+        [CVM_OP_RET]     = &&L_RET,
+        [CVM_OP_CALLR]   = &&L_CALLR,
     };
 
 #  define DISPATCH() do {                                  \
@@ -398,7 +460,7 @@ int cvm_run_args(struct cvm_image *img,
         DISPATCH();
     L_LDW: {
         uint32_t addr = (uint32_t)R[b];
-        if (addr > heap_size || heap_size - addr < 4u) return CVM_E_BAD_ADDR;
+        if (addr > mem_size || mem_size - addr < 4u) return CVM_E_BAD_ADDR;
         int32_t v;
         memcpy(&v, heap + addr, 4);
         R[a] = v;
@@ -406,7 +468,7 @@ int cvm_run_args(struct cvm_image *img,
     }
     L_STW: {
         uint32_t addr = (uint32_t)R[b];
-        if (addr > heap_size || heap_size - addr < 4u) return CVM_E_BAD_ADDR;
+        if (addr > mem_size || mem_size - addr < 4u) return CVM_E_BAD_ADDR;
         int32_t v = R[c];
         memcpy(heap + addr, &v, 4);
         DISPATCH();
@@ -466,6 +528,41 @@ int cvm_run_args(struct cvm_image *img,
     L_AND: R[a] = R[b] & R[c]; DISPATCH();
     L_OR:  R[a] = R[b] | R[c]; DISPATCH();
     L_XOR: R[a] = R[b] ^ R[c]; DISPATCH();
+    L_CALL: {
+        uint32_t fid = (inst >> 8) & 0xFFFFFFu;
+        if (fid >= func_count) return CVM_E_BAD_FUNC_INDEX;
+        uint32_t sp = (uint32_t)R[CVM_REG_SP];
+        if (sp < 4u || sp > mem_size) return CVM_E_STACK_OVERFLOW;
+        sp -= 4u;
+        memcpy(heap + sp, &pc, 4);
+        R[CVM_REG_SP] = (int32_t)sp;
+        pc = func_offsets[fid];
+        DISPATCH();
+    }
+    L_RET: {
+        uint32_t sp = (uint32_t)R[CVM_REG_SP];
+        if (sp > mem_size || mem_size - sp < 4u) return CVM_E_BAD_ADDR;
+        uint32_t ret_pc;
+        memcpy(&ret_pc, heap + sp, 4);
+        R[CVM_REG_SP] = (int32_t)(sp + 4u);
+        if (ret_pc == CVM_RET_SENTINEL) {
+            if (return_value) *return_value = R[0];
+            return CVM_OK;
+        }
+        pc = ret_pc;
+        DISPATCH();
+    }
+    L_CALLR: {
+        uint32_t fid = (uint32_t)R[a];
+        if (fid >= func_count) return CVM_E_BAD_FUNC_INDEX;
+        uint32_t sp = (uint32_t)R[CVM_REG_SP];
+        if (sp < 4u || sp > mem_size) return CVM_E_STACK_OVERFLOW;
+        sp -= 4u;
+        memcpy(heap + sp, &pc, 4);
+        R[CVM_REG_SP] = (int32_t)sp;
+        pc = func_offsets[fid];
+        DISPATCH();
+    }
 
 #  undef DISPATCH
 
@@ -491,7 +588,7 @@ int cvm_run_args(struct cvm_image *img,
         case CVM_OP_MUL:  R[a] = (int32_t)((uint32_t)R[b] * (uint32_t)R[c]); break;
         case CVM_OP_LDW: {
             uint32_t addr = (uint32_t)R[b];
-            if (addr > heap_size || heap_size - addr < 4u) return CVM_E_BAD_ADDR;
+            if (addr > mem_size || mem_size - addr < 4u) return CVM_E_BAD_ADDR;
             int32_t v;
             memcpy(&v, heap + addr, 4);
             R[a] = v;
@@ -499,7 +596,7 @@ int cvm_run_args(struct cvm_image *img,
         }
         case CVM_OP_STW: {
             uint32_t addr = (uint32_t)R[b];
-            if (addr > heap_size || heap_size - addr < 4u) return CVM_E_BAD_ADDR;
+            if (addr > mem_size || mem_size - addr < 4u) return CVM_E_BAD_ADDR;
             int32_t v = R[c];
             memcpy(heap + addr, &v, 4);
             break;
@@ -555,6 +652,41 @@ int cvm_run_args(struct cvm_image *img,
         case CVM_OP_AND: R[a] = R[b] & R[c]; break;
         case CVM_OP_OR:  R[a] = R[b] | R[c]; break;
         case CVM_OP_XOR: R[a] = R[b] ^ R[c]; break;
+        case CVM_OP_CALL: {
+            uint32_t fid = (inst >> 8) & 0xFFFFFFu;
+            if (fid >= func_count) return CVM_E_BAD_FUNC_INDEX;
+            uint32_t sp = (uint32_t)R[CVM_REG_SP];
+            if (sp < 4u || sp > mem_size) return CVM_E_STACK_OVERFLOW;
+            sp -= 4u;
+            memcpy(heap + sp, &pc, 4);
+            R[CVM_REG_SP] = (int32_t)sp;
+            pc = func_offsets[fid];
+            break;
+        }
+        case CVM_OP_RET: {
+            uint32_t sp = (uint32_t)R[CVM_REG_SP];
+            if (sp > mem_size || mem_size - sp < 4u) return CVM_E_BAD_ADDR;
+            uint32_t ret_pc;
+            memcpy(&ret_pc, heap + sp, 4);
+            R[CVM_REG_SP] = (int32_t)(sp + 4u);
+            if (ret_pc == CVM_RET_SENTINEL) {
+                if (return_value) *return_value = R[0];
+                return CVM_OK;
+            }
+            pc = ret_pc;
+            break;
+        }
+        case CVM_OP_CALLR: {
+            uint32_t fid = (uint32_t)R[a];
+            if (fid >= func_count) return CVM_E_BAD_FUNC_INDEX;
+            uint32_t sp = (uint32_t)R[CVM_REG_SP];
+            if (sp < 4u || sp > mem_size) return CVM_E_STACK_OVERFLOW;
+            sp -= 4u;
+            memcpy(heap + sp, &pc, 4);
+            R[CVM_REG_SP] = (int32_t)sp;
+            pc = func_offsets[fid];
+            break;
+        }
         default:
             return CVM_E_BAD_OPCODE;
         }

@@ -32,12 +32,14 @@ extern "C" {
 #define CVM_VERSION_1_0   0x00010000u
 
 enum cvm_section_type {
-    CVM_SEC_CODE         = 1,
-    CVM_SEC_DATA         = 2,
-    CVM_SEC_BSS          = 3,
-    CVM_SEC_IMPORTS      = 4,
-    CVM_SEC_DEBUG        = 5,
-    CVM_SEC_HEAP_RESERVE = 6,   /* file_off=0, size = free-region bytes */
+    CVM_SEC_CODE          = 1,
+    CVM_SEC_DATA          = 2,
+    CVM_SEC_BSS           = 3,
+    CVM_SEC_IMPORTS       = 4,
+    CVM_SEC_DEBUG         = 5,
+    CVM_SEC_HEAP_RESERVE  = 6,   /* file_off=0, size = free-region bytes */
+    CVM_SEC_STACK_RESERVE = 7,   /* file_off=0, size = stack region bytes */
+    CVM_SEC_FUNCS         = 8,   /* u32[N] — entry instruction index per func */
 };
 
 enum cvm_result {
@@ -59,6 +61,9 @@ enum cvm_result {
     CVM_E_UNLINKED_SYSCALL,
     CVM_E_SYSCALL_TRAP,
     CVM_E_DIV_BY_ZERO,
+    CVM_E_BAD_FUNCS,        /* malformed FUNCS section */
+    CVM_E_BAD_FUNC_INDEX,   /* CALL imm24 outside func table */
+    CVM_E_STACK_OVERFLOW,   /* SP went past the stack region */
 };
 
 /* ---------------------------------------------------------------------------
@@ -91,6 +96,9 @@ enum cvm_result {
  *     SHL      A=rd, B=rs1, C=rs2          R[A] = R[B] << (R[C] & 31)
  *     SHR/SAR                              logical / arithmetic right shift
  *     AND/OR/XOR                           bitwise
+ *     CALL     ABC=imm24 (unsigned)        push pc+1; pc = FUNCS[imm24]
+ *     CALLR    A=rs1                       push pc+1; pc = FUNCS[R[A]]
+ *     RET                                  pc = pop(); halt if pc == 0xFFFFFFFF
  *
  * All arithmetic is 32-bit two's-complement with wrap-around semantics.
  * Branch offsets are in instructions, relative to the instruction *after*
@@ -98,6 +106,14 @@ enum cvm_result {
  *
  * SYSCALL invokes the host handler registered for import index imm16.
  * Args go in R0..R7, return value in R0. See docs/syscalls.md.
+ *
+ * CALL/RET use a stack region addressed via R255 (SP). On run start, R255 is
+ * set to the top of memory and the sentinel 0xFFFFFFFF is pushed as the
+ * outermost return PC; when RET pops it, the run ends and R[0] is returned.
+ * The user-call ABI mirrors the syscall ABI for the first 8 args (R0..R7);
+ * any remaining args are pushed on the stack by the caller (lowest stacked
+ * arg at lowest address) and cleaned up by the caller after RET. Return
+ * value lands in R0.
  * ------------------------------------------------------------------------- */
 
 enum cvm_opcode {
@@ -136,10 +152,22 @@ enum cvm_opcode {
     CVM_OP_AND     = 0x19,
     CVM_OP_OR      = 0x1A,
     CVM_OP_XOR     = 0x1B,
+
+    /* Calls. CALL pushes the address of the next instruction to the stack
+     * (decrementing R255 by 4) and jumps to FUNCS[imm24]. RET pops a 32-bit
+     * value from the stack and uses it as the new pc; if the popped value is
+     * the sentinel 0xFFFFFFFF, execution halts and the run returns R[0].
+     * CALLR is identical to CALL but reads the function index from R[A]
+     * — used for function pointers / indirect calls. */
+    CVM_OP_CALL    = 0x1C,    /* ABC = imm24 (unsigned function index) */
+    CVM_OP_RET     = 0x1D,
+    CVM_OP_CALLR   = 0x1E,    /* A = rs1 (holds function index) */
 };
 
 #define CVM_REG_COUNT 256
 #define CVM_SYSCALL_MAX_ARGS 8
+#define CVM_REG_SP    255u
+#define CVM_RET_SENTINEL 0xFFFFFFFFu
 
 struct cvm_image;
 
@@ -155,19 +183,35 @@ struct cvm_image {
     uint32_t *code;
     uint32_t  code_count;
 
-    /* Heap layout:
+    /* Memory layout (single contiguous buffer of mem_size bytes):
      *   heap[0 .. data_size)                            DATA (initialised)
      *   heap[data_size .. heap_size - reserve_size)     BSS  (zero-filled)
      *   heap[heap_size - reserve_size .. heap_size)     RESERVE (zero-filled,
      *                                                    free for the user
      *                                                    allocator)
+     *   heap[heap_size .. heap_size + stack_size)       STACK (zero-filled,
+     *                                                    grows down from top)
+     *
+     * heap_size names just the heap portion (data+bss+reserve). LDW/STW
+     * bounds-check against mem_size = heap_size + stack_size so stack
+     * accesses use the same opcodes as heap accesses. cvm_sys_heap_start
+     * still returns data_size+bss_size; the stack region is invisible to
+     * the user-side allocator.
      */
     uint8_t  *heap;
     uint32_t  heap_size;
     uint32_t  data_size;
     uint32_t  reserve_size;
+    uint32_t  stack_size;
+    uint32_t  mem_size;       /* heap_size + stack_size, for bounds checks */
 
     uint32_t  entry;
+
+    /* FUNCS section: img->func_offsets[i] is the instruction index in CODE
+     * where function #i starts, used as the target of CALL imm24. NULL if
+     * the binary has no FUNCS section (i.e. emits no CALL instructions). */
+    uint32_t *func_offsets;
+    uint32_t  func_count;
 
     /* Imports: parsed from the IMPORTS section. import_names[i] is the
      * NUL-terminated symbol the host should resolve via cvm_link. The fn /

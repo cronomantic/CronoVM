@@ -318,6 +318,8 @@ struct cg_global {
     uint32_t     size;       /* bytes occupied on the heap */
 };
 
+struct cg_func;   /* fully defined in the codegen section below */
+
 struct cg_globals {
     LLVMTargetDataRef td;
     struct cg_global *items;
@@ -326,6 +328,13 @@ struct cg_globals {
     uint8_t          *data_bytes;
     uint32_t          data_size;
     uint32_t          data_cap;
+
+    /* Function table (not owned). Set before cg_collect_globals so
+     * function values used as constant initialisers can be serialised
+     * as their FUNCS-table indices. NULL when no functions have been
+     * enumerated yet. */
+    const struct cg_func *funcs;
+    int                   func_count;
 };
 
 static int cg_globals_lookup(const struct cg_globals *g, LLVMValueRef v) {
@@ -360,11 +369,37 @@ static void cg_data_reserve(struct cg_globals *g, uint32_t need) {
     g->data_cap = cap;
 }
 
-static int serialize_constant(LLVMValueRef c, LLVMTargetDataRef td,
+/* Forward declaration: cg_func is fully defined later, but we only
+ * need its `value` field, accessed through a typed pointer. */
+struct cg_func {
+    LLVMValueRef value;
+    uint32_t     entry_offset;
+    uint32_t     frame_size;
+};
+
+static int serialize_function_index(const struct cg_globals *g,
+                                    LLVMValueRef fn,
+                                    uint8_t *out, uint32_t off)
+{
+    if (!g->funcs) return 1;
+    int fidx = -1;
+    for (int i = 0; i < g->func_count; ++i)
+        if (g->funcs[i].value == fn) { fidx = i; break; }
+    if (fidx < 0) return 1;
+    /* Function "address" = its FUNCS-table index, written as a 32-bit LE
+     * integer. CALLR Rd reads R[d] and looks up FUNCS[R[d]] at run time. */
+    out[off + 0] = (uint8_t)(uint32_t)fidx;
+    out[off + 1] = (uint8_t)((uint32_t)fidx >> 8);
+    out[off + 2] = (uint8_t)((uint32_t)fidx >> 16);
+    out[off + 3] = (uint8_t)((uint32_t)fidx >> 24);
+    return 0;
+}
+
+static int serialize_constant(const struct cg_globals *g, LLVMValueRef c,
                               uint8_t *out, uint32_t off, uint32_t cap)
 {
     LLVMTypeRef ty = LLVMTypeOf(c);
-    uint32_t sz = (uint32_t)LLVMABISizeOfType(td, ty);
+    uint32_t sz = (uint32_t)LLVMABISizeOfType(g->td, ty);
     if (off + sz > cap) return 1;
 
     if (LLVMIsAConstantAggregateZero(c) || LLVMIsAConstantPointerNull(c)) {
@@ -377,14 +412,22 @@ static int serialize_constant(LLVMValueRef c, LLVMTargetDataRef td,
             out[off + b] = (uint8_t)(v >> (b * 8));
         return 0;
     }
+    if (LLVMIsAFunction(c)) {
+        /* A function value embedded in a constant initialiser — typically
+         * a static dispatch table. We need the function's FUNCS-index,
+         * which means cg_collect_globals must run *after* the function
+         * table has been built. */
+        if (sz < 4) return 1;
+        return serialize_function_index(g, c, out, off);
+    }
     if (LLVMGetTypeKind(ty) == LLVMArrayTypeKind) {
         LLVMTypeRef elem = LLVMGetElementType(ty);
-        uint32_t   esz   = (uint32_t)LLVMABISizeOfType(td, elem);
+        uint32_t   esz   = (uint32_t)LLVMABISizeOfType(g->td, elem);
         unsigned   n     = LLVMGetArrayLength(ty);
         for (unsigned i = 0; i < n; ++i) {
             LLVMValueRef e = LLVMGetAggregateElement(c, i);
             if (!e) return 1;
-            if (serialize_constant(e, td, out, off + i * esz, cap) != 0)
+            if (serialize_constant(g, e, out, off + i * esz, cap) != 0)
                 return 1;
         }
         return 0;
@@ -394,8 +437,8 @@ static int serialize_constant(LLVMValueRef c, LLVMTargetDataRef td,
         for (unsigned i = 0; i < n; ++i) {
             LLVMValueRef e = LLVMGetAggregateElement(c, i);
             if (!e) return 1;
-            uint32_t fo = (uint32_t)LLVMOffsetOfElement(td, ty, i);
-            if (serialize_constant(e, td, out, off + fo, cap) != 0)
+            uint32_t fo = (uint32_t)LLVMOffsetOfElement(g->td, ty, i);
+            if (serialize_constant(g, e, out, off + fo, cap) != 0)
                 return 1;
         }
         return 0;
@@ -436,9 +479,11 @@ static int cg_collect_globals(struct cg_globals *g, LLVMModuleRef mod) {
 
         cg_data_reserve(g, cursor + size);
         LLVMValueRef init = LLVMGetInitializer(gv);
-        if (init && serialize_constant(init, g->td,
+        if (init && serialize_constant(g, init,
                                        g->data_bytes, cursor, g->data_cap) != 0) {
-            ERR(NULL, "global '%s': unsupported initializer shape",
+            ERR(NULL, "global '%s': unsupported initializer shape "
+                      "(or function-pointer initialiser without a "
+                      "definition for the referenced function)",
                 value_name(gv));
             return 1;
         }
@@ -470,31 +515,30 @@ struct cg_import {
     const char  *name;      /* points into LLVM-owned storage */
 };
 
+/* struct cg_func is defined earlier (before cg_globals) so that the
+ * constant-initialiser serialiser can map function values in DATA to
+ * their FUNCS-table indices. Indices into this table double as CALL
+ * imm24 operands; the loader resolves them via FUNCS at run time. */
+
+/* One entry per LLVMAlloca in the entry block (only static, entry-block
+ * allocas are supported). offset is in bytes from SP after prologue. */
+struct cg_alloca {
+    LLVMValueRef value;
+    uint32_t     offset;
+};
+
+/* Scratch register reserved by the codegen for prologue/epilogue/CALL
+ * sequences (frame_size constants, spill addresses, stack-arg pointers).
+ * Never holds an SSA value, so it doesn't need to be spilled across CALLs. */
+#define CG_REG_SP      255u
+#define CG_REG_SCRATCH 254u
+#define CG_MAX_SSA_REG 254u   /* SSA values use R8..R253 (R254=scratch, R255=SP) */
+
 struct cg {
+    /* Module-level state, persists across all functions. */
     uint32_t *code;
     uint32_t  count;
     uint32_t  cap;
-
-    /* SSA value -> physical register, parallel arrays. */
-    LLVMValueRef *vals;
-    uint8_t      *regs;
-    int           map_count;
-    int           map_cap;
-    int           next_reg;
-
-    /* Block enumeration and starting offsets in code[]. */
-    LLVMBasicBlockRef *blocks;
-    uint32_t          *block_offsets;
-    int                block_count;
-    int                block_cap;
-
-    /* Pending branch fixups, resolved after all blocks emitted. */
-    struct cg_fixup *fixups;
-    int              fixup_count;
-    int              fixup_cap;
-
-    uint8_t           zero_reg;       /* register holding 0, for branch tests */
-    LLVMBasicBlockRef cur_block;      /* updated during emit walk */
 
     struct cg_globals *globals;       /* module-wide; not owned */
 
@@ -504,9 +548,97 @@ struct cg {
     int               import_count;
     int               import_cap;
 
+    /* User-defined function table; index = CALL imm24. */
+    struct cg_func *funcs;
+    int             func_count;
+    int             func_cap;
+
+    int has_calls;          /* did codegen ever emit a CALL? */
+
+    /* Per-function scratch — reset by cg_reset_function_state. */
+    LLVMValueRef *vals;     /* SSA value -> physical register, parallel arrays */
+    uint8_t      *regs;
+    int           map_count;
+    int           map_cap;
+    int           next_reg;
+
+    LLVMBasicBlockRef *blocks;
+    uint32_t          *block_offsets;
+    int                block_count;
+    int                block_cap;
+
+    struct cg_fixup *fixups;
+    int              fixup_count;
+    int              fixup_cap;
+
+    /* Allocas in the current function (entry block, static size). */
+    struct cg_alloca *allocas;
+    int               alloca_count;
+    int               alloca_cap;
+
+    uint32_t          alloca_bytes;   /* total bytes used by alloca area */
+    uint32_t          spill_bytes;    /* (ssa_reg_high - 8) * 4 */
+    uint32_t          frame_bytes;    /* alloca_bytes + spill_bytes */
+    int               ssa_reg_high;   /* next_reg snapshot after pre-alloc.
+                                       * Spilling around CALL only covers
+                                       * R8..R(ssa_reg_high-1). Constants
+                                       * and per-instruction temps are
+                                       * re-materialised on each use, so
+                                       * they don't need to survive a CALL. */
+
+    uint8_t           zero_reg;       /* register holding 0, for branch tests */
+    LLVMBasicBlockRef cur_block;      /* updated during emit walk */
+
     int           had_error;
     const char   *fn_name;
 };
+
+static int cg_func_lookup(const struct cg *cg, LLVMValueRef v) {
+    for (int i = 0; i < cg->func_count; ++i)
+        if (cg->funcs[i].value == v) return i;
+    return -1;
+}
+
+static int cg_func_append(struct cg *cg, LLVMValueRef v) {
+    if (cg->func_count == cg->func_cap) {
+        cg->func_cap = cg->func_cap ? cg->func_cap * 2 : 8;
+        cg->funcs = (struct cg_func *)realloc(cg->funcs,
+                            cg->func_cap * sizeof(*cg->funcs));
+        if (!cg->funcs) { perror("realloc"); return 1; }
+    }
+    cg->funcs[cg->func_count].value        = v;
+    cg->funcs[cg->func_count].entry_offset = 0;
+    cg->funcs[cg->func_count].frame_size   = 0;
+    return cg->func_count++;
+}
+
+static int cg_alloca_append(struct cg *cg, LLVMValueRef v, uint32_t off) {
+    if (cg->alloca_count == cg->alloca_cap) {
+        cg->alloca_cap = cg->alloca_cap ? cg->alloca_cap * 2 : 4;
+        cg->allocas = (struct cg_alloca *)realloc(cg->allocas,
+                            cg->alloca_cap * sizeof(*cg->allocas));
+        if (!cg->allocas) { perror("realloc"); return 1; }
+    }
+    cg->allocas[cg->alloca_count].value  = v;
+    cg->allocas[cg->alloca_count].offset = off;
+    cg->alloca_count++;
+    return 0;
+}
+
+static void cg_reset_function_state(struct cg *cg) {
+    cg->map_count = 0;
+    cg->next_reg = 8;
+    cg->block_count = 0;
+    cg->fixup_count = 0;
+    cg->alloca_count = 0;
+    cg->alloca_bytes = 0;
+    cg->spill_bytes = 0;
+    cg->frame_bytes = 0;
+    cg->ssa_reg_high = 8;
+    cg->zero_reg = 0;
+    cg->cur_block = NULL;
+    cg->fn_name = NULL;
+}
 
 static int cg_import_lookup_or_add(struct cg *cg, LLVMValueRef callee,
                                    const char *name)
@@ -555,8 +687,9 @@ static void cg_emit(struct cg *cg, uint32_t inst) {
 }
 
 static uint8_t cg_alloc_reg(struct cg *cg) {
-    if (cg->next_reg >= 256) {
-        ERR(cg->fn_name, "ran out of registers (>256 live SSA values)");
+    if (cg->next_reg > (int)CG_MAX_SSA_REG) {
+        ERR(cg->fn_name, "ran out of registers (R254/R255 are reserved as "
+                         "scratch and SP)");
         cg->had_error = 1;
         return 0;
     }
@@ -623,6 +756,31 @@ static uint8_t cg_reg_for(struct cg *cg, LLVMValueRef v) {
         uint8_t r = cg_alloc_reg(cg);
         cg_emit(cg, enc_i16(CVM_OP_MOVI, r,
                             (int16_t)cg->globals->items[idx].offset));
+        return r;
+    }
+
+    /* A Function value used as an operand (rather than as a call target)
+     * means somebody is taking its address — for a function pointer or a
+     * select/phi between two callees. In our world a function "address"
+     * is its index in the FUNCS table; materialise that as a MOVI. */
+    if (LLVMIsAFunction(v)) {
+        int fidx = cg_func_lookup(cg, v);
+        if (fidx < 0) {
+            ERR(cg->fn_name,
+                "address taken of '%s': function has no definition in "
+                "this module (extern is not supported)", value_name(v));
+            cg->had_error = 1;
+            return 0;
+        }
+        if (fidx > INT16_MAX) {
+            ERR(cg->fn_name,
+                "function index %d doesn't fit in MOVI imm16 "
+                "(wide-constant lowering pending)", fidx);
+            cg->had_error = 1;
+            return 0;
+        }
+        uint8_t r = cg_alloc_reg(cg);
+        cg_emit(cg, enc_i16(CVM_OP_MOVI, r, (int16_t)fidx));
         return r;
     }
 
@@ -782,6 +940,123 @@ static int icmp_to_op(LLVMIntPredicate p, int *swap_out) {
     }
 }
 
+/* --- prologue / epilogue / stack helpers --------------------------------- */
+
+/* Materialise `imm` into the scratch register (R254) using a single MOVI.
+ * Caller is responsible for ensuring imm fits in int16 (we range-check and
+ * bail out via cg->had_error otherwise). */
+static int cg_movi_scratch(struct cg *cg, int32_t imm) {
+    if (imm < INT16_MIN || imm > INT16_MAX) {
+        ERR(cg->fn_name,
+            "constant %d doesn't fit in MOVI imm16 "
+            "(wide-constant lowering not yet implemented)", imm);
+        cg->had_error = 1;
+        return 1;
+    }
+    cg_emit(cg, enc_i16(CVM_OP_MOVI, (uint8_t)CG_REG_SCRATCH, (int16_t)imm));
+    return 0;
+}
+
+/* Compute R254 = R255 + offset. */
+static int cg_addr_sp_plus(struct cg *cg, int32_t offset) {
+    if (cg_movi_scratch(cg, offset)) return 1;
+    cg_emit(cg, enc_r(CVM_OP_ADD, (uint8_t)CG_REG_SCRATCH,
+                                  (uint8_t)CG_REG_SP,
+                                  (uint8_t)CG_REG_SCRATCH));
+    return 0;
+}
+
+/* SP -= n (n must be > 0 and fit in int16). Uses R254. */
+static int cg_sp_sub(struct cg *cg, uint32_t n) {
+    if (n == 0) return 0;
+    if (cg_movi_scratch(cg, (int32_t)n)) return 1;
+    cg_emit(cg, enc_r(CVM_OP_SUB, (uint8_t)CG_REG_SP,
+                                  (uint8_t)CG_REG_SP,
+                                  (uint8_t)CG_REG_SCRATCH));
+    return 0;
+}
+
+/* SP += n. */
+static int cg_sp_add(struct cg *cg, uint32_t n) {
+    if (n == 0) return 0;
+    if (cg_movi_scratch(cg, (int32_t)n)) return 1;
+    cg_emit(cg, enc_r(CVM_OP_ADD, (uint8_t)CG_REG_SP,
+                                  (uint8_t)CG_REG_SP,
+                                  (uint8_t)CG_REG_SCRATCH));
+    return 0;
+}
+
+/* Store R[src_reg] at address (SP + offset). Uses R254 as a temporary. */
+static int cg_stw_sp_off(struct cg *cg, int32_t offset, uint8_t src_reg) {
+    if (cg_addr_sp_plus(cg, offset)) return 1;
+    cg_emit(cg, enc_r(CVM_OP_STW, 0, (uint8_t)CG_REG_SCRATCH, src_reg));
+    return 0;
+}
+
+/* Load (SP + offset) into R[dst_reg]. Uses R254 as a temporary. */
+static int cg_ldw_sp_off(struct cg *cg, uint8_t dst_reg, int32_t offset) {
+    if (cg_addr_sp_plus(cg, offset)) return 1;
+    cg_emit(cg, enc_r(CVM_OP_LDW, dst_reg, (uint8_t)CG_REG_SCRATCH, 0));
+    return 0;
+}
+
+/* Walk the entry block, register every static-size alloca, and reject any
+ * dynamic alloca or alloca outside the entry block. Sets cg->alloca_bytes. */
+static int cg_collect_allocas(struct cg *cg, LLVMValueRef fn) {
+    LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock(fn);
+    uint32_t cursor = 0;
+
+    for (LLVMValueRef i = LLVMGetFirstInstruction(entry);
+         i; i = LLVMGetNextInstruction(i))
+    {
+        if (LLVMGetInstructionOpcode(i) != LLVMAlloca) continue;
+        LLVMValueRef cnt = LLVMGetOperand(i, 0);
+        if (!LLVMIsAConstantInt(cnt)) {
+            ERR(cg->fn_name, "dynamic alloca is not supported");
+            cg->had_error = 1;
+            return 1;
+        }
+        long long n = LLVMConstIntGetSExtValue(cnt);
+        if (n < 0) {
+            ERR(cg->fn_name, "alloca count is negative");
+            cg->had_error = 1;
+            return 1;
+        }
+        LLVMTypeRef ety = LLVMGetAllocatedType(i);
+        uint32_t   esz = (uint32_t)LLVMABISizeOfType(cg->globals->td, ety);
+        uint32_t   align = (uint32_t)LLVMABIAlignmentOfType(cg->globals->td, ety);
+        if (align < 4) align = 4;
+        cursor = (cursor + align - 1u) & ~(align - 1u);
+        uint32_t size  = (uint32_t)n * esz;
+        if (cg_alloca_append(cg, i, cursor) != 0) {
+            cg->had_error = 1;
+            return 1;
+        }
+        cursor += size;
+    }
+    /* round total alloca bytes to 4 so the spill area stays word-aligned. */
+    cursor = (cursor + 3u) & ~3u;
+    cg->alloca_bytes = cursor;
+
+    /* Reject any alloca outside the entry block. */
+    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn);
+         bb; bb = LLVMGetNextBasicBlock(bb))
+    {
+        if (bb == entry) continue;
+        for (LLVMValueRef i = LLVMGetFirstInstruction(bb);
+             i; i = LLVMGetNextInstruction(i))
+        {
+            if (LLVMGetInstructionOpcode(i) == LLVMAlloca) {
+                ERR(cg->fn_name,
+                    "alloca outside the entry block is not supported");
+                cg->had_error = 1;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 static void cg_pre_alloc_function(struct cg *cg, LLVMValueRef fn) {
     /* R0..R7 are scratch for syscall argument passing. SSA values start at
      * R8 — the function prologue copies params from R0..R(N-1) into their
@@ -810,29 +1085,80 @@ static void cg_pre_alloc_function(struct cg *cg, LLVMValueRef fn) {
     }
 }
 
-static int cg_function(struct cg *cg, LLVMValueRef fn) {
+static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
+    cg_reset_function_state(cg);
     cg->fn_name = value_name(fn);
 
-    unsigned n_params = LLVMCountParams(fn);
-    if (n_params > 8) {
-        ERR(cg->fn_name, "more than 8 parameters not supported (got %u)",
-            n_params);
-        cg->had_error = 1;
-        return 1;
-    }
+    if (cg_collect_allocas(cg, fn) != 0) return 1;
 
     cg_pre_alloc_function(cg, fn);
     if (cg->had_error) return 1;
 
-    /* Prologue: copy params from the syscall-ABI slots (R0..R(N-1)) into
-     * their assigned high registers, then materialise the zero register. */
+    /* Snapshot the SSA register high-water mark. cg_reg_for grows next_reg
+     * during emission whenever it materialises a constant; those transient
+     * registers are dead after their parent instruction and must not be
+     * counted in spill_bytes. */
+    cg->ssa_reg_high = cg->next_reg;
+
+    /* Spill area: one slot per pre-allocated SSA register (R8..R(ssa_reg_high-1)).
+     * Frame layout (low → high): [alloca area | spill area]. The frame is
+     * adjusted once at prologue and reverted at every RET. Anything that
+     * needs to push beyond it (stacked args during a CALL) walks SP further
+     * down only inside that call sequence. */
+    cg->spill_bytes = (uint32_t)(cg->ssa_reg_high - 8) * 4u;
+    cg->frame_bytes = cg->alloca_bytes + cg->spill_bytes;
+
+    if (cg->frame_bytes > INT16_MAX) {
+        ERR(cg->fn_name,
+            "frame size %u exceeds MOVI imm16 range "
+            "(spill compaction / wide constants pending)", cg->frame_bytes);
+        cg->had_error = 1;
+        return 1;
+    }
+    cg->funcs[func_idx].frame_size = cg->frame_bytes;
+
+    /* Prologue: SUB SP, SP, frame. */
+    if (cg_sp_sub(cg, cg->frame_bytes)) return 1;
+
+    /* Copy first-8 params from the calling-convention regs into their high
+     * SSA homes, and load any stacked params (>=9th) from caller's frame.
+     *
+     * Stacked args sit just above the return PC the callee's CALL pushed:
+     *   addr(stacked_arg_i) = SP_after_prologue + frame + 4 + i*4
+     * where the +4 accounts for the saved return PC. */
+    unsigned n_params = LLVMCountParams(fn);
     for (unsigned p = 0; p < n_params; ++p) {
         LLVMValueRef pv  = LLVMGetParam(fn, p);
         uint8_t      dst = cg->regs[cg_lookup(cg, pv)];
-        if (dst != p)
-            cg_emit(cg, enc_r(CVM_OP_MOV, dst, (uint8_t)p, 0));
+        if (p < 8) {
+            if (dst != p)
+                cg_emit(cg, enc_r(CVM_OP_MOV, dst, (uint8_t)p, 0));
+        } else {
+            int32_t off = (int32_t)cg->frame_bytes + 4 + (int32_t)(p - 8) * 4;
+            if (cg_ldw_sp_off(cg, dst, off)) return 1;
+        }
     }
     cg_emit(cg, enc_i16(CVM_OP_MOVI, cg->zero_reg, 0));
+
+    /* Materialise alloca pointers: each %p = SP + alloca_offset. SP doesn't
+     * move within the body except inside CALL sequences, but those sequences
+     * never read alloca pointers, so the snapshotted absolute addresses
+     * remain valid for every subsequent use. */
+    for (int k = 0; k < cg->alloca_count; ++k) {
+        LLVMValueRef av = cg->allocas[k].value;
+        int idx = cg_lookup(cg, av);
+        if (idx < 0) {
+            ERR(cg->fn_name, "internal: alloca register not pre-allocated");
+            cg->had_error = 1;
+            return 1;
+        }
+        uint8_t dst = cg->regs[idx];
+        int32_t off = (int32_t)cg->allocas[k].offset;
+        if (cg_movi_scratch(cg, off)) return 1;
+        cg_emit(cg, enc_r(CVM_OP_ADD, dst,
+                                      (uint8_t)CG_REG_SP,
+                                      (uint8_t)CG_REG_SCRATCH));
+    }
 
     for (int b = 0; b < cg->block_count && !cg->had_error; ++b) {
         LLVMBasicBlockRef bb = cg->blocks[b];
@@ -931,14 +1257,22 @@ static int cg_function(struct cg *cg, LLVMValueRef fn) {
             }
 
             case LLVMRet: {
-                if (LLVMGetNumOperands(i) == 0) {
-                    cg_emit(cg, enc_r(CVM_OP_HALT, 0, 0, 0));
-                } else {
+                if (LLVMGetNumOperands(i) > 0) {
                     uint8_t r = cg_reg_for(cg, LLVMGetOperand(i, 0));
-                    cg_emit(cg, enc_r(CVM_OP_HALT, r, 0, 0));
+                    if (cg->had_error) break;
+                    if (r != 0)
+                        cg_emit(cg, enc_r(CVM_OP_MOV, 0, r, 0));
                 }
+                if (cg_sp_add(cg, cg->frame_bytes)) break;
+                cg_emit(cg, enc_r(CVM_OP_RET, 0, 0, 0));
                 break;
             }
+
+            case LLVMAlloca:
+                /* No code here: the alloca pointer was materialised in the
+                 * prologue. cg_collect_allocas validated that the alloca is
+                 * static-size and lives in the entry block. */
+                break;
 
             case LLVMLoad: {
                 /* Accept i32 and (4-byte-aligned) i1 / pointer loads — both
@@ -1126,14 +1460,24 @@ static int cg_function(struct cg *cg, LLVMValueRef fn) {
 
             case LLVMCall: {
                 LLVMValueRef callee = LLVMGetCalledValue(i);
+                LLVMValueRef callee_fn = LLVMIsAFunction(callee);
+
+                /* Indirect call (callee is an SSA value, not a Function
+                 * constant). All the name-based dispatch below — intrinsics,
+                 * syscalls, lifetime markers — only makes sense for direct
+                 * calls, so for indirect we go straight to the user-call
+                 * sequence at the bottom of this case. */
+                const char *name = NULL;
                 size_t name_len = 0;
-                const char *name = callee
-                    ? LLVMGetValueName2(callee, &name_len) : NULL;
-                if (!name || name_len == 0) {
-                    ERR(cg->fn_name, "call with unknown callee");
-                    cg->had_error = 1;
-                    break;
+                if (callee_fn) {
+                    name = LLVMGetValueName2(callee_fn, &name_len);
+                    if (!name || name_len == 0) {
+                        ERR(cg->fn_name, "call with unnamed function");
+                        cg->had_error = 1;
+                        break;
+                    }
                 }
+                if (!name) goto user_call_lowering;
 
                 /* llvm.abs.i32(%x, _is_int_min_poison)
                  *   abs(x) = (x<0) ? -x : x
@@ -1223,15 +1567,129 @@ static int cg_function(struct cg *cg, LLVMValueRef fn) {
                     break;
                 }
 
+                /* Lifetime markers are pure metadata in our world: they
+                 * tell the optimiser when an alloca is in/out of use, but
+                 * have no runtime effect. Drop them silently. */
+                if (strncmp(name, "llvm.lifetime.", 14) == 0) {
+                    break;
+                }
+
                 if (strncmp(name, "llvm.", 5) == 0) {
                     ERR(cg->fn_name,
                         "intrinsic '%s' not yet lowered", name);
-                } else {
-                    ERR(cg->fn_name,
-                        "user-defined call to '%s' not yet lowered "
-                        "(CALL/RET pending)", name);
+                    cg->had_error = 1;
+                    break;
                 }
-                cg->had_error = 1;
+
+            user_call_lowering: ;
+                /* User-defined call. Direct (callee_fn != NULL): emit
+                 * `CALL imm24` with the callee's index in the module's
+                 * function table. Indirect (callee_fn == NULL): the
+                 * callee is an SSA value of pointer type that holds a
+                 * function index, emit `CALLR Rcallee`. */
+                int callee_idx = -1;
+                uint8_t callee_reg = 0;
+                int is_indirect = (callee_fn == NULL);
+
+                if (is_indirect) {
+                    callee_reg = cg_reg_for(cg, callee);
+                    if (cg->had_error) break;
+                } else {
+                    callee_idx = cg_func_lookup(cg, callee_fn);
+                    if (callee_idx < 0) {
+                        ERR(cg->fn_name,
+                            "call to '%s': callee has no definition in this "
+                            "module (extern is not supported)", name);
+                        cg->had_error = 1;
+                        break;
+                    }
+                    if (callee_idx > 0xFFFFFF) {
+                        ERR(cg->fn_name, "more than 16M user functions");
+                        cg->had_error = 1;
+                        break;
+                    }
+                }
+
+                unsigned narg = LLVMGetNumArgOperands(i);
+                unsigned n_in_reg  = narg < 8 ? narg : 8;
+                unsigned n_stacked = narg > 8 ? narg - 8 : 0;
+
+                /* Materialise every argument into a register first, before
+                 * any spill/copy. This makes sure constants get MOVI'd into
+                 * their own scratch SSA registers (which we'll then spill
+                 * harmlessly along with everything else). */
+                uint8_t arg_regs[256];
+                if (narg > sizeof arg_regs) {
+                    ERR(cg->fn_name,
+                        "call has %u args; codegen cap is %zu",
+                        narg, sizeof arg_regs);
+                    cg->had_error = 1;
+                    break;
+                }
+                for (unsigned k = 0; k < narg; ++k)
+                    arg_regs[k] = cg_reg_for(cg, LLVMGetOperand(i, k));
+                if (cg->had_error) break;
+
+                /* 1. Caller-saved spill: dump R8..R(ssa_reg_high-1) to the
+                 *    spill area at [SP+alloca_bytes ..]. We only spill the
+                 *    pre-allocated SSA registers; transient constant regs
+                 *    that cg_reg_for materialised above ssa_reg_high are
+                 *    dead after their parent instruction and never need to
+                 *    survive a call. (TODO: liveness-based spill — this
+                 *    over-saves SSA values that are dead after the call.) */
+                int spill_count = cg->ssa_reg_high - 8;
+                for (int k = 0; k < spill_count; ++k) {
+                    int32_t off = (int32_t)cg->alloca_bytes + k * 4;
+                    if (cg_stw_sp_off(cg, off, (uint8_t)(8 + k))) break;
+                }
+                if (cg->had_error) break;
+
+                /* 2. Push stacked args (the 9th onward) below the current
+                 *    SP, lowest stacked arg at the lowest address. */
+                if (n_stacked > 0) {
+                    if (cg_sp_sub(cg, n_stacked * 4u)) break;
+                    for (unsigned k = 0; k < n_stacked; ++k) {
+                        if (cg_stw_sp_off(cg, (int32_t)(k * 4u),
+                                          arg_regs[8 + k])) break;
+                    }
+                    if (cg->had_error) break;
+                }
+
+                /* 3. Move first-8 args into R0..R7. SSA homes are >= R8 so
+                 *    they never alias targets — sequential MOVs are safe. */
+                for (unsigned k = 0; k < n_in_reg; ++k) {
+                    if (arg_regs[k] != k)
+                        cg_emit(cg, enc_r(CVM_OP_MOV,
+                                          (uint8_t)k, arg_regs[k], 0));
+                }
+
+                /* 4. CALL or CALLR. */
+                if (is_indirect)
+                    cg_emit(cg, enc_r(CVM_OP_CALLR, callee_reg, 0, 0));
+                else
+                    cg_emit(cg, enc_i24(CVM_OP_CALL, callee_idx));
+                cg->has_calls = 1;
+
+                /* 5. Pop stacked args (caller cleans). */
+                if (n_stacked > 0) {
+                    if (cg_sp_add(cg, n_stacked * 4u)) break;
+                }
+
+                /* 6. Restore R8..R(next_reg-1). */
+                for (int k = 0; k < spill_count; ++k) {
+                    int32_t off = (int32_t)cg->alloca_bytes + k * 4;
+                    if (cg_ldw_sp_off(cg, (uint8_t)(8 + k), off)) break;
+                }
+                if (cg->had_error) break;
+
+                /* 7. Move R0 into the call's SSA home (after restore so
+                 *    the restore doesn't clobber the just-set return). */
+                LLVMTypeRef rty = LLVMTypeOf(i);
+                if (LLVMGetTypeKind(rty) != LLVMVoidTypeKind) {
+                    uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                    if (dst != 0)
+                        cg_emit(cg, enc_r(CVM_OP_MOV, dst, 0, 0));
+                }
                 break;
             }
 
@@ -1261,8 +1719,11 @@ static void put_u32_le(uint8_t *p, uint32_t v) {
 static int write_bin(const char *path,
                      const uint32_t *code, uint32_t code_count,
                      const uint8_t *data, uint32_t data_size,
-                     uint32_t reserve_size,
+                     uint32_t heap_reserve_size,
+                     uint32_t stack_reserve_size,
                      const struct cg_import *imports, int import_count,
+                     const struct cg_func *funcs, int func_count,
+                     int emit_funcs,
                      uint32_t entry)
 {
     FILE *f = fopen(path, "wb");
@@ -1292,16 +1753,30 @@ static int write_bin(const char *path,
         }
     }
 
+    /* Build FUNCS payload (u32[N] of entry offsets). */
+    uint8_t  *funcs_buf  = NULL;
+    uint32_t  funcs_size = 0;
+    if (emit_funcs && func_count > 0) {
+        funcs_size = (uint32_t)func_count * 4u;
+        funcs_buf  = (uint8_t *)malloc(funcs_size);
+        for (int k = 0; k < func_count; ++k)
+            put_u32_le(funcs_buf + (size_t)k * 4u, funcs[k].entry_offset);
+    }
+
     uint32_t section_count = 1u
-                           + (data_size    > 0 ? 1u : 0u)
-                           + (imports_size > 0 ? 1u : 0u)
-                           + (reserve_size > 0 ? 1u : 0u);
+                           + (data_size          > 0 ? 1u : 0u)
+                           + (imports_size       > 0 ? 1u : 0u)
+                           + (heap_reserve_size  > 0 ? 1u : 0u)
+                           + (stack_reserve_size > 0 ? 1u : 0u)
+                           + (funcs_size         > 0 ? 1u : 0u);
     uint32_t table_off = 24;
     uint32_t code_off  = table_off + section_count * 16;
     uint32_t code_size = code_count * 4u;
     uint32_t data_off    = data_size    > 0 ? code_off + code_size : 0;
     uint32_t imports_off = imports_size > 0
                          ? code_off + code_size + data_size : 0;
+    uint32_t funcs_off   = funcs_size > 0
+                         ? code_off + code_size + data_size + imports_size : 0;
 
     uint8_t hdr[24] = {0};
     hdr[0] = 'C'; hdr[1] = 'V'; hdr[2] = 'M'; hdr[3] = '1';
@@ -1335,11 +1810,27 @@ static int write_bin(const char *path,
         put_u32_le(sec + 12, 0u);
         fwrite(sec, sizeof(sec), 1, f);
     }
-    if (reserve_size > 0) {
+    if (heap_reserve_size > 0) {
         memset(sec, 0, sizeof(sec));
         put_u32_le(sec + 0,  CVM_SEC_HEAP_RESERVE);
         put_u32_le(sec + 4,  0u);
-        put_u32_le(sec + 8,  reserve_size);
+        put_u32_le(sec + 8,  heap_reserve_size);
+        put_u32_le(sec + 12, 0u);
+        fwrite(sec, sizeof(sec), 1, f);
+    }
+    if (stack_reserve_size > 0) {
+        memset(sec, 0, sizeof(sec));
+        put_u32_le(sec + 0,  CVM_SEC_STACK_RESERVE);
+        put_u32_le(sec + 4,  0u);
+        put_u32_le(sec + 8,  stack_reserve_size);
+        put_u32_le(sec + 12, 0u);
+        fwrite(sec, sizeof(sec), 1, f);
+    }
+    if (funcs_size > 0) {
+        memset(sec, 0, sizeof(sec));
+        put_u32_le(sec + 0,  CVM_SEC_FUNCS);
+        put_u32_le(sec + 4,  funcs_off);
+        put_u32_le(sec + 8,  funcs_size);
         put_u32_le(sec + 12, 0u);
         fwrite(sec, sizeof(sec), 1, f);
     }
@@ -1352,7 +1843,9 @@ static int write_bin(const char *path,
 
     if (data_size > 0) fwrite(data, 1, data_size, f);
     if (imports_size > 0) fwrite(imports_buf, 1, imports_size, f);
+    if (funcs_size > 0)   fwrite(funcs_buf, 1, funcs_size, f);
     free(imports_buf);
+    free(funcs_buf);
 
     int err = ferror(f);
     fclose(f);
@@ -1367,10 +1860,13 @@ static int write_bin(const char *path,
 
 static void usage(void) {
     fprintf(stderr,
-            "Usage: cvm-translate [-o <out.bin>] [--heap-reserve=N[K|M]] <input.bc>\n"
-            "  -o <file>           Emit a CronoVM .bin (otherwise validate-only).\n"
-            "  --heap-reserve=N    Reserve N bytes of free heap for the user\n"
-            "                      allocator. K and M suffixes accepted.\n");
+            "Usage: cvm-translate [-o <out.bin>] [--heap-reserve=N[K|M]] "
+            "[--stack-reserve=N[K|M]] <input.bc>\n"
+            "  -o <file>            Emit a CronoVM .bin (otherwise validate-only).\n"
+            "  --heap-reserve=N     Reserve N bytes of free heap for the user\n"
+            "                       allocator. K and M suffixes accepted.\n"
+            "  --stack-reserve=N    Reserve N bytes of stack for CALL/RET.\n"
+            "                       Default 16K when the module emits any CALL.\n");
 }
 
 static int parse_size(const char *s, uint32_t *out) {
@@ -1385,10 +1881,14 @@ static int parse_size(const char *s, uint32_t *out) {
     return 0;
 }
 
+#define CVM_DEFAULT_STACK_RESERVE (16u * 1024u)
+
 int main(int argc, char **argv) {
     const char *input  = NULL;
     const char *output = NULL;
     uint32_t    heap_reserve = 0;
+    uint32_t    stack_reserve = 0;
+    int         stack_reserve_set = 0;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-o") == 0) {
@@ -1400,6 +1900,13 @@ int main(int argc, char **argv) {
                         argv[i] + 15);
                 return 2;
             }
+        } else if (strncmp(argv[i], "--stack-reserve=", 16) == 0) {
+            if (parse_size(argv[i] + 16, &stack_reserve) != 0) {
+                fprintf(stderr, "translator: bad --stack-reserve value '%s'\n",
+                        argv[i] + 16);
+                return 2;
+            }
+            stack_reserve_set = 1;
         } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
             fprintf(stderr, "translator: unknown option '%s'\n", argv[i]);
             return 2;
@@ -1437,57 +1944,104 @@ int main(int argc, char **argv) {
     const char *src = LLVMGetSourceFileName(mod, &src_len);
     if (src && src_len) printf("module: %.*s\n", (int)src_len, src);
 
-    LLVMValueRef first_def = NULL;
+    LLVMValueRef main_fn = NULL;
     int defs = 0;
     for (LLVMValueRef fn = LLVMGetFirstFunction(mod);
          fn; fn = LLVMGetNextFunction(fn))
     {
         print_function_summary(fn);
         if (LLVMIsDeclaration(fn)) continue;
-        if (!first_def) first_def = fn;
         ++defs;
         validate_function(fn);
+
+        size_t nl = 0;
+        const char *nm = LLVMGetValueName2(fn, &nl);
+        if (!main_fn || (nm && nl == 4 && memcmp(nm, "main", 4) == 0))
+            main_fn = fn;
     }
     if (defs == 0) ERR(NULL, "module contains no function definitions");
 
     int rc = 0;
 
     if (g_errors == 0 && output) {
-        if (defs > 1) {
-            ERR(NULL, "module has %d function definitions; "
-                      "step-5 codegen handles exactly one", defs);
-        }
-    }
-
-    if (g_errors == 0 && output) {
         struct cg_globals globals = {0};
         globals.td = LLVMCreateTargetData(LLVMGetDataLayoutStr(mod));
-        if (cg_collect_globals(&globals, mod) != 0) {
+
+        struct cg cg = {0};
+        cg.globals = &globals;
+
+        /* Pass 1: assign a stable function index to every definition.
+         * Done before cg_collect_globals so the constant-initialiser
+         * serialiser can map function values in DATA initialisers
+         * (e.g. a `static const fn_t ops[3] = { add, sub, mul };`
+         * dispatch table) to their FUNCS-table indices. Indices also
+         * double as CALL imm24 operands, so they must exist before
+         * any codegen for forward calls to work. */
+        for (LLVMValueRef fn = LLVMGetFirstFunction(mod);
+             fn && rc == 0; fn = LLVMGetNextFunction(fn))
+        {
+            if (LLVMIsDeclaration(fn)) continue;
+            if (cg_func_append(&cg, fn) < 0) { rc = 1; break; }
+        }
+        globals.funcs      = cg.funcs;
+        globals.func_count = cg.func_count;
+
+        if (rc == 0 && cg_collect_globals(&globals, mod) != 0) {
             rc = 1;
-        } else {
-            struct cg cg = {0};
-            cg.globals = &globals;
-            if (cg_function(&cg, first_def) != 0) {
-                rc = 1;
-            } else if (write_bin(output, cg.code, cg.count,
-                                  globals.data_bytes, globals.data_size,
-                                  heap_reserve,
-                                  cg.imports, cg.import_count, 0) != 0) {
+        }
+
+        int main_idx = -1;
+        if (rc == 0 && main_fn) main_idx = cg_func_lookup(&cg, main_fn);
+        if (rc == 0 && main_idx < 0) {
+            ERR(NULL, "internal: no entry function selected");
+            rc = 1;
+        }
+
+        /* Pass 2: emit code for each definition in declaration order.
+         * Each function's entry_offset is recorded so the FUNCS section
+         * and the header.entry field can reference it. */
+        for (int k = 0; k < cg.func_count && rc == 0; ++k) {
+            cg.funcs[k].entry_offset = cg.count;
+            if (cg_function(&cg, cg.funcs[k].value, k) != 0) rc = 1;
+        }
+
+        /* Every translator-emitted function ends in RET, so even leaf
+         * programs need at least the sentinel return PC on the stack.
+         * Default to 16 KiB regardless of CALL usage; --stack-reserve
+         * overrides. Setting it explicitly to 0 produces a binary
+         * whose first RET will trap on out-of-bounds access. */
+        uint32_t stack_size = stack_reserve_set
+                            ? stack_reserve
+                            : CVM_DEFAULT_STACK_RESERVE;
+
+        if (rc == 0) {
+            uint32_t entry_off = cg.funcs[main_idx].entry_offset;
+            if (write_bin(output, cg.code, cg.count,
+                          globals.data_bytes, globals.data_size,
+                          heap_reserve, stack_size,
+                          cg.imports, cg.import_count,
+                          cg.funcs, cg.func_count, cg.has_calls,
+                          entry_off) != 0)
+            {
                 rc = 1;
             } else {
                 printf("translator: wrote %s (%u instructions, %u data bytes, "
-                       "%d imports, %u heap-reserve)\n",
+                       "%d imports, %d funcs, %u heap-reserve, "
+                       "%u stack-reserve)\n",
                        output, cg.count, globals.data_size,
-                       cg.import_count, heap_reserve);
+                       cg.import_count, cg.func_count,
+                       heap_reserve, stack_size);
             }
-            free(cg.code);
-            free(cg.vals);
-            free(cg.regs);
-            free(cg.blocks);
-            free(cg.block_offsets);
-            free(cg.fixups);
-            free(cg.imports);
         }
+        free(cg.code);
+        free(cg.vals);
+        free(cg.regs);
+        free(cg.blocks);
+        free(cg.block_offsets);
+        free(cg.fixups);
+        free(cg.imports);
+        free(cg.funcs);
+        free(cg.allocas);
         cg_globals_dispose(&globals);
     }
 
