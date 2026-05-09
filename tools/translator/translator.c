@@ -530,6 +530,45 @@ struct cg_alloca {
 #define CG_REG_SCRATCH 254u
 #define CG_MAX_SSA_REG 254u   /* SSA values use R8..R253 (R254=scratch, R255=SP) */
 
+/* --- Liveness bitset ---------------------------------------------------- */
+/* 256 bits, indexed by (register - 8). Covers any pre-allocated SSA
+ * register R8..R253 (the spillable range) with room to spare. */
+#define CG_BITS_W 4
+
+typedef struct { uint64_t w[CG_BITS_W]; } cg_bits;
+
+static inline void cg_bits_clear(cg_bits *b) {
+    for (int i = 0; i < CG_BITS_W; ++i) b->w[i] = 0;
+}
+static inline void cg_bits_set(cg_bits *b, unsigned bit) {
+    b->w[bit >> 6] |= (uint64_t)1 << (bit & 63);
+}
+static inline void cg_bits_clear_bit(cg_bits *b, unsigned bit) {
+    b->w[bit >> 6] &= ~((uint64_t)1 << (bit & 63));
+}
+static inline int cg_bits_test(const cg_bits *b, unsigned bit) {
+    return (int)((b->w[bit >> 6] >> (bit & 63)) & 1u);
+}
+static inline void cg_bits_or(cg_bits *dst, const cg_bits *src) {
+    for (int i = 0; i < CG_BITS_W; ++i) dst->w[i] |= src->w[i];
+}
+static inline void cg_bits_andnot(cg_bits *dst, const cg_bits *src) {
+    for (int i = 0; i < CG_BITS_W; ++i) dst->w[i] &= ~src->w[i];
+}
+static inline int cg_bits_eq(const cg_bits *a, const cg_bits *b) {
+    for (int i = 0; i < CG_BITS_W; ++i)
+        if (a->w[i] != b->w[i]) return 0;
+    return 1;
+}
+
+/* For each LLVMCall instruction, the set of SSA registers live immediately
+ * after the call returns. Drives the per-call spill in the LLVMCall handler:
+ * only registers in this set need to be preserved across the call. */
+struct cg_call_live {
+    LLVMValueRef inst;
+    cg_bits      live_after;
+};
+
 struct cg {
     /* Module-level state, persists across all functions. */
     uint32_t *code;
@@ -571,6 +610,22 @@ struct cg {
     struct cg_alloca *allocas;
     int               alloca_count;
     int               alloca_cap;
+
+    /* Liveness analysis (per function, recomputed in cg_function). Indexed
+     * by block index in `cg->blocks`. live_cap tracks the buffer size so
+     * we can reuse the allocation across functions and only realloc when
+     * a function has more blocks than any prior one. */
+    cg_bits *bb_live_in;
+    cg_bits *bb_live_out;
+    int      live_cap;
+
+    /* Per-CALL "live-after" set: for each LLVMCall instruction, the SSA
+     * registers (bit i ↔ R(8+i)) that hold values needed after the call
+     * returns. The CALL handler spills only these registers instead of
+     * everything in [8, ssa_reg_high). */
+    struct cg_call_live *call_lives;
+    int                  call_live_count;
+    int                  call_live_cap;
 
     uint32_t          alloca_bytes;   /* total bytes used by alloca area */
     uint32_t          spill_bytes;    /* (ssa_reg_high - 8) * 4 */
@@ -634,6 +689,7 @@ static void cg_reset_function_state(struct cg *cg) {
     cg->zero_reg = 0;
     cg->cur_block = NULL;
     cg->fn_name = NULL;
+    cg->call_live_count = 0;
 }
 
 static int cg_import_lookup_or_add(struct cg *cg, LLVMValueRef callee,
@@ -1085,6 +1141,233 @@ static void cg_pre_alloc_function(struct cg *cg, LLVMValueRef fn) {
     }
 }
 
+/* --- Liveness analysis --------------------------------------------------- */
+
+/* Map an LLVM value (instruction or function parameter) to its bit index in
+ * the spill bitset, or -1 if the value isn't held in a pre-allocated SSA
+ * register. Constants, globals, function values, basic-block targets, and
+ * transient temps above ssa_reg_high all return -1. */
+static int cg_spill_bit_of(struct cg *cg, LLVMValueRef v) {
+    if (!v) return -1;
+    if (!LLVMIsAInstruction(v) && !LLVMIsAArgument(v)) return -1;
+    int idx = cg_lookup(cg, v);
+    if (idx < 0) return -1;
+    uint8_t r = cg->regs[idx];
+    if (r < 8u || (int)r >= cg->ssa_reg_high) return -1;
+    return (int)r - 8;
+}
+
+/* Compute def[bb], use[bb] (upward-exposed uses), and phi_def[bb] for one
+ * basic block. Phi instructions are skipped during the upward-use walk
+ * (their source operands belong to the predecessor edges, not to this
+ * block); phi result registers are subtracted from `use` at the end so a
+ * non-phi instruction that reads a phi result doesn't make the phi result
+ * appear upward-exposed. */
+static void cg_block_def_use(struct cg *cg, LLVMBasicBlockRef bb,
+                             int is_entry, LLVMValueRef fn,
+                             cg_bits *def_out, cg_bits *use_out,
+                             cg_bits *phi_def_out)
+{
+    cg_bits_clear(def_out);
+    cg_bits_clear(use_out);
+    cg_bits_clear(phi_def_out);
+
+    /* Collect every instruction-defined SSA register, plus the phi subset. */
+    for (LLVMValueRef i = LLVMGetFirstInstruction(bb);
+         i; i = LLVMGetNextInstruction(i))
+    {
+        int b = cg_spill_bit_of(cg, i);
+        if (b < 0) continue;
+        cg_bits_set(def_out, (unsigned)b);
+        if (LLVMGetInstructionOpcode(i) == LLVMPHI)
+            cg_bits_set(phi_def_out, (unsigned)b);
+    }
+
+    /* In the entry block, parameters are conceptually defined at the top
+     * (the prologue copies R0..R7 into their high SSA homes). Marking them
+     * as defs prevents them from being treated as upward-exposed uses. */
+    if (is_entry) {
+        unsigned np = LLVMCountParams(fn);
+        for (unsigned p = 0; p < np; ++p) {
+            int b = cg_spill_bit_of(cg, LLVMGetParam(fn, p));
+            if (b >= 0) cg_bits_set(def_out, (unsigned)b);
+        }
+    }
+
+    /* Backward walk over non-phi instructions to derive upward-exposed uses. */
+    cg_bits live; cg_bits_clear(&live);
+    for (LLVMValueRef i = LLVMGetLastInstruction(bb);
+         i; i = LLVMGetPreviousInstruction(i))
+    {
+        if (LLVMGetInstructionOpcode(i) == LLVMPHI) continue;
+
+        int db = cg_spill_bit_of(cg, i);
+        if (db >= 0) cg_bits_clear_bit(&live, (unsigned)db);
+
+        unsigned no = LLVMGetNumOperands(i);
+        for (unsigned k = 0; k < no; ++k) {
+            int ob = cg_spill_bit_of(cg, LLVMGetOperand(i, k));
+            if (ob >= 0) cg_bits_set(&live, (unsigned)ob);
+        }
+    }
+    /* Phi results are defined at the very top of the block (logically before
+     * any non-phi inst), so any non-phi use we tracked is satisfied locally. */
+    cg_bits_andnot(&live, phi_def_out);
+    *use_out = live;
+}
+
+/* Look up a block's index in cg->blocks (linear scan; block counts are tiny). */
+static int cg_block_index(struct cg *cg, LLVMBasicBlockRef bb) {
+    for (int i = 0; i < cg->block_count; ++i)
+        if (cg->blocks[i] == bb) return i;
+    return -1;
+}
+
+/* OR the set of phi-input source registers from edge P→S into `out`. For
+ * each phi at the top of S, find the incoming pair whose predecessor block
+ * is P and add the source value's spill bit. */
+static void cg_or_phi_use_from_edge(struct cg *cg,
+                                    LLVMBasicBlockRef P, LLVMBasicBlockRef S,
+                                    cg_bits *out)
+{
+    for (LLVMValueRef phi = LLVMGetFirstInstruction(S); phi;
+         phi = LLVMGetNextInstruction(phi))
+    {
+        if (LLVMGetInstructionOpcode(phi) != LLVMPHI) break;
+        unsigned ni = LLVMCountIncoming(phi);
+        for (unsigned k = 0; k < ni; ++k) {
+            if (LLVMGetIncomingBlock(phi, k) != P) continue;
+            int eb = cg_spill_bit_of(cg, LLVMGetIncomingValue(phi, k));
+            if (eb >= 0) cg_bits_set(out, (unsigned)eb);
+            break;
+        }
+    }
+}
+
+/* Standard fixed-point liveness with phi handling:
+ *
+ *   live_in[bb]  = use[bb] ∪ (live_out[bb] − def[bb])
+ *   live_out[P]  = ∪_{S ∈ succ(P)} ((live_in[S] − phi_def[S]) ∪ phi_use(P,S))
+ *
+ * Iterates blocks in reverse order (cheap proxy for reverse postorder).
+ * Block counts are small enough that the naive iteration converges in a
+ * handful of passes. */
+static void cg_compute_liveness(struct cg *cg, LLVMValueRef fn) {
+    int n = cg->block_count;
+    if (n == 0) return;
+
+    if (n > cg->live_cap) {
+        cg->live_cap = n;
+        cg->bb_live_in  = (cg_bits *)realloc(cg->bb_live_in,
+                                             (size_t)n * sizeof(cg_bits));
+        cg->bb_live_out = (cg_bits *)realloc(cg->bb_live_out,
+                                             (size_t)n * sizeof(cg_bits));
+        if (!cg->bb_live_in || !cg->bb_live_out) {
+            perror("realloc"); exit(1);
+        }
+    }
+
+    cg_bits *def     = (cg_bits *)malloc((size_t)n * sizeof(cg_bits));
+    cg_bits *use     = (cg_bits *)malloc((size_t)n * sizeof(cg_bits));
+    cg_bits *phi_def = (cg_bits *)malloc((size_t)n * sizeof(cg_bits));
+    if (!def || !use || !phi_def) { perror("malloc"); exit(1); }
+
+    LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock(fn);
+    for (int b = 0; b < n; ++b) {
+        cg_block_def_use(cg, cg->blocks[b], cg->blocks[b] == entry, fn,
+                         &def[b], &use[b], &phi_def[b]);
+        cg_bits_clear(&cg->bb_live_in[b]);
+        cg_bits_clear(&cg->bb_live_out[b]);
+    }
+
+    int changed = 1;
+    while (changed) {
+        changed = 0;
+        for (int b = n - 1; b >= 0; --b) {
+            LLVMBasicBlockRef bb = cg->blocks[b];
+            cg_bits new_out; cg_bits_clear(&new_out);
+
+            LLVMValueRef term = LLVMGetBasicBlockTerminator(bb);
+            unsigned ns = term ? LLVMGetNumSuccessors(term) : 0;
+            for (unsigned s = 0; s < ns; ++s) {
+                LLVMBasicBlockRef succ = LLVMGetSuccessor(term, s);
+                int si = cg_block_index(cg, succ);
+                if (si < 0) continue;
+
+                cg_bits tmp = cg->bb_live_in[si];
+                cg_bits_andnot(&tmp, &phi_def[si]);
+                cg_bits_or(&new_out, &tmp);
+                cg_or_phi_use_from_edge(cg, bb, succ, &new_out);
+            }
+
+            cg_bits new_in = use[b];
+            cg_bits tmp_in = new_out;
+            cg_bits_andnot(&tmp_in, &def[b]);
+            cg_bits_or(&new_in, &tmp_in);
+
+            if (!cg_bits_eq(&new_in, &cg->bb_live_in[b])) {
+                changed = 1;
+                cg->bb_live_in[b] = new_in;
+            }
+            if (!cg_bits_eq(&new_out, &cg->bb_live_out[b])) {
+                changed = 1;
+                cg->bb_live_out[b] = new_out;
+            }
+        }
+    }
+
+    free(def); free(use); free(phi_def);
+}
+
+/* Walk every block backward and snapshot, for each LLVMCall instruction,
+ * the set of spillable SSA registers live at the program point immediately
+ * after the call. The CALL handler in cg_function consults this table to
+ * spill only what the callee would clobber. */
+static void cg_compute_call_liveouts(struct cg *cg) {
+    cg->call_live_count = 0;
+    for (int b = 0; b < cg->block_count; ++b) {
+        LLVMBasicBlockRef bb = cg->blocks[b];
+        cg_bits live = cg->bb_live_out[b];
+        for (LLVMValueRef i = LLVMGetLastInstruction(bb); i;
+             i = LLVMGetPreviousInstruction(i))
+        {
+            LLVMOpcode op = LLVMGetInstructionOpcode(i);
+            if (op == LLVMPHI) continue;
+
+            /* Snapshot before applying i's effects: `live` here is the set
+             * of registers live at the program point AFTER i has executed. */
+            if (op == LLVMCall) {
+                if (cg->call_live_count == cg->call_live_cap) {
+                    cg->call_live_cap = cg->call_live_cap
+                                        ? cg->call_live_cap * 2 : 16;
+                    cg->call_lives = (struct cg_call_live *)realloc(
+                        cg->call_lives,
+                        (size_t)cg->call_live_cap * sizeof(*cg->call_lives));
+                    if (!cg->call_lives) { perror("realloc"); exit(1); }
+                }
+                cg->call_lives[cg->call_live_count].inst       = i;
+                cg->call_lives[cg->call_live_count].live_after = live;
+                cg->call_live_count++;
+            }
+
+            int db = cg_spill_bit_of(cg, i);
+            if (db >= 0) cg_bits_clear_bit(&live, (unsigned)db);
+            unsigned no = LLVMGetNumOperands(i);
+            for (unsigned k = 0; k < no; ++k) {
+                int ob = cg_spill_bit_of(cg, LLVMGetOperand(i, k));
+                if (ob >= 0) cg_bits_set(&live, (unsigned)ob);
+            }
+        }
+    }
+}
+
+static const cg_bits *cg_lookup_call_live(struct cg *cg, LLVMValueRef call) {
+    for (int i = 0; i < cg->call_live_count; ++i)
+        if (cg->call_lives[i].inst == call)
+            return &cg->call_lives[i].live_after;
+    return NULL;
+}
+
 static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
     cg_reset_function_state(cg);
     cg->fn_name = value_name(fn);
@@ -1108,6 +1391,13 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
     cg->spill_bytes = (uint32_t)(cg->ssa_reg_high - 8) * 4u;
     cg->frame_bytes = cg->alloca_bytes + cg->spill_bytes;
     cg->funcs[func_idx].frame_size = cg->frame_bytes;
+
+    /* Liveness analysis: lets the LLVMCall handler spill only the SSA
+     * registers actually live across each call site. Slot assignment in
+     * the spill area is unchanged (slot k for register 8+k); we just emit
+     * fewer STW/LDW pairs around each CALL. */
+    cg_compute_liveness(cg, fn);
+    cg_compute_call_liveouts(cg);
 
     /* Prologue: SUB SP, SP, frame. */
     if (cg_sp_sub(cg, cg->frame_bytes)) return 1;
@@ -1703,15 +1993,38 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     arg_regs[k] = cg_reg_for(cg, LLVMGetOperand(i, k));
                 if (cg->had_error) break;
 
-                /* 1. Caller-saved spill: dump R8..R(ssa_reg_high-1) to the
-                 *    spill area at [SP+alloca_bytes ..]. We only spill the
-                 *    pre-allocated SSA registers; transient constant regs
-                 *    that cg_reg_for materialised above ssa_reg_high are
-                 *    dead after their parent instruction and never need to
-                 *    survive a call. (TODO: liveness-based spill — this
-                 *    over-saves SSA values that are dead after the call.) */
+                /* 1. Caller-saved spill, narrowed by liveness analysis.
+                 *    `cg_compute_call_liveouts` precomputed, for each
+                 *    LLVMCall, the set of SSA registers (R8..R(ssa_reg_high
+                 *    -1)) that hold values used after the call returns.
+                 *    Only those registers need to be preserved. The call's
+                 *    own destination register is excluded explicitly: its
+                 *    pre-call contents are garbage from this call's POV
+                 *    (that register is exclusively assigned to the SSA
+                 *    value the call is about to define), and the post-call
+                 *    `MOV dst, R0` writes the actual return value, so a
+                 *    spill/restore round-trip would just shuffle garbage. */
+                cg_bits spill_set;
+                const cg_bits *live = cg_lookup_call_live(cg, i);
+                if (live) {
+                    spill_set = *live;
+                    int my_bit = cg_spill_bit_of(cg, i);
+                    if (my_bit >= 0)
+                        cg_bits_clear_bit(&spill_set, (unsigned)my_bit);
+                } else {
+                    /* Defensive fallback: if liveness wasn't recorded for
+                     * this call (shouldn't happen — every LLVMCall is
+                     * snapshotted), fall back to spilling everything so
+                     * correctness never depends on the analysis. */
+                    cg_bits_clear(&spill_set);
+                    int sc = cg->ssa_reg_high - 8;
+                    for (int k = 0; k < sc; ++k)
+                        cg_bits_set(&spill_set, (unsigned)k);
+                }
+
                 int spill_count = cg->ssa_reg_high - 8;
                 for (int k = 0; k < spill_count; ++k) {
+                    if (!cg_bits_test(&spill_set, (unsigned)k)) continue;
                     int32_t off = (int32_t)cg->alloca_bytes + k * 4;
                     if (cg_stw_sp_off(cg, off, (uint8_t)(8 + k))) break;
                 }
@@ -1751,8 +2064,12 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     if (cg_sp_add(cg, n_stacked * 4u)) break;
                 }
 
-                /* 6. Restore R8..R(next_reg-1). */
+                /* 6. Restore the same registers we spilled in step 1 (and
+                 *    only those; an LDW with no matching STW would load
+                 *    stale spill-area bytes from a previous call site or
+                 *    uninitialised stack memory). */
                 for (int k = 0; k < spill_count; ++k) {
+                    if (!cg_bits_test(&spill_set, (unsigned)k)) continue;
                     int32_t off = (int32_t)cg->alloca_bytes + k * 4;
                     if (cg_ldw_sp_off(cg, (uint8_t)(8 + k), off)) break;
                 }
@@ -2121,6 +2438,9 @@ int main(int argc, char **argv) {
         free(cg.imports);
         free(cg.funcs);
         free(cg.allocas);
+        free(cg.bb_live_in);
+        free(cg.bb_live_out);
+        free(cg.call_lives);
         cg_globals_dispose(&globals);
     }
 

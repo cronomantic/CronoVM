@@ -11,17 +11,22 @@ user.c ──[ clang -emit-llvm ]──▶ user.bc ──[ cvm-translate ]──
 The translator is **not** part of the runtime. The VM binary you ship with
 your game has zero LLVM dependency.
 
-## Status (step 8)
+## Status (step 9)
 
 Codegen now covers **scalar i32 arithmetic, comparisons, branches,
 multi-block control flow, `select`, calls between user functions
 (direct, recursive, indirect, with > 8 args), entry-block allocas
 with escaping pointers, i8/i16 memory ops, arbitrary 32-bit
-constants, a NULL-fn-pointer trap, and the
-`llvm.memcpy`/`llvm.memset`/`llvm.memmove` block intrinsics
-(struct copies and array `memset`/`memmove` lower to single
-`MEMCPY`/`MEMSET`/`MEMMOVE` opcodes)**. The biggest remaining
-gaps are 64-bit and floating-point types.
+constants, a NULL-fn-pointer trap, the
+`llvm.memcpy`/`llvm.memset`/`llvm.memmove` block intrinsics, and
+liveness-based spill at every call site (only SSA values still
+live after the call get a STW/LDW round-trip)**. The biggest
+remaining gaps are 64-bit and floating-point types.
+
+`fib_recursive.bin` shrank from 135 to 51 instructions when
+liveness landed (62% fewer); a deeply recursive function with
+several SSA temps in flight is exactly the case the prior
+spill-everything was worst at.
 
 ```text
 $ cvm-translate build/fib_recursive.bc -o build/fib_recursive.bin
@@ -184,8 +189,33 @@ non-syscall non-intrinsic):
 6. Reload `R8..R(ssa_reg_high-1)` from the spill area.
 7. `MOV dst, R0` for the call's return value (when not `void`).
 
-Spill is currently *spill-everything*. A future pass will narrow it
-to values genuinely live across the call.
+Spill is **liveness-narrowed** as of step 9. The codegen runs a
+standard fixed-point liveness analysis after pre-allocation:
+
+- `cg_block_def_use` computes `def[bb]`, `phi_def[bb]`, and
+  `use[bb]` (upward-exposed uses) for each block. Phi instructions
+  are skipped during the upward-use walk because their source
+  operands logically belong to the predecessor edges, not to the
+  block containing the phi.
+- The fixed-point computes `live_in[bb]` and `live_out[bb]` with
+  `live_out[P] = ∪_{S} ((live_in[S] − phi_def[S]) ∪
+  phi_use(P, S))`, where `phi_use(P, S)` is the set of phi-input
+  source registers on edge P→S.
+- `cg_compute_call_liveouts` then walks each block backward,
+  snapshotting at every `LLVMCall` the set of spillable registers
+  live at the program point immediately after the call.
+
+The CALL handler consults that snapshot via
+`cg_lookup_call_live` and only spills/restores registers in the
+set, with the call's own destination register masked out (it
+holds garbage from the caller's POV and is overwritten by the
+post-call `MOV dst, R0`). The slot mapping in the spill area is
+unchanged (slot k for register 8+k); only the count of emitted
+STW/LDW pairs goes down.
+
+A defensive fallback in the CALL handler reverts to spilling
+everything if a call instruction has no recorded live set —
+correctness never depends on the analysis being complete.
 
 ### Syscall lowering
 
