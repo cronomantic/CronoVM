@@ -45,7 +45,7 @@ set(_fixture_out ${CMAKE_CURRENT_BINARY_DIR})
 set(_fixture_targets "")
 foreach(name add pick fib abs max divmod bitops counter sum_global
              alloc_sum two_funcs fib_recursive many_args alloca_swap
-             fnptr dispatch_table narrow_ops reject_double)
+             fnptr dispatch_table narrow_ops mem_intrin reject_double)
     set(_src ${_fixture_dir}/${name}.c)
     set(_bc  ${_fixture_out}/${name}.bc)
     add_custom_command(
@@ -64,7 +64,7 @@ add_custom_target(translator_fixtures DEPENDS ${_fixture_targets})
 set(_emit_targets "")
 foreach(name add pick fib abs max divmod bitops counter sum_global
              two_funcs fib_recursive many_args alloca_swap fnptr
-             dispatch_table narrow_ops)
+             dispatch_table narrow_ops mem_intrin)
     set(_bc  ${_fixture_out}/${name}.bc)
     set(_bin ${_fixture_out}/${name}.bin)
     add_custom_command(
@@ -138,6 +138,7 @@ add_test(NAME e2e_dispatch_add     COMMAND test_e2e ${_fixture_out}/dispatch_tab
 add_test(NAME e2e_dispatch_sub     COMMAND test_e2e ${_fixture_out}/dispatch_table.bin   4 1 7 3)
 add_test(NAME e2e_dispatch_mul     COMMAND test_e2e ${_fixture_out}/dispatch_table.bin  21 2 7 3)
 add_test(NAME e2e_narrow_ops       COMMAND test_e2e ${_fixture_out}/narrow_ops.bin    16214 8)
+add_test(NAME e2e_mem_intrin       COMMAND test_e2e ${_fixture_out}/mem_intrin.bin     226 10)
 set_tests_properties(
     e2e_add e2e_pick_true e2e_pick_false e2e_fib_10 e2e_fib_0
     e2e_abs_neg e2e_abs_pos e2e_max_lhs e2e_max_rhs
@@ -145,5 +146,5 @@ set_tests_properties(
     e2e_two_funcs e2e_fib_rec_10 e2e_fib_rec_1 e2e_fib_rec_0
     e2e_many_args e2e_alloca_swap e2e_fnptr_add e2e_fnptr_sub
     e2e_dispatch_add e2e_dispatch_sub e2e_dispatch_mul
-    e2e_narrow_ops
+    e2e_narrow_ops e2e_mem_intrin
     PROPERTIES FIXTURES_REQUIRED emitted_bins)

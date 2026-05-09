@@ -431,6 +431,9 @@ int cvm_run_args(struct cvm_image *img,
         [CVM_OP_LDH]     = &&L_LDH,
         [CVM_OP_STH]     = &&L_STH,
         [CVM_OP_MOVHI]   = &&L_MOVHI,
+        [CVM_OP_MEMCPY]  = &&L_MEMCPY,
+        [CVM_OP_MEMSET]  = &&L_MEMSET,
+        [CVM_OP_MEMMOVE] = &&L_MEMMOVE,
     };
 
 #  define DISPATCH() do {                                  \
@@ -603,6 +606,37 @@ int cvm_run_args(struct cvm_image *img,
         R[a] = (int32_t)((hi << 16) | ((uint32_t)R[a] & 0xFFFFu));
         DISPATCH();
     }
+    L_MEMCPY: {
+        uint32_t dst = (uint32_t)R[a];
+        uint32_t src = (uint32_t)R[b];
+        uint32_t len = (uint32_t)R[c];
+        if (len) {
+            if (dst > mem_size || mem_size - dst < len) return CVM_E_BAD_ADDR;
+            if (src > mem_size || mem_size - src < len) return CVM_E_BAD_ADDR;
+            memcpy(heap + dst, heap + src, len);
+        }
+        DISPATCH();
+    }
+    L_MEMSET: {
+        uint32_t dst = (uint32_t)R[a];
+        uint32_t len = (uint32_t)R[c];
+        if (len) {
+            if (dst > mem_size || mem_size - dst < len) return CVM_E_BAD_ADDR;
+            memset(heap + dst, (int)((uint32_t)R[b] & 0xFFu), len);
+        }
+        DISPATCH();
+    }
+    L_MEMMOVE: {
+        uint32_t dst = (uint32_t)R[a];
+        uint32_t src = (uint32_t)R[b];
+        uint32_t len = (uint32_t)R[c];
+        if (len) {
+            if (dst > mem_size || mem_size - dst < len) return CVM_E_BAD_ADDR;
+            if (src > mem_size || mem_size - src < len) return CVM_E_BAD_ADDR;
+            memmove(heap + dst, heap + src, len);
+        }
+        DISPATCH();
+    }
 
 #  undef DISPATCH
 
@@ -759,6 +793,37 @@ int cvm_run_args(struct cvm_image *img,
         case CVM_OP_MOVHI: {
             uint32_t hi = (inst >> 16) & 0xFFFFu;
             R[a] = (int32_t)((hi << 16) | ((uint32_t)R[a] & 0xFFFFu));
+            break;
+        }
+        case CVM_OP_MEMCPY: {
+            uint32_t dst = (uint32_t)R[a];
+            uint32_t src = (uint32_t)R[b];
+            uint32_t len = (uint32_t)R[c];
+            if (len) {
+                if (dst > mem_size || mem_size - dst < len) return CVM_E_BAD_ADDR;
+                if (src > mem_size || mem_size - src < len) return CVM_E_BAD_ADDR;
+                memcpy(heap + dst, heap + src, len);
+            }
+            break;
+        }
+        case CVM_OP_MEMSET: {
+            uint32_t dst = (uint32_t)R[a];
+            uint32_t len = (uint32_t)R[c];
+            if (len) {
+                if (dst > mem_size || mem_size - dst < len) return CVM_E_BAD_ADDR;
+                memset(heap + dst, (int)((uint32_t)R[b] & 0xFFu), len);
+            }
+            break;
+        }
+        case CVM_OP_MEMMOVE: {
+            uint32_t dst = (uint32_t)R[a];
+            uint32_t src = (uint32_t)R[b];
+            uint32_t len = (uint32_t)R[c];
+            if (len) {
+                if (dst > mem_size || mem_size - dst < len) return CVM_E_BAD_ADDR;
+                if (src > mem_size || mem_size - src < len) return CVM_E_BAD_ADDR;
+                memmove(heap + dst, heap + src, len);
+            }
             break;
         }
         default:

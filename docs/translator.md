@@ -11,15 +11,17 @@ user.c ──[ clang -emit-llvm ]──▶ user.bc ──[ cvm-translate ]──
 The translator is **not** part of the runtime. The VM binary you ship with
 your game has zero LLVM dependency.
 
-## Status (step 7b)
+## Status (step 8)
 
 Codegen now covers **scalar i32 arithmetic, comparisons, branches,
 multi-block control flow, `select`, calls between user functions
 (direct, recursive, indirect, with > 8 args), entry-block allocas
 with escaping pointers, i8/i16 memory ops, arbitrary 32-bit
-constants, and a NULL-fn-pointer trap**. The biggest remaining
-gaps are `llvm.memcpy`/`memset`/`memmove` (struct/string copies)
-and 64-bit / floating-point types.
+constants, a NULL-fn-pointer trap, and the
+`llvm.memcpy`/`llvm.memset`/`llvm.memmove` block intrinsics
+(struct copies and array `memset`/`memmove` lower to single
+`MEMCPY`/`MEMSET`/`MEMMOVE` opcodes)**. The biggest remaining
+gaps are 64-bit and floating-point types.
 
 ```text
 $ cvm-translate build/fib_recursive.bc -o build/fib_recursive.bin
@@ -113,7 +115,11 @@ the gap is what's still being implemented:
   via `MOVI scratch, (32-w); SHL dst, src, scratch; SAR dst, dst,
   scratch` — three instructions per narrow signed load
 - intrinsic calls: `llvm.abs.i32`, `llvm.smax.i32`, `llvm.smin.i32`,
-  `llvm.umax.i32`, `llvm.umin.i32`; `llvm.lifetime.start/end` (no-ops)
+  `llvm.umax.i32`, `llvm.umin.i32`; `llvm.memcpy.*`, `llvm.memset.*`,
+  `llvm.memmove.*` (lowered to single `MEMCPY`/`MEMSET`/`MEMMOVE`
+  opcodes — the i1 isvolatile operand is metadata and ignored;
+  length must be i32, since i64 size_t isn't in the subset);
+  `llvm.lifetime.start/end` (no-ops)
 - syscall calls: any `cvm_sys_*` function call lowers to `SYSCALL`
 - user calls: direct calls to functions defined in the same module
   lower to `CALL imm24`, with caller-saved spill, R0..R7+stack arg
@@ -136,8 +142,7 @@ a zero-initialised function pointer (LLVM `null` → 0 bytes in DATA)
 naturally traps with `CVM_E_NULL_FUNC_PTR` when called instead of
 silently dispatching to the first user function.
 
-`llvm.memcpy` / `llvm.memset` / `llvm.memmove` and `extern` data globals
-still error out — they need per-intrinsic lowerings.
+`extern` data globals still error out (no host-side data linking yet).
 
 ### Calling convention
 

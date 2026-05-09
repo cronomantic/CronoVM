@@ -1594,6 +1594,50 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     break;
                 }
 
+                /* Block memory intrinsics — `llvm.memcpy.p0.p0.iN(dst, src,
+                 * len, isvolatile)`, `llvm.memset.p0.iN(dst, val, len,
+                 * isvolatile)`, `llvm.memmove.p0.p0.iN(dst, src, len,
+                 * isvolatile)`. The fourth operand (i1 isvolatile) is
+                 * compile-time metadata; the runtime ignores it. The length
+                 * argument is i32 (i386-elf size_t); a wider variant would
+                 * be rejected by the type-subset check upstream. */
+                {
+                    int is_memcpy  = (strncmp(name, "llvm.memcpy.",  12) == 0);
+                    int is_memmove = (strncmp(name, "llvm.memmove.", 13) == 0);
+                    int is_memset  = (strncmp(name, "llvm.memset.",  12) == 0);
+                    if (is_memcpy || is_memmove || is_memset) {
+                        unsigned narg = LLVMGetNumArgOperands(i);
+                        if (narg < 3) {
+                            ERR(cg->fn_name,
+                                "intrinsic '%s' has %u args; expected >= 3",
+                                name, narg);
+                            cg->had_error = 1;
+                            break;
+                        }
+                        /* Length must be i32 — i64 would mean ptr-size = 64,
+                         * which the type-subset check rejects elsewhere. */
+                        LLVMTypeRef lty = LLVMTypeOf(LLVMGetOperand(i, 2));
+                        if (LLVMGetTypeKind(lty) != LLVMIntegerTypeKind ||
+                            LLVMGetIntTypeWidth(lty) != 32)
+                        {
+                            ERR(cg->fn_name,
+                                "intrinsic '%s': length operand must be i32",
+                                name);
+                            cg->had_error = 1;
+                            break;
+                        }
+                        uint8_t dst = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                        uint8_t mid = cg_reg_for(cg, LLVMGetOperand(i, 1));
+                        uint8_t len = cg_reg_for(cg, LLVMGetOperand(i, 2));
+                        if (cg->had_error) break;
+                        uint8_t opc = is_memcpy  ? CVM_OP_MEMCPY
+                                    : is_memmove ? CVM_OP_MEMMOVE
+                                                 : CVM_OP_MEMSET;
+                        cg_emit(cg, enc_r(opc, dst, mid, len));
+                        break;
+                    }
+                }
+
                 /* Lifetime markers are pure metadata in our world: they
                  * tell the optimiser when an alloca is in/out of use, but
                  * have no runtime effect. Drop them silently. */

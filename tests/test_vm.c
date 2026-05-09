@@ -699,6 +699,192 @@ static void test_null_func_ptr_callr(void) {
     cvm_image_free(&img); free(blob);
 }
 
+/* --- Block memory ops --------------------------------------------------- */
+
+/* Helper: build a blob with arbitrary BSS, a stack region for any RET that
+ * may need it, and run it returning the post-run heap snapshot via cap. */
+static int run_with_heap(const uint32_t *code, uint32_t n,
+                         uint32_t bss_size,
+                         uint8_t **out_heap, uint32_t *out_heap_size,
+                         int32_t *out_v)
+{
+    size_t len;
+    uint8_t *blob = build_blob(code, n, bss_size, 0, &len);
+    struct cvm_image img;
+    int r = cvm_load(blob, len, &img);
+    if (r != CVM_OK) { free(blob); return r; }
+    r = cvm_run(&img, out_v);
+    if (out_heap && out_heap_size) {
+        *out_heap_size = img.heap_size;
+        *out_heap = (uint8_t *)malloc(img.heap_size);
+        if (*out_heap) memcpy(*out_heap, img.heap, img.heap_size);
+    }
+    cvm_image_free(&img);
+    free(blob);
+    return r;
+}
+
+static void test_memcpy_basic(void) {
+    /* DATA-less; BSS=64. Set bytes 0..7 via STB to {1..8}, then MEMCPY 8 bytes
+     * from offset 0 to offset 16, and read offset 22 back via LDB. */
+    uint32_t code[] = {
+        enc_i16(CVM_OP_MOVI, 0, 0),    /* base addr */
+        /* Write bytes 1..8 at heap[0..7] */
+        enc_i16(CVM_OP_MOVI, 1, 1), enc_r(CVM_OP_STB, 0, 0, 1),
+        enc_i16(CVM_OP_MOVI, 2, 1), enc_r(CVM_OP_ADD, 0, 0, 2),
+        enc_i16(CVM_OP_MOVI, 1, 2), enc_r(CVM_OP_STB, 0, 0, 1),
+        enc_r  (CVM_OP_ADD, 0, 0, 2),
+        enc_i16(CVM_OP_MOVI, 1, 3), enc_r(CVM_OP_STB, 0, 0, 1),
+        enc_r  (CVM_OP_ADD, 0, 0, 2),
+        enc_i16(CVM_OP_MOVI, 1, 4), enc_r(CVM_OP_STB, 0, 0, 1),
+        enc_r  (CVM_OP_ADD, 0, 0, 2),
+        enc_i16(CVM_OP_MOVI, 1, 5), enc_r(CVM_OP_STB, 0, 0, 1),
+        enc_r  (CVM_OP_ADD, 0, 0, 2),
+        enc_i16(CVM_OP_MOVI, 1, 6), enc_r(CVM_OP_STB, 0, 0, 1),
+        enc_r  (CVM_OP_ADD, 0, 0, 2),
+        enc_i16(CVM_OP_MOVI, 1, 7), enc_r(CVM_OP_STB, 0, 0, 1),
+        enc_r  (CVM_OP_ADD, 0, 0, 2),
+        enc_i16(CVM_OP_MOVI, 1, 8), enc_r(CVM_OP_STB, 0, 0, 1),
+        /* MEMCPY heap[16..23] <- heap[0..7] */
+        enc_i16(CVM_OP_MOVI, 3, 16),    /* dst */
+        enc_i16(CVM_OP_MOVI, 4, 0),     /* src */
+        enc_i16(CVM_OP_MOVI, 5, 8),     /* len */
+        enc_r  (CVM_OP_MEMCPY, 3, 4, 5),
+        /* Read back heap[22] -> R10, return R10 (should be 7). */
+        enc_i16(CVM_OP_MOVI, 6, 22),
+        enc_r  (CVM_OP_LDB, 10, 6, 0),
+        enc_r  (CVM_OP_HALT, 10, 0, 0),
+    };
+    int32_t v = 0;
+    uint8_t *heap = NULL; uint32_t hsz = 0;
+    int r = run_with_heap(code, sizeof(code)/sizeof(code[0]), 64,
+                          &heap, &hsz, &v);
+    CHECK(r == CVM_OK, "memcpy basic: %s", cvm_strerror(r));
+    CHECK(v == 7, "memcpy basic: got byte=%d", v);
+    if (heap) {
+        for (int i = 0; i < 8; ++i)
+            CHECK(heap[16 + i] == i + 1,
+                  "memcpy basic: heap[%d]=%u", 16+i, heap[16+i]);
+    }
+    free(heap);
+}
+
+static void test_memset_basic(void) {
+    /* BSS=32. MEMSET heap[4..19] = 0xAB; check first/last/inside. */
+    uint32_t code[] = {
+        enc_i16(CVM_OP_MOVI, 0, 4),     /* dst */
+        enc_i16(CVM_OP_MOVI, 1, 0xAB),  /* val (low 8 bits) */
+        enc_i16(CVM_OP_MOVI, 2, 16),    /* len */
+        enc_r  (CVM_OP_MEMSET, 0, 1, 2),
+        /* Sentinel: heap[3] and heap[20] must remain 0 (BSS-zero). */
+        enc_i16(CVM_OP_MOVI, 3, 3), enc_r(CVM_OP_LDB, 10, 3, 0),
+        enc_i16(CVM_OP_MOVI, 4, 4), enc_r(CVM_OP_LDB, 11, 4, 0),
+        enc_i16(CVM_OP_MOVI, 5, 19), enc_r(CVM_OP_LDB, 12, 5, 0),
+        enc_i16(CVM_OP_MOVI, 6, 20), enc_r(CVM_OP_LDB, 13, 6, 0),
+        /* Return a packed checksum: r10*1 + r11 + r12 + r13*1.
+         * Expected: 0 + 0xAB + 0xAB + 0 = 0x156. */
+        enc_r  (CVM_OP_ADD, 14, 10, 11),
+        enc_r  (CVM_OP_ADD, 14, 14, 12),
+        enc_r  (CVM_OP_ADD, 14, 14, 13),
+        enc_r  (CVM_OP_HALT, 14, 0, 0),
+    };
+    int32_t v = 0;
+    int r = run_with_heap(code, sizeof(code)/sizeof(code[0]), 32,
+                          NULL, NULL, &v);
+    CHECK(r == CVM_OK, "memset basic: %s", cvm_strerror(r));
+    CHECK(v == 0x156, "memset basic: checksum=0x%x", (unsigned)v);
+}
+
+static void test_memmove_overlap(void) {
+    /* Forward overlap: heap[0..7] = {1..8}, then memmove(heap+2, heap, 6).
+     * Expected after move: heap = { 1,2, 1,2,3,4,5,6, 0... }.
+     * memcpy on this overlap would be UB; memmove must handle it. */
+    uint32_t code[] = {
+        enc_i16(CVM_OP_MOVI, 0, 0),
+        enc_i16(CVM_OP_MOVI, 1, 1), enc_r(CVM_OP_STB, 0, 0, 1),
+        enc_i16(CVM_OP_MOVI, 0, 1),
+        enc_i16(CVM_OP_MOVI, 1, 2), enc_r(CVM_OP_STB, 0, 0, 1),
+        enc_i16(CVM_OP_MOVI, 0, 2),
+        enc_i16(CVM_OP_MOVI, 1, 3), enc_r(CVM_OP_STB, 0, 0, 1),
+        enc_i16(CVM_OP_MOVI, 0, 3),
+        enc_i16(CVM_OP_MOVI, 1, 4), enc_r(CVM_OP_STB, 0, 0, 1),
+        enc_i16(CVM_OP_MOVI, 0, 4),
+        enc_i16(CVM_OP_MOVI, 1, 5), enc_r(CVM_OP_STB, 0, 0, 1),
+        enc_i16(CVM_OP_MOVI, 0, 5),
+        enc_i16(CVM_OP_MOVI, 1, 6), enc_r(CVM_OP_STB, 0, 0, 1),
+        /* memmove(2, 0, 6) — destination overlaps source on the right */
+        enc_i16(CVM_OP_MOVI, 3, 2),
+        enc_i16(CVM_OP_MOVI, 4, 0),
+        enc_i16(CVM_OP_MOVI, 5, 6),
+        enc_r  (CVM_OP_MEMMOVE, 3, 4, 5),
+        enc_i16(CVM_OP_MOVI, 0, 0),
+        enc_r  (CVM_OP_HALT, 0, 0, 0),
+    };
+    int32_t v = -1;
+    uint8_t *heap = NULL; uint32_t hsz = 0;
+    int r = run_with_heap(code, sizeof(code)/sizeof(code[0]), 16,
+                          &heap, &hsz, &v);
+    CHECK(r == CVM_OK, "memmove fwd: %s", cvm_strerror(r));
+    if (heap && hsz >= 8) {
+        const uint8_t expect[8] = { 1,2,1,2,3,4,5,6 };
+        for (int i = 0; i < 8; ++i)
+            CHECK(heap[i] == expect[i],
+                  "memmove fwd: heap[%d]=%u expected %u",
+                  i, heap[i], expect[i]);
+    }
+    free(heap);
+}
+
+static void test_mem_zero_len(void) {
+    /* Zero-length op must succeed even when dst/src look out of range. */
+    uint32_t code[] = {
+        enc_i16(CVM_OP_MOVI, 0, 1000),      /* dst out of range */
+        enc_i16(CVM_OP_MOVI, 1, 1000),      /* src out of range */
+        enc_i16(CVM_OP_MOVI, 2, 0),         /* len = 0 */
+        enc_r  (CVM_OP_MEMCPY, 0, 1, 2),
+        enc_r  (CVM_OP_MEMSET, 0, 1, 2),
+        enc_r  (CVM_OP_MEMMOVE, 0, 1, 2),
+        enc_i16(CVM_OP_MOVI, 3, 99),
+        enc_r  (CVM_OP_HALT, 3, 0, 0),
+    };
+    int32_t v = 0;
+    int r = run_with_heap(code, sizeof(code)/sizeof(code[0]), 16,
+                          NULL, NULL, &v);
+    CHECK(r == CVM_OK, "mem zero-len: %s", cvm_strerror(r));
+    CHECK(v == 99, "mem zero-len: got %d", v);
+}
+
+static void test_memcpy_oob_dst(void) {
+    /* Heap is 16 bytes; MEMCPY of 8 bytes starting at offset 12 (would touch
+     * bytes 12..19) must trap. */
+    uint32_t code[] = {
+        enc_i16(CVM_OP_MOVI, 0, 12),        /* dst near top */
+        enc_i16(CVM_OP_MOVI, 1, 0),         /* src */
+        enc_i16(CVM_OP_MOVI, 2, 8),         /* len */
+        enc_r  (CVM_OP_MEMCPY, 0, 1, 2),
+        enc_r  (CVM_OP_HALT, 0, 0, 0),
+    };
+    int32_t v = 0;
+    int r = run_with_heap(code, sizeof(code)/sizeof(code[0]), 16,
+                          NULL, NULL, &v);
+    CHECK(r == CVM_E_BAD_ADDR, "memcpy oob dst: got %s", cvm_strerror(r));
+}
+
+static void test_memset_oob(void) {
+    /* Heap 16 bytes; MEMSET starting at offset 8 with len=12 overflows. */
+    uint32_t code[] = {
+        enc_i16(CVM_OP_MOVI, 0, 8),
+        enc_i16(CVM_OP_MOVI, 1, 0),
+        enc_i16(CVM_OP_MOVI, 2, 12),
+        enc_r  (CVM_OP_MEMSET, 0, 1, 2),
+        enc_r  (CVM_OP_HALT, 0, 0, 0),
+    };
+    int32_t v = 0;
+    int r = run_with_heap(code, sizeof(code)/sizeof(code[0]), 16,
+                          NULL, NULL, &v);
+    CHECK(r == CVM_E_BAD_ADDR, "memset oob: got %s", cvm_strerror(r));
+}
+
 static void test_loader_rejects(void) {
     /* Bad magic */
     uint8_t bogus[24] = {0};
@@ -737,6 +923,12 @@ int main(void) {
     test_movhi_wide_const();
     test_null_func_ptr_call();
     test_null_func_ptr_callr();
+    test_memcpy_basic();
+    test_memset_basic();
+    test_memmove_overlap();
+    test_mem_zero_len();
+    test_memcpy_oob_dst();
+    test_memset_oob();
 
     if (g_failures) {
         fprintf(stderr, "%d test(s) failed\n", g_failures);

@@ -54,6 +54,9 @@ an offset of `0` means "fall through to the next instruction".
 | 0x21 | `LDH` | `A, B` | `R[A] = (u32)*(u16*)(heap + R[B])` (zero-extend) |
 | 0x22 | `STH` | `B, C` | `*(u16*)(heap + R[B]) = R[C] & 0xFFFF` |
 | 0x23 | `MOVHI` | `A, imm16` | `R[A] = ((u32)imm16 << 16) \| (R[A] & 0xFFFF)` |
+| 0x24 | `MEMCPY` | `A, B, C` | `memcpy(heap+R[A], heap+R[B], R[C])` |
+| 0x25 | `MEMSET` | `A, B, C` | `memset(heap+R[A], R[B] & 0xFF, R[C])` |
+| 0x26 | `MEMMOVE` | `A, B, C` | `memmove(heap+R[A], heap+R[B], R[C])` (overlap-safe) |
 
 ### Forms
 
@@ -90,6 +93,23 @@ load), the translator emits an explicit `MOVI scratch, (32-w); SHL; SAR`
 sequence. Sub-word stores write only the low byte (`STB`) or low halfword
 (`STH`); upper bits in the source register are ignored, so the codegen
 doesn't have to mask before storing.
+
+## Block memory ops
+
+`MEMCPY`, `MEMSET`, and `MEMMOVE` take three register operands: destination
+address, source address (or fill byte for `MEMSET`), and length in bytes
+(read as `uint32`). Each region is bounds-checked once against `[0, mem_size)`
+and then delegated to the host's `memcpy`/`memset`/`memmove` — typically a
+SIMD-optimised libc routine — so a block move costs one dispatch and one
+host call rather than one dispatch per byte/word in a hand-rolled loop.
+
+A length of zero is a no-op even when the source/destination would otherwise
+be out of range. `MEMSET`'s value register supplies a single byte (its low 8
+bits); upper bits are ignored. `MEMCPY` is undefined when the regions
+overlap; use `MEMMOVE` if the regions might overlap. These intrinsics are
+the lowering target for `llvm.memcpy`/`llvm.memset`/`llvm.memmove` and for
+the `__builtin_mem*` family Clang emits for struct copies and array
+initialisation.
 
 ## Wide constants
 

@@ -77,6 +77,9 @@ enum cvm_result {
  *     HALT  A=rs1                          stop, return R[A]
  *     MOVI  A=rd, BC=imm16 (signed)        R[A] = sext(imm16)
  *     MOVHI A=rd, BC=imm16                 R[A] = (imm16 << 16) | (R[A] & 0xFFFF)
+ *     MEMCPY  A=rdst, B=rsrc, C=rlen       memcpy (heap+R[A], heap+R[B], R[C])
+ *     MEMSET  A=rdst, B=rval, C=rlen       memset (heap+R[A], R[B] & 0xFF, R[C])
+ *     MEMMOVE A=rdst, B=rsrc, C=rlen       memmove(heap+R[A], heap+R[B], R[C])
  *     MOV   A=rd, B=rs1                    R[A] = R[B]
  *     ADD   A=rd, B=rs1, C=rs2             R[A] = R[B] + R[C]
  *     SUB                                  R[A] = R[B] - R[C]
@@ -185,6 +188,25 @@ enum cvm_opcode {
      * from imm16 without touching the lower 16, so the translator can load
      * any 32-bit immediate as `MOVI rd, lo16; MOVHI rd, hi16`. */
     CVM_OP_MOVHI   = 0x23,
+
+    /* Block memory ops. All three forms take three register operands:
+     *   A = destination address, B = source address (or fill value for
+     *   MEMSET), C = length in bytes. Length is read as uint32. Bounds
+     *   are checked once for each region against [0, mem_size); a length
+     *   of zero succeeds without touching memory.
+     *
+     *   MEMCPY   — copy R[C] bytes from heap+R[B] to heap+R[A].
+     *              Behaviour on overlap is undefined; use MEMMOVE if the
+     *              regions may overlap.
+     *   MEMSET   — fill R[C] bytes at heap+R[A] with the byte R[B] & 0xFF.
+     *   MEMMOVE  — like MEMCPY but overlap-safe in both directions.
+     *
+     * These delegate to the host's memcpy/memset/memmove (typically SIMD)
+     * after a single bounds check, so a block move costs one dispatch and
+     * a libc call instead of one dispatch per byte/word. */
+    CVM_OP_MEMCPY  = 0x24,
+    CVM_OP_MEMSET  = 0x25,
+    CVM_OP_MEMMOVE = 0x26,
 };
 
 #define CVM_REG_COUNT 256
