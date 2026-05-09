@@ -64,6 +64,7 @@ enum cvm_result {
     CVM_E_BAD_FUNCS,        /* malformed FUNCS section */
     CVM_E_BAD_FUNC_INDEX,   /* CALL imm24 outside func table */
     CVM_E_STACK_OVERFLOW,   /* SP went past the stack region */
+    CVM_E_NULL_FUNC_PTR,    /* CALL/CALLR targeted the reserved slot 0 */
 };
 
 /* ---------------------------------------------------------------------------
@@ -75,12 +76,17 @@ enum cvm_result {
  * Field interpretation per opcode (R = 256-entry i32 register file):
  *     HALT  A=rs1                          stop, return R[A]
  *     MOVI  A=rd, BC=imm16 (signed)        R[A] = sext(imm16)
+ *     MOVHI A=rd, BC=imm16                 R[A] = (imm16 << 16) | (R[A] & 0xFFFF)
  *     MOV   A=rd, B=rs1                    R[A] = R[B]
  *     ADD   A=rd, B=rs1, C=rs2             R[A] = R[B] + R[C]
  *     SUB                                  R[A] = R[B] - R[C]
  *     MUL                                  R[A] = R[B] * R[C]
  *     LDW   A=rd, B=rs1                    R[A] = *(i32*)(heap + R[B])
  *     STW   B=rs1, C=rs2                   *(i32*)(heap + R[B]) = R[C]
+ *     LDB   A=rd, B=rs1                    R[A] = (u32)*(u8*)(heap + R[B])
+ *     STB   B=rs1, C=rs2                   *(u8*)(heap + R[B]) = R[C] & 0xFF
+ *     LDH   A=rd, B=rs1                    R[A] = (u32)*(u16*)(heap + R[B])
+ *     STH   B=rs1, C=rs2                   *(u16*)(heap + R[B]) = R[C] & 0xFFFF
  *     JMP   ABC=imm24 (signed)             pc += imm24   (relative to next ins)
  *     BEQ   A=rs1, B=rs2, C=imm8 (signed)  if R[A]==R[B] pc += imm8
  *     BNE                                  if R[A]!=R[B] pc += imm8
@@ -99,6 +105,10 @@ enum cvm_result {
  *     CALL     ABC=imm24 (unsigned)        push pc+1; pc = FUNCS[imm24]
  *     CALLR    A=rs1                       push pc+1; pc = FUNCS[R[A]]
  *     RET                                  pc = pop(); halt if pc == 0xFFFFFFFF
+ *
+ *   FUNCS[0] is reserved as the null-function-pointer slot. CALL imm24=0
+ *   and CALLR Rd with R[d]==0 trap with CVM_E_NULL_FUNC_PTR; user functions
+ *   live at FUNCS[1..N].
  *
  * All arithmetic is 32-bit two's-complement with wrap-around semantics.
  * Branch offsets are in instructions, relative to the instruction *after*
@@ -162,6 +172,19 @@ enum cvm_opcode {
     CVM_OP_CALL    = 0x1C,    /* ABC = imm24 (unsigned function index) */
     CVM_OP_RET     = 0x1D,
     CVM_OP_CALLR   = 0x1E,    /* A = rs1 (holds function index) */
+
+    /* Sub-word memory ops. Loads zero-extend; sign extension is the
+     * translator's job (an explicit SHL/SAR pair on the loaded value).
+     * Stores write only the low byte / halfword and ignore upper bits. */
+    CVM_OP_LDB     = 0x1F,
+    CVM_OP_STB     = 0x20,
+    CVM_OP_LDH     = 0x21,
+    CVM_OP_STH     = 0x22,
+
+    /* Wide-constant materialisation. MOVHI sets the upper 16 bits of R[A]
+     * from imm16 without touching the lower 16, so the translator can load
+     * any 32-bit immediate as `MOVI rd, lo16; MOVHI rd, hi16`. */
+    CVM_OP_MOVHI   = 0x23,
 };
 
 #define CVM_REG_COUNT 256

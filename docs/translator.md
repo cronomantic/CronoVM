@@ -11,13 +11,14 @@ user.c ──[ clang -emit-llvm ]──▶ user.bc ──[ cvm-translate ]──
 The translator is **not** part of the runtime. The VM binary you ship with
 your game has zero LLVM dependency.
 
-## Status (step 6c)
+## Status (step 7b)
 
 Codegen now covers **scalar i32 arithmetic, comparisons, branches,
 multi-block control flow, `select`, calls between user functions
-(direct, recursive, with > 8 args), and entry-block allocas with
-escaping pointers**. The biggest remaining gaps are i8/i16 memory
-ops, `llvm.memcpy`/`memset`/`memmove`, indirect calls (`CALLR`),
+(direct, recursive, indirect, with > 8 args), entry-block allocas
+with escaping pointers, i8/i16 memory ops, arbitrary 32-bit
+constants, and a NULL-fn-pointer trap**. The biggest remaining
+gaps are `llvm.memcpy`/`memset`/`memmove` (struct/string copies)
 and 64-bit / floating-point types.
 
 ```text
@@ -99,12 +100,18 @@ the gap is what's still being implemented:
   `shl`, `lshr`, `ashr`, `and`, `or`, `xor`
 - comparisons: `icmp` (all 10 predicates)
 - control: `br` (both forms), `phi`, `ret`
-- memory: `load` / `store` (i32, i1, ptr), `getelementptr`
+- memory: `load` / `store` (i1/i8/i16/i32/ptr — narrow loads use `LDB`/`LDH`
+  and zero-extend; narrow stores use `STB`/`STH` and write only the low byte
+  or halfword), `getelementptr`
 - aggregate values via globals: arrays, structs, scalars
 - value selection: `select`
 - pointer reinterprets: `inttoptr`, `ptrtoint`, `bitcast`
-- width casts: `trunc`, `zext`, `sext` (no-op MOV — i32-only register
-  model means these don't change the live value at i386-elf -O1)
+- width casts: `trunc`, `zext` are still no-op MOVs (LDB/LDH already
+  zero-extend on load, and STB/STH only write the low byte/halfword on
+  store, so upper-bit garbage in a "narrow" register never reaches
+  memory). `sext` from a narrow source emits an explicit sign-extension
+  via `MOVI scratch, (32-w); SHL dst, src, scratch; SAR dst, dst,
+  scratch` — three instructions per narrow signed load
 - intrinsic calls: `llvm.abs.i32`, `llvm.smax.i32`, `llvm.smin.i32`,
   `llvm.umax.i32`, `llvm.umin.i32`; `llvm.lifetime.start/end` (no-ops)
 - syscall calls: any `cvm_sys_*` function call lowers to `SYSCALL`
@@ -122,15 +129,15 @@ the gap is what's still being implemented:
 Function values stored in DATA-section globals (e.g. a `static const
 fn_t ops[N] = { f0, f1, ... };` dispatch table) are also supported:
 the constant-initialiser serialiser writes each function pointer as
-its FUNCS-table index in little-endian u32 form, and runtime code
-loads it with `LDW` and dispatches via `CALLR`. NULL function
-pointers in v1 are undefined behaviour — index 0 collides with the
-first user function — so initialise every function pointer before
-calling through it.
+its FUNCS-table index `(k + 1)` in little-endian u32 form, and runtime
+code loads it with `LDW` and dispatches via `CALLR`. The `+1` shift
+keeps `FUNCS[0]` reserved as the null-function-pointer trap slot, so
+a zero-initialised function pointer (LLVM `null` → 0 bytes in DATA)
+naturally traps with `CVM_E_NULL_FUNC_PTR` when called instead of
+silently dispatching to the first user function.
 
-`llvm.memcpy` / `llvm.memset` / `llvm.memmove`, i8/i16 loads/stores,
-and `extern` data globals still error out — they need new opcodes
-or per-intrinsic lowerings.
+`llvm.memcpy` / `llvm.memset` / `llvm.memmove` and `extern` data globals
+still error out — they need per-intrinsic lowerings.
 
 ### Calling convention
 
@@ -198,9 +205,9 @@ section is supported by the loader but not yet emitted by the
 translator (cheap in binary size for now, swap-in is straightforward
 when something pushes the size up).
 
-The `DATA` section is currently capped at 32 KB because every global
-address is materialised through `MOVI imm16`. When that limit binds, a
-wide-constant lowering (or a constant pool) will lift it.
+Global addresses are materialised through `MOVI`/`MOVI+MOVHI` as needed,
+so the `DATA` section has no codegen-imposed size cap (only the loader's
+`heap_size + stack_size <= 4 GiB` invariant binds).
 
 ### Instructions rejected
 

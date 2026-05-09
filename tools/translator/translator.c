@@ -386,12 +386,15 @@ static int serialize_function_index(const struct cg_globals *g,
     for (int i = 0; i < g->func_count; ++i)
         if (g->funcs[i].value == fn) { fidx = i; break; }
     if (fidx < 0) return 1;
-    /* Function "address" = its FUNCS-table index, written as a 32-bit LE
-     * integer. CALLR Rd reads R[d] and looks up FUNCS[R[d]] at run time. */
-    out[off + 0] = (uint8_t)(uint32_t)fidx;
-    out[off + 1] = (uint8_t)((uint32_t)fidx >> 8);
-    out[off + 2] = (uint8_t)((uint32_t)fidx >> 16);
-    out[off + 3] = (uint8_t)((uint32_t)fidx >> 24);
+    /* Function "address" = its FUNCS-table index + 1, written as a 32-bit
+     * LE integer. CALLR Rd reads R[d] and looks up FUNCS[R[d]] at run
+     * time; FUNCS[0] is the reserved null-function-pointer slot, so user
+     * functions live at FUNCS[1..N] and a NULL fn-ptr is naturally 0. */
+    uint32_t enc = (uint32_t)fidx + 1u;
+    out[off + 0] = (uint8_t)(enc);
+    out[off + 1] = (uint8_t)(enc >> 8);
+    out[off + 2] = (uint8_t)(enc >> 16);
+    out[off + 3] = (uint8_t)(enc >> 24);
     return 0;
 }
 
@@ -469,13 +472,6 @@ static int cg_collect_globals(struct cg_globals *g, LLVMModuleRef mod) {
         uint32_t align = (uint32_t)LLVMABIAlignmentOfType(g->td, ty);
         if (align == 0) align = 1;
         cursor = (cursor + align - 1) & ~(align - 1);
-
-        if (cursor > INT16_MAX) {
-            ERR(NULL, "global '%s' offset %u exceeds 16-bit MOVI range "
-                      "(wide-constant lowering pending)",
-                value_name(gv), cursor);
-            return 1;
-        }
 
         cg_data_reserve(g, cursor + size);
         LLVMValueRef init = LLVMGetInitializer(gv);
@@ -696,6 +692,9 @@ static uint8_t cg_alloc_reg(struct cg *cg) {
     return (uint8_t)cg->next_reg++;
 }
 
+/* Forward decl: defined further down with the prologue/stack helpers. */
+static void cg_emit_load_const32(struct cg *cg, uint8_t rd, int32_t imm);
+
 static int cg_lookup(struct cg *cg, LLVMValueRef v) {
     for (int i = 0; i < cg->map_count; ++i)
         if (cg->vals[i] == v) return i;
@@ -728,20 +727,22 @@ static uint8_t cg_reg_for(struct cg *cg, LLVMValueRef v) {
 
     if (LLVMIsAConstantInt(v)) {
         long long imm = LLVMConstIntGetSExtValue(v);
-        if (imm < INT16_MIN || imm > INT16_MAX) {
+        if (imm < INT32_MIN || imm > INT32_MAX) {
             ERR(cg->fn_name,
-                "constant %lld doesn't fit in MOVI imm16 "
-                "(wide-constant lowering not yet implemented)", imm);
+                "constant %lld is wider than i32 (i64 not yet supported)",
+                imm);
             cg->had_error = 1;
             return 0;
         }
         uint8_t r = cg_alloc_reg(cg);
-        cg_emit(cg, enc_i16(CVM_OP_MOVI, r, (int16_t)imm));
+        if (cg->had_error) return 0;
+        cg_emit_load_const32(cg, r, (int32_t)imm);
         return r;
     }
 
     if (LLVMIsAConstantPointerNull(v)) {
         uint8_t r = cg_alloc_reg(cg);
+        if (cg->had_error) return 0;
         cg_emit(cg, enc_i16(CVM_OP_MOVI, r, 0));
         return r;
     }
@@ -754,15 +755,17 @@ static uint8_t cg_reg_for(struct cg *cg, LLVMValueRef v) {
             return 0;
         }
         uint8_t r = cg_alloc_reg(cg);
-        cg_emit(cg, enc_i16(CVM_OP_MOVI, r,
-                            (int16_t)cg->globals->items[idx].offset));
+        if (cg->had_error) return 0;
+        cg_emit_load_const32(cg, r, (int32_t)cg->globals->items[idx].offset);
         return r;
     }
 
     /* A Function value used as an operand (rather than as a call target)
      * means somebody is taking its address — for a function pointer or a
      * select/phi between two callees. In our world a function "address"
-     * is its index in the FUNCS table; materialise that as a MOVI. */
+     * is its FUNCS-table index; user functions live at FUNCS[1..N]
+     * (slot 0 is reserved as the null-function-pointer trap), so we
+     * materialise `fidx + 1`. */
     if (LLVMIsAFunction(v)) {
         int fidx = cg_func_lookup(cg, v);
         if (fidx < 0) {
@@ -772,15 +775,9 @@ static uint8_t cg_reg_for(struct cg *cg, LLVMValueRef v) {
             cg->had_error = 1;
             return 0;
         }
-        if (fidx > INT16_MAX) {
-            ERR(cg->fn_name,
-                "function index %d doesn't fit in MOVI imm16 "
-                "(wide-constant lowering pending)", fidx);
-            cg->had_error = 1;
-            return 0;
-        }
         uint8_t r = cg_alloc_reg(cg);
-        cg_emit(cg, enc_i16(CVM_OP_MOVI, r, (int16_t)fidx));
+        if (cg->had_error) return 0;
+        cg_emit_load_const32(cg, r, fidx + 1);
         return r;
     }
 
@@ -942,18 +939,21 @@ static int icmp_to_op(LLVMIntPredicate p, int *swap_out) {
 
 /* --- prologue / epilogue / stack helpers --------------------------------- */
 
-/* Materialise `imm` into the scratch register (R254) using a single MOVI.
- * Caller is responsible for ensuring imm fits in int16 (we range-check and
- * bail out via cg->had_error otherwise). */
-static int cg_movi_scratch(struct cg *cg, int32_t imm) {
-    if (imm < INT16_MIN || imm > INT16_MAX) {
-        ERR(cg->fn_name,
-            "constant %d doesn't fit in MOVI imm16 "
-            "(wide-constant lowering not yet implemented)", imm);
-        cg->had_error = 1;
-        return 1;
+/* Materialise an arbitrary 32-bit immediate into `rd`. Single MOVI when
+ * the value fits in int16; otherwise a MOVI(lo16) + MOVHI(hi16) pair. */
+static void cg_emit_load_const32(struct cg *cg, uint8_t rd, int32_t imm) {
+    if (imm >= INT16_MIN && imm <= INT16_MAX) {
+        cg_emit(cg, enc_i16(CVM_OP_MOVI, rd, (int16_t)imm));
+        return;
     }
-    cg_emit(cg, enc_i16(CVM_OP_MOVI, (uint8_t)CG_REG_SCRATCH, (int16_t)imm));
+    uint32_t u = (uint32_t)imm;
+    cg_emit(cg, enc_i16(CVM_OP_MOVI,  rd, (int16_t)(uint16_t)(u & 0xFFFFu)));
+    cg_emit(cg, enc_i16(CVM_OP_MOVHI, rd, (int16_t)(uint16_t)((u >> 16) & 0xFFFFu)));
+}
+
+/* Materialise `imm` into the scratch register (R254). Always succeeds. */
+static int cg_movi_scratch(struct cg *cg, int32_t imm) {
+    cg_emit_load_const32(cg, (uint8_t)CG_REG_SCRATCH, imm);
     return 0;
 }
 
@@ -1107,14 +1107,6 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
      * down only inside that call sequence. */
     cg->spill_bytes = (uint32_t)(cg->ssa_reg_high - 8) * 4u;
     cg->frame_bytes = cg->alloca_bytes + cg->spill_bytes;
-
-    if (cg->frame_bytes > INT16_MAX) {
-        ERR(cg->fn_name,
-            "frame size %u exceeds MOVI imm16 range "
-            "(spill compaction / wide constants pending)", cg->frame_bytes);
-        cg->had_error = 1;
-        return 1;
-    }
     cg->funcs[func_idx].frame_size = cg->frame_bytes;
 
     /* Prologue: SUB SP, SP, frame. */
@@ -1275,69 +1267,113 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 break;
 
             case LLVMLoad: {
-                /* Accept i32 and (4-byte-aligned) i1 / pointer loads — both
-                 * lower to LDW. Narrower loads (i8/i16) need LDB/LDH and are
-                 * pending. */
-                LLVMTypeRef lty = LLVMTypeOf(i);
-                LLVMTypeKind lk = LLVMGetTypeKind(lty);
-                int ok = 0;
-                if (lk == LLVMPointerTypeKind) ok = 1;
-                else if (lk == LLVMIntegerTypeKind) {
-                    unsigned w = LLVMGetIntTypeWidth(lty);
-                    if (w == 1 || w == 32) ok = 1;
-                }
-                if (!ok ||
-                    LLVMGetTypeKind(LLVMTypeOf(LLVMGetOperand(i, 0)))
-                        != LLVMPointerTypeKind)
-                {
-                    ERR(cg->fn_name,
-                        "load: only i32/i1/ptr through ptr is implemented yet");
+                /* LDB / LDH / LDW chosen by result-type width. LDB/LDH
+                 * zero-extend; sign extension, if needed by the IR, is the
+                 * job of a following SExt (lowered as SHL/SAR pair). */
+                LLVMValueRef ptr_v = LLVMGetOperand(i, 0);
+                if (LLVMGetTypeKind(LLVMTypeOf(ptr_v)) != LLVMPointerTypeKind) {
+                    ERR(cg->fn_name, "load: address operand must be a pointer");
                     cg->had_error = 1;
                     break;
                 }
-                uint8_t addr = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                LLVMTypeRef  lty = LLVMTypeOf(i);
+                LLVMTypeKind lk  = LLVMGetTypeKind(lty);
+                uint8_t opc = 0;
+                if (lk == LLVMPointerTypeKind) {
+                    opc = CVM_OP_LDW;
+                } else if (lk == LLVMIntegerTypeKind) {
+                    unsigned w = LLVMGetIntTypeWidth(lty);
+                    if (w == 1 || w == 8) opc = CVM_OP_LDB;
+                    else if (w == 16)     opc = CVM_OP_LDH;
+                    else if (w == 32)     opc = CVM_OP_LDW;
+                }
+                if (!opc) {
+                    ERR(cg->fn_name,
+                        "load: unsupported result type "
+                        "(only i1/i8/i16/i32/ptr supported)");
+                    cg->had_error = 1;
+                    break;
+                }
+                uint8_t addr = cg_reg_for(cg, ptr_v);
                 uint8_t dst  = cg->regs[cg_lookup(cg, i)];
-                cg_emit(cg, enc_r(CVM_OP_LDW, dst, addr, 0));
+                cg_emit(cg, enc_r(opc, dst, addr, 0));
                 break;
             }
 
             case LLVMStore: {
-                /* Operand 0 = value, operand 1 = pointer. Same widths as load. */
+                /* STB / STH / STW by value-type width. Sub-word stores write
+                 * only the relevant low byte/halfword, so upper bits in the
+                 * source register don't need to be masked here. */
                 LLVMValueRef val_v = LLVMGetOperand(i, 0);
                 LLVMTypeRef  vty   = LLVMTypeOf(val_v);
                 LLVMTypeKind vk    = LLVMGetTypeKind(vty);
-                int ok = 0;
-                if (vk == LLVMPointerTypeKind) ok = 1;
-                else if (vk == LLVMIntegerTypeKind) {
+                uint8_t opc = 0;
+                if (vk == LLVMPointerTypeKind) {
+                    opc = CVM_OP_STW;
+                } else if (vk == LLVMIntegerTypeKind) {
                     unsigned w = LLVMGetIntTypeWidth(vty);
-                    if (w == 1 || w == 32) ok = 1;
+                    if (w == 1 || w == 8) opc = CVM_OP_STB;
+                    else if (w == 16)     opc = CVM_OP_STH;
+                    else if (w == 32)     opc = CVM_OP_STW;
                 }
-                if (!ok) {
+                if (!opc) {
                     ERR(cg->fn_name,
-                        "store: only i32/i1/ptr values are implemented yet");
+                        "store: unsupported value type "
+                        "(only i1/i8/i16/i32/ptr supported)");
                     cg->had_error = 1;
                     break;
                 }
                 uint8_t val  = cg_reg_for(cg, val_v);
                 uint8_t addr = cg_reg_for(cg, LLVMGetOperand(i, 1));
-                cg_emit(cg, enc_r(CVM_OP_STW, 0, addr, val));
+                cg_emit(cg, enc_r(opc, 0, addr, val));
                 break;
             }
 
-            /* Pointer/integer reinterprets are no-ops in our world: pointers
-             * live in 32-bit registers, like every other scalar. Same for
-             * width-changing casts when source and dest are both i32 (the
-             * common case at i386-elf -O1 since we have no narrower ops). */
+            /* Pointer/integer reinterprets are no-ops: pointers live in
+             * 32-bit registers like every other scalar. Trunc/ZExt are MOVs
+             * because LDB/LDH already zero-extend on load and STB/STH only
+             * write the low byte/halfword on store, so upper-bit garbage in
+             * a "narrow" register never reaches memory. */
             case LLVMPtrToInt:
             case LLVMIntToPtr:
             case LLVMBitCast:
             case LLVMTrunc:
-            case LLVMZExt:
-            case LLVMSExt: {
+            case LLVMZExt: {
                 uint8_t src = cg_reg_for(cg, LLVMGetOperand(i, 0));
                 uint8_t dst = cg->regs[cg_lookup(cg, i)];
                 if (src != dst)
                     cg_emit(cg, enc_r(CVM_OP_MOV, dst, src, 0));
+                break;
+            }
+
+            /* SExt has to actually sign-extend when the source is narrower
+             * than i32 (since narrow loads zero-extend). We don't have an
+             * immediate-form shift, so the recipe is:
+             *     MOVI scratch, (32 - src_w)
+             *     SHL  dst, src, scratch
+             *     SAR  dst, dst, scratch
+             * For src_w == 32 (e.g. SExt across same width — rare, but legal
+             * IR after some passes), it degenerates to a MOV. */
+            case LLVMSExt: {
+                LLVMValueRef src_v = LLVMGetOperand(i, 0);
+                uint8_t src = cg_reg_for(cg, src_v);
+                uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                LLVMTypeRef  sty = LLVMTypeOf(src_v);
+                unsigned src_w =
+                    (LLVMGetTypeKind(sty) == LLVMIntegerTypeKind)
+                        ? LLVMGetIntTypeWidth(sty) : 32;
+                if (src_w >= 32) {
+                    if (src != dst)
+                        cg_emit(cg, enc_r(CVM_OP_MOV, dst, src, 0));
+                } else {
+                    int16_t shift = (int16_t)(32u - src_w);
+                    cg_emit(cg, enc_i16(CVM_OP_MOVI,
+                                        (uint8_t)CG_REG_SCRATCH, shift));
+                    cg_emit(cg, enc_r(CVM_OP_SHL, dst, src,
+                                      (uint8_t)CG_REG_SCRATCH));
+                    cg_emit(cg, enc_r(CVM_OP_SAR, dst, dst,
+                                      (uint8_t)CG_REG_SCRATCH));
+                }
                 break;
             }
 
@@ -1405,15 +1441,7 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                         uint8_t idx_r   = cg_reg_for(cg, idx_v);
                         uint8_t stride_r = cg_alloc_reg(cg);
                         if (cg->had_error) break;
-                        if (stride > INT16_MAX) {
-                            ERR(cg->fn_name,
-                                "GEP element stride %u doesn't fit in imm16",
-                                stride);
-                            cg->had_error = 1;
-                            break;
-                        }
-                        cg_emit(cg, enc_i16(CVM_OP_MOVI, stride_r,
-                                            (int16_t)stride));
+                        cg_emit_load_const32(cg, stride_r, (int32_t)stride);
                         uint8_t step_r = cg_alloc_reg(cg);
                         if (cg->had_error) break;
                         cg_emit(cg, enc_r(CVM_OP_MUL, step_r, idx_r, stride_r));
@@ -1434,17 +1462,16 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 /* Combine: dst = base + const_off + dyn_reg. */
                 uint8_t cur = base;
                 if (const_off != 0) {
-                    if (const_off < INT16_MIN || const_off > INT16_MAX) {
+                    if (const_off < INT32_MIN || const_off > INT32_MAX) {
                         ERR(cg->fn_name,
-                            "GEP constant offset %lld doesn't fit in imm16",
+                            "GEP constant offset %lld is wider than i32",
                             const_off);
                         cg->had_error = 1;
                         break;
                     }
                     uint8_t off_r = cg_alloc_reg(cg);
                     if (cg->had_error) break;
-                    cg_emit(cg, enc_i16(CVM_OP_MOVI, off_r,
-                                        (int16_t)const_off));
+                    cg_emit_load_const32(cg, off_r, (int32_t)const_off);
                     uint8_t sum_r = cg_alloc_reg(cg);
                     if (cg->had_error) break;
                     cg_emit(cg, enc_r(CVM_OP_ADD, sum_r, cur, off_r));
@@ -1603,7 +1630,9 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                         cg->had_error = 1;
                         break;
                     }
-                    if (callee_idx > 0xFFFFFF) {
+                    if (callee_idx >= 0xFFFFFF) {
+                        /* +1 shift for the reserved FUNCS[0] slot must fit
+                         * in CALL's imm24 field. */
                         ERR(cg->fn_name, "more than 16M user functions");
                         cg->had_error = 1;
                         break;
@@ -1663,11 +1692,14 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                                           (uint8_t)k, arg_regs[k], 0));
                 }
 
-                /* 4. CALL or CALLR. */
-                if (is_indirect)
+                /* 4. CALL or CALLR. User functions occupy FUNCS[1..N]
+                 *    (index 0 is reserved as the null-fn-ptr trap), so a
+                 *    direct call uses (callee_idx + 1) as the imm24. */
+                if (is_indirect) {
                     cg_emit(cg, enc_r(CVM_OP_CALLR, callee_reg, 0, 0));
-                else
-                    cg_emit(cg, enc_i24(CVM_OP_CALL, callee_idx));
+                } else {
+                    cg_emit(cg, enc_i24(CVM_OP_CALL, callee_idx + 1));
+                }
                 cg->has_calls = 1;
 
                 /* 5. Pop stacked args (caller cleans). */
@@ -1753,14 +1785,17 @@ static int write_bin(const char *path,
         }
     }
 
-    /* Build FUNCS payload (u32[N] of entry offsets). */
+    /* Build FUNCS payload (u32[N+1] of entry offsets). Slot 0 is reserved
+     * as the null-function-pointer trap target; the interpreter rejects
+     * any CALL/CALLR with fid==0 before reading FUNCS, so the value here
+     * is unused — we leave it 0. User function k lives at FUNCS[k+1]. */
     uint8_t  *funcs_buf  = NULL;
     uint32_t  funcs_size = 0;
     if (emit_funcs && func_count > 0) {
-        funcs_size = (uint32_t)func_count * 4u;
-        funcs_buf  = (uint8_t *)malloc(funcs_size);
+        funcs_size = (uint32_t)(func_count + 1) * 4u;
+        funcs_buf  = (uint8_t *)calloc(1, funcs_size);
         for (int k = 0; k < func_count; ++k)
-            put_u32_le(funcs_buf + (size_t)k * 4u, funcs[k].entry_offset);
+            put_u32_le(funcs_buf + (size_t)(k + 1) * 4u, funcs[k].entry_offset);
     }
 
     uint32_t section_count = 1u

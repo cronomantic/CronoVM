@@ -1,15 +1,19 @@
 # Where I left off
 
 > Short orientation note for the next coding session. Last touched
-> **2026-05-09**, end of step 6c (CALL/RET + stack + alloca + CALLR
-> + function pointers in DATA).
+> **2026-05-09**, end of step 7b (wide-constant lowering via MOVHI
+> and reserved `FUNCS[0]` slot for null-function-pointer trap).
 
 ## Current state
 
-30/30 tests pass. Pipeline runs end-to-end, including multi-function
-modules, recursion, > 8 args via the stack, entry-block allocas
-with escaping pointers, indirect calls through function pointers,
-and static dispatch tables:
+31/31 tests pass (test_vm now covers MOVHI + null-fn-ptr trap; e2e
+narrow_ops runs without `volatile` since the wide constant `0xFFFF`
+mask now lowers cleanly). Pipeline runs end-to-end, including
+multi-function modules, recursion, > 8 args via the stack, entry-block
+allocas with escaping pointers, indirect calls through function
+pointers, static dispatch tables, full sub-word memory access (signed
+and unsigned `char` / `short` arrays), arbitrary 32-bit constants,
+and a clean trap on calls through a NULL function pointer:
 
 ```text
 user.c → clang --target=i386-elf -O1 -emit-llvm → user.bc
@@ -22,10 +26,10 @@ user.c → clang --target=i386-elf -O1 -emit-llvm → user.bc
 
 | Layer | Coverage |
 | ----- | -------- |
-| Interpreter | 30 opcodes (HALT, MOVI, MOV, ADD/SUB/MUL, LDW/STW, JMP, BEQ, BNE, SYSCALL, 6×CMP, DIV/DIVU/MOD/MODU, SHL/SHR/SAR, AND/OR/XOR, **CALL, RET, CALLR**) — see [isa.md](isa.md) |
-| Loader | All 8 section types (CODE, DATA, BSS, IMPORTS, DEBUG, HEAP_RESERVE, **STACK_RESERVE, FUNCS**) — see [format.md](format.md) |
+| Interpreter | 35 opcodes (HALT, MOVI, MOV, ADD/SUB/MUL, LDW/STW, JMP, BEQ, BNE, SYSCALL, 6×CMP, DIV/DIVU/MOD/MODU, SHL/SHR/SAR, AND/OR/XOR, CALL/RET/CALLR, LDB/STB/LDH/STH, **MOVHI**) — see [isa.md](isa.md) |
+| Loader | All 8 section types (CODE, DATA, BSS, IMPORTS, DEBUG, HEAP_RESERVE, STACK_RESERVE, FUNCS — slot 0 reserved for null-fn-ptr trap) — see [format.md](format.md) |
 | Built-ins | `cvm_sys_heap_start` / `cvm_sys_heap_size` |
-| Codegen | Scalar i32 + control flow + globals + memory + syscalls + intrinsics + **multi-function CALL/RET, recursion, hybrid R0..R7 + stacked args, alloca, indirect calls (CALLR), function values in DATA initialisers (static dispatch tables), lifetime markers** |
+| Codegen | Scalar i32 + control flow + globals + memory + syscalls + intrinsics + multi-function CALL/RET, recursion, hybrid R0..R7 + stacked args, alloca, indirect calls (CALLR), function values in DATA initialisers (static dispatch tables), lifetime markers, i8/i16 loads (zero-extend) and stores; SExt via SHL/SAR shift-pair for narrow signed loads; **arbitrary 32-bit immediates via MOVI+MOVHI; user functions live at FUNCS[1..N] so a NULL function pointer cleanly traps** |
 | Allocator | Header-only bump in `runtime/lib/cvm_alloc.h` (free is no-op) |
 
 Calling convention: `R255` = SP, `R254` = codegen scratch, `R0..R7`
@@ -34,14 +38,6 @@ the stack by the caller. Return value in `R0`. See
 [translator.md](translator.md) for the spill protocol.
 
 ## Natural next steps (any is shippable in a session)
-
-### A — i8 / i16 memory ops (LDB / STB / LDH / STH)
-
-Currently the codegen rejects loads/stores narrower than `i32`. This
-is a small, well-scoped task: 4 new opcodes in the interpreter, the
-matching encoding rules, then a tweak in the `LLVMLoad`/`LLVMStore`
-handlers to pick the right opcode based on the value type. Unblocks
-`char` and `short` arrays, `strlen`-style code, and packed structs.
 
 ### B — `llvm.memcpy` / `llvm.memset` / `llvm.memmove`
 
@@ -66,18 +62,8 @@ every call. For programs with many SSA values this is slow. A simple
 liveness pass (per basic block, walking uses) would let us spill
 only values actually live across each call site.
 
-### E — NULL function pointers
-
-Today an SSA value of 0 used as a function pointer dispatches to
-function index 0 (the first user function), silently — a foot-gun
-for any C code that NULL-checks function pointers. Two fixes:
-reserve `FUNCS[0]` as a trap entry and shift user functions to
-1+, or pick a sentinel index (e.g. 0xFFFFFFFE) and have CALLR
-check for it. Either is small.
-
 ## Smaller alternative paths
 
-- **Wide constants**: only when something exceeds 32 KB DATA.
 - **i64 / float64**: bigger lift; new opcodes plus reg-pair handling.
 - **`gamecc` wrapper**: hides the `clang | cvm-translate` pipeline
   behind a single command.
@@ -101,3 +87,4 @@ check for it. Either is small.
 - `tests/fixtures/fnptr.c` — `select` between functions + indirect call (CALLR).
 - `tests/fixtures/dispatch_table.c` — `static const op_t ops[3] = { ... };` table in DATA, indexed at runtime via LDW + CALLR.
 - `tests/fixtures/alloc_sum.c` — heap allocator via syscalls.
+- `tests/fixtures/narrow_ops.c` — unsigned/signed `char`/`short` arrays with STB/STH round-trip; exercises LDB/LDH/STB/STH and shift-based SExt.

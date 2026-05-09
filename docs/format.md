@@ -47,7 +47,7 @@ appear in any order after the section table.
 | 5 | `DEBUG` | no | Opaque blob ignored by the loader. |
 | 6 | `HEAP_RESERVE` | no | Zero-filled free region appended after BSS for the user-side allocator; see [memory.md](memory.md). `file_off` must be 0. |
 | 7 | `STACK_RESERVE` | no | Zero-filled stack region above the heap for `CALL`/`RET`. `file_off` must be 0; `size` must be a multiple of 4 and at least 4 (room for the run-completion sentinel). |
-| 8 | `FUNCS` | no | `u32[N]` array of function entry points (instruction indices into CODE), indexed by `CALL imm24`. Required if any `CALL` instruction is emitted. `size` must be a multiple of 4. |
+| 8 | `FUNCS` | no | `u32[N]` array of function entry points (instruction indices into CODE), indexed by `CALL imm24`. Required if any `CALL` instruction is emitted. `size` must be a multiple of 4. **Slot 0 is reserved as the null-function-pointer trap target** — the interpreter rejects `CALL imm24=0` / `CALLR R[A]=0` with `CVM_E_NULL_FUNC_PTR` before any indexing, so the value at offset 0 is unused (the translator writes 0). User function `k` (in source order) lives at `FUNCS[k+1]`. |
 
 Each type may appear at most once except `DEBUG`. CODE is required.
 

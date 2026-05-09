@@ -49,6 +49,11 @@ an offset of `0` means "fall through to the next instruction".
 | 0x1C | `CALL` | `imm24 (unsigned)` | push pc; `pc = FUNCS[imm24]` |
 | 0x1D | `RET` | — | `pc = pop()`; halt with `R[0]` if popped value is `0xFFFFFFFF` |
 | 0x1E | `CALLR` | `A` | push pc; `pc = FUNCS[R[A]]` (indirect call via register) |
+| 0x1F | `LDB` | `A, B` | `R[A] = (u32)*(u8*)(heap + R[B])` (zero-extend) |
+| 0x20 | `STB` | `B, C` | `*(u8*)(heap + R[B]) = R[C] & 0xFF` |
+| 0x21 | `LDH` | `A, B` | `R[A] = (u32)*(u16*)(heap + R[B])` (zero-extend) |
+| 0x22 | `STH` | `B, C` | `*(u16*)(heap + R[B]) = R[C] & 0xFFFF` |
+| 0x23 | `MOVHI` | `A, imm16` | `R[A] = ((u32)imm16 << 16) \| (R[A] & 0xFFFF)` |
 
 ### Forms
 
@@ -75,12 +80,40 @@ region sits at the top, starting at `mem_size` and growing downward via
 `R255` (SP). See [format.md](format.md) for the section that controls
 each region's size.
 
+`LDB`/`STB` need 1 byte at `R[B]`, `LDH`/`STH` need 2, `LDW`/`STW` need 4.
+Sub-word memory ops do not require natural alignment — bounds checking is
+the only constraint.
+
+Sub-word loads always **zero-extend** into the destination register. When
+the IR asks for sign extension (e.g. `sext i8 to i32` after a signed-byte
+load), the translator emits an explicit `MOVI scratch, (32-w); SHL; SAR`
+sequence. Sub-word stores write only the low byte (`STB`) or low halfword
+(`STH`); upper bits in the source register are ignored, so the codegen
+doesn't have to mask before storing.
+
+## Wide constants
+
+`MOVI` carries a signed 16-bit immediate, which covers the common case of
+small literals. For arbitrary 32-bit values the translator pairs `MOVI`
+with `MOVHI`: `MOVI rd, lo16; MOVHI rd, hi16` lands `(hi16 << 16) | lo16`
+in `R[rd]`. Two instructions for any constant, regardless of bit pattern.
+This frees the codegen from any 16-bit cap on global addresses, GEP
+strides/offsets, frame sizes, or in-source literals.
+
 ## Calls and the stack
 
 `CALL imm24` pushes the address of the next instruction at `R[255] -= 4`
 and jumps to `FUNCS[imm24]`. `RET` pops a 32-bit word from the stack and
 uses it as the new `pc`; if that word equals the **completion sentinel**
 `0xFFFFFFFF`, the run ends and `cvm_run` returns `R[0]`.
+
+`FUNCS[0]` is reserved as the null-function-pointer slot: `CALL imm24=0`
+and `CALLR Rd` with `R[d] == 0` trap with `CVM_E_NULL_FUNC_PTR` *before*
+indexing the table. User functions live at `FUNCS[1..N]`. This makes the
+natural C idiom `if (fp) fp(arg);` work — a zero-initialised function
+pointer is the integer `0`, comparing equal to a null check, and calling
+through it traps cleanly instead of dispatching into whatever happens to
+be at function index 0.
 
 On run start, the interpreter places `R[255] = mem_size`, then pushes the
 sentinel as the outermost return PC. Programs that don't use `CALL` get a
@@ -104,6 +137,7 @@ responsible for restoring SP after `RET`. The return value lands in `R0`.
 | `CVM_E_SYSCALL_TRAP` | Host handler returned non-zero. |
 | `CVM_E_DIV_BY_ZERO` | `DIV`/`DIVU`/`MOD`/`MODU` with `R[C]==0`. |
 | `CVM_E_BAD_FUNC_INDEX` | `CALL imm24` references an out-of-range function index. |
+| `CVM_E_NULL_FUNC_PTR` | `CALL imm24=0` or `CALLR` with `R[A]=0` — the reserved null-fn-ptr slot. |
 | `CVM_E_STACK_OVERFLOW` | `CALL` would push past the bottom of the stack region. |
 
 ## Lowering of i1 conditions
