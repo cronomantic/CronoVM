@@ -150,7 +150,14 @@ convenience here.
 
 ## Status
 
-Designed; not yet implemented. The HEAP_RESERVE section, the two
-syscalls, and `runtime/lib/cvm_alloc.c` all land together in step 6,
-once codegen can compile control flow (the allocator needs branches
-and loops to function).
+Implemented. The loader recognises `HEAP_RESERVE`, allocates the extra
+memory, and zero-fills it. `cvm_sys_heap_start` and `cvm_sys_heap_size`
+are auto-bound built-in syscalls registered on every load. The
+translator accepts `--heap-reserve=N[K|M]` and emits the section.
+
+`runtime/lib/cvm_alloc.h` ships a header-only **bump allocator** as the
+reference: `cvm_alloc_init` / `cvm_malloc` / `cvm_free` (free is a
+no-op for now). It's enough for retro-game patterns of "allocate at
+startup, never free" or "arena reset between levels". A full free-list
+allocator with reclaim lands when CALL/RET enables multi-function
+binaries; the API stays the same.

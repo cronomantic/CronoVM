@@ -43,14 +43,16 @@ set(_fixture_dir ${CMAKE_SOURCE_DIR}/tests/fixtures)
 set(_fixture_out ${CMAKE_CURRENT_BINARY_DIR})
 
 set(_fixture_targets "")
-foreach(name add pick fib abs max divmod bitops counter sum_global reject_double)
+foreach(name add pick fib abs max divmod bitops counter sum_global
+             alloc_sum reject_double)
     set(_src ${_fixture_dir}/${name}.c)
     set(_bc  ${_fixture_out}/${name}.bc)
     add_custom_command(
         OUTPUT  ${_bc}
         COMMAND ${CMAKE_C_COMPILER} --target=i386-elf -emit-llvm -O1
+                                    -I${CMAKE_SOURCE_DIR}/runtime/lib
                                     -c ${_src} -o ${_bc}
-        DEPENDS ${_src}
+        DEPENDS ${_src} ${CMAKE_SOURCE_DIR}/runtime/lib/cvm_alloc.h
         VERBATIM
     )
     list(APPEND _fixture_targets ${_bc})
@@ -70,6 +72,17 @@ foreach(name add pick fib abs max divmod bitops counter sum_global)
     )
     list(APPEND _emit_targets ${_bin})
 endforeach()
+
+# alloc_sum needs a heap reserve.
+add_custom_command(
+    OUTPUT  ${_fixture_out}/alloc_sum.bin
+    COMMAND $<TARGET_FILE:cvm-translate> ${_fixture_out}/alloc_sum.bc
+                                          --heap-reserve=4K
+                                          -o ${_fixture_out}/alloc_sum.bin
+    DEPENDS cvm-translate ${_fixture_out}/alloc_sum.bc
+    VERBATIM
+)
+list(APPEND _emit_targets ${_fixture_out}/alloc_sum.bin)
 add_custom_target(translator_emit_fixtures DEPENDS ${_emit_targets})
 
 add_test(NAME translator_build_fixtures
@@ -109,8 +122,9 @@ add_test(NAME e2e_divmod     COMMAND test_e2e ${_fixture_out}/divmod.bin 302  17
 add_test(NAME e2e_bitops     COMMAND test_e2e ${_fixture_out}/bitops.bin 127  7 3)
 add_test(NAME e2e_counter    COMMAND test_e2e ${_fixture_out}/counter.bin 7  7)
 add_test(NAME e2e_sum_global COMMAND test_e2e ${_fixture_out}/sum_global.bin 55 10)
+add_test(NAME e2e_alloc_sum  COMMAND test_e2e ${_fixture_out}/alloc_sum.bin 15 5)
 set_tests_properties(
     e2e_add e2e_pick_true e2e_pick_false e2e_fib_10 e2e_fib_0
     e2e_abs_neg e2e_abs_pos e2e_max_lhs e2e_max_rhs
-    e2e_divmod e2e_bitops e2e_counter e2e_sum_global
+    e2e_divmod e2e_bitops e2e_counter e2e_sum_global e2e_alloc_sum
     PROPERTIES FIXTURES_REQUIRED emitted_bins)

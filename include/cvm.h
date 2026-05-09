@@ -32,11 +32,12 @@ extern "C" {
 #define CVM_VERSION_1_0   0x00010000u
 
 enum cvm_section_type {
-    CVM_SEC_CODE    = 1,
-    CVM_SEC_DATA    = 2,
-    CVM_SEC_BSS     = 3,
-    CVM_SEC_IMPORTS = 4,
-    CVM_SEC_DEBUG   = 5,
+    CVM_SEC_CODE         = 1,
+    CVM_SEC_DATA         = 2,
+    CVM_SEC_BSS          = 3,
+    CVM_SEC_IMPORTS      = 4,
+    CVM_SEC_DEBUG        = 5,
+    CVM_SEC_HEAP_RESERVE = 6,   /* file_off=0, size = free-region bytes */
 };
 
 enum cvm_result {
@@ -154,11 +155,17 @@ struct cvm_image {
     uint32_t *code;
     uint32_t  code_count;
 
-    /* heap[0 .. data_size) is initialised from the DATA section,
-     * heap[data_size .. heap_size) is zero-filled from BSS. */
+    /* Heap layout:
+     *   heap[0 .. data_size)                            DATA (initialised)
+     *   heap[data_size .. heap_size - reserve_size)     BSS  (zero-filled)
+     *   heap[heap_size - reserve_size .. heap_size)     RESERVE (zero-filled,
+     *                                                    free for the user
+     *                                                    allocator)
+     */
     uint8_t  *heap;
     uint32_t  heap_size;
     uint32_t  data_size;
+    uint32_t  reserve_size;
 
     uint32_t  entry;
 

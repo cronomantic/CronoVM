@@ -5,13 +5,53 @@
 
 #define CVM_HEADER_SIZE   24u
 #define CVM_SECTION_SIZE  16u
-#define CVM_MAX_SEC_TYPE  5u
+#define CVM_MAX_SEC_TYPE  6u
 
 static uint32_t read_u32_le(const uint8_t *p) {
     return  (uint32_t)p[0]
          | ((uint32_t)p[1] << 8)
          | ((uint32_t)p[2] << 16)
          | ((uint32_t)p[3] << 24);
+}
+
+/* --- Built-in syscalls --------------------------------------------------- */
+
+static int builtin_sys_heap_start(struct cvm_image *img,
+                                  int32_t *regs, void *ud)
+{
+    (void)ud;
+    regs[0] = (int32_t)(img->heap_size - img->reserve_size);
+    return 0;
+}
+
+static int builtin_sys_heap_size(struct cvm_image *img,
+                                 int32_t *regs, void *ud)
+{
+    (void)ud;
+    regs[0] = (int32_t)img->reserve_size;
+    return 0;
+}
+
+static const struct {
+    const char    *name;
+    cvm_syscall_fn fn;
+} BUILTIN_SYSCALLS[] = {
+    { "cvm_sys_heap_start", builtin_sys_heap_start },
+    { "cvm_sys_heap_size",  builtin_sys_heap_size  },
+};
+
+static void auto_bind_builtins(struct cvm_image *img) {
+    for (uint32_t i = 0; i < img->import_count; ++i) {
+        for (size_t j = 0;
+             j < sizeof BUILTIN_SYSCALLS / sizeof BUILTIN_SYSCALLS[0]; ++j)
+        {
+            if (strcmp(img->import_names[i], BUILTIN_SYSCALLS[j].name) == 0) {
+                img->import_fns[i]      = BUILTIN_SYSCALLS[j].fn;
+                img->import_userdata[i] = NULL;
+                break;
+            }
+        }
+    }
 }
 
 int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
@@ -41,6 +81,7 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
     uint32_t code_off = 0, code_size = 0;
     uint32_t data_off = 0, data_size = 0;
     uint32_t bss_size = 0;
+    uint32_t reserve_size = 0;
     uint32_t imports_off = 0, imports_size = 0;
     int      has_code = 0;
 
@@ -58,7 +99,7 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
             seen[type] = 1;
         }
 
-        if (type != CVM_SEC_BSS) {
+        if (type != CVM_SEC_BSS && type != CVM_SEC_HEAP_RESERVE) {
             if ((uint64_t)file_off + size > len) return CVM_E_TRUNCATED;
         } else if (file_off != 0) {
             return CVM_E_BAD_SECTION;
@@ -82,6 +123,9 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
             imports_off = file_off;
             imports_size = size;
             break;
+        case CVM_SEC_HEAP_RESERVE:
+            reserve_size = size;
+            break;
         case CVM_SEC_DEBUG:
         default:
             break;
@@ -93,7 +137,9 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
     uint32_t code_count = code_size / 4u;
     if (entry >= code_count) return CVM_E_BAD_ENTRY;
 
-    uint64_t heap_total = (uint64_t)data_size + (uint64_t)bss_size;
+    uint64_t heap_total = (uint64_t)data_size
+                        + (uint64_t)bss_size
+                        + (uint64_t)reserve_size;
     if (heap_total > 0xFFFFFFFFu) return CVM_E_BAD_SECTION;
 
     /* Pre-validate IMPORTS layout before any allocation. */
@@ -140,7 +186,8 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
         code[i] = read_u32_le(base + code_off + (size_t)i * 4u);
 
     if (data_size) memcpy(heap, base + data_off, data_size);
-    if (bss_size)  memset(heap + data_size, 0, bss_size);
+    if (bss_size + reserve_size)
+        memset(heap + data_size, 0, (size_t)bss_size + reserve_size);
 
     if (imports_size > 0) {
         memcpy(import_blob, base + imports_off, imports_size);
@@ -155,12 +202,14 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
     out->heap             = heap;
     out->heap_size        = (uint32_t)heap_total;
     out->data_size        = data_size;
+    out->reserve_size     = reserve_size;
     out->entry            = entry;
     out->import_count     = import_count;
     out->import_names     = import_names;
     out->import_fns       = import_fns;
     out->import_userdata  = import_ud;
     out->_import_blob     = import_blob;
+    auto_bind_builtins(out);
     return CVM_OK;
 
 oom:

@@ -367,7 +367,7 @@ static int serialize_constant(LLVMValueRef c, LLVMTargetDataRef td,
     uint32_t sz = (uint32_t)LLVMABISizeOfType(td, ty);
     if (off + sz > cap) return 1;
 
-    if (LLVMIsAConstantAggregateZero(c)) {
+    if (LLVMIsAConstantAggregateZero(c) || LLVMIsAConstantPointerNull(c)) {
         /* out is calloc/zeroed already; nothing to write. */
         return 0;
     }
@@ -465,6 +465,11 @@ struct cg_fixup {
     int      bits;      /* width of the imm field (8 or 24) */
 };
 
+struct cg_import {
+    LLVMValueRef value;     /* the LLVM declaration */
+    const char  *name;      /* points into LLVM-owned storage */
+};
+
 struct cg {
     uint32_t *code;
     uint32_t  count;
@@ -493,9 +498,31 @@ struct cg {
 
     struct cg_globals *globals;       /* module-wide; not owned */
 
+    /* Imports collected as we encounter cvm_sys_* calls. Each unique callee
+     * gets a stable syscall_id (its index in this table). */
+    struct cg_import *imports;
+    int               import_count;
+    int               import_cap;
+
     int           had_error;
     const char   *fn_name;
 };
+
+static int cg_import_lookup_or_add(struct cg *cg, LLVMValueRef callee,
+                                   const char *name)
+{
+    for (int i = 0; i < cg->import_count; ++i)
+        if (cg->imports[i].value == callee) return i;
+    if (cg->import_count == cg->import_cap) {
+        cg->import_cap = cg->import_cap ? cg->import_cap * 2 : 4;
+        cg->imports = (struct cg_import *)realloc(cg->imports,
+                            cg->import_cap * sizeof(*cg->imports));
+        if (!cg->imports) { perror("realloc"); exit(1); }
+    }
+    cg->imports[cg->import_count].value = callee;
+    cg->imports[cg->import_count].name  = name;
+    return cg->import_count++;
+}
 
 static uint32_t enc_r(uint8_t op, uint8_t a, uint8_t b, uint8_t c) {
     return (uint32_t)op
@@ -577,6 +604,12 @@ static uint8_t cg_reg_for(struct cg *cg, LLVMValueRef v) {
         }
         uint8_t r = cg_alloc_reg(cg);
         cg_emit(cg, enc_i16(CVM_OP_MOVI, r, (int16_t)imm));
+        return r;
+    }
+
+    if (LLVMIsAConstantPointerNull(v)) {
+        uint8_t r = cg_alloc_reg(cg);
+        cg_emit(cg, enc_i16(CVM_OP_MOVI, r, 0));
         return r;
     }
 
@@ -750,10 +783,16 @@ static int icmp_to_op(LLVMIntPredicate p, int *swap_out) {
 }
 
 static void cg_pre_alloc_function(struct cg *cg, LLVMValueRef fn) {
+    /* R0..R7 are scratch for syscall argument passing. SSA values start at
+     * R8 — the function prologue copies params from R0..R(N-1) into their
+     * assigned high registers, so the syscall ABI can clobber R0..R7
+     * freely without saving anything. */
+    cg->next_reg = 8;
+
     unsigned np = LLVMCountParams(fn);
     for (unsigned i = 0; i < np; ++i) {
         LLVMValueRef p = LLVMGetParam(fn, i);
-        cg_assign(cg, p, cg_alloc_reg(cg));   /* R0..R(N-1) */
+        cg_assign(cg, p, cg_alloc_reg(cg));   /* R8..R(8+N-1) */
     }
     cg->zero_reg = cg_alloc_reg(cg);          /* dedicated zero register */
 
@@ -785,7 +824,14 @@ static int cg_function(struct cg *cg, LLVMValueRef fn) {
     cg_pre_alloc_function(cg, fn);
     if (cg->had_error) return 1;
 
-    /* Prologue: materialise the zero register once. */
+    /* Prologue: copy params from the syscall-ABI slots (R0..R(N-1)) into
+     * their assigned high registers, then materialise the zero register. */
+    for (unsigned p = 0; p < n_params; ++p) {
+        LLVMValueRef pv  = LLVMGetParam(fn, p);
+        uint8_t      dst = cg->regs[cg_lookup(cg, pv)];
+        if (dst != p)
+            cg_emit(cg, enc_r(CVM_OP_MOV, dst, (uint8_t)p, 0));
+    }
     cg_emit(cg, enc_i16(CVM_OP_MOVI, cg->zero_reg, 0));
 
     for (int b = 0; b < cg->block_count && !cg->had_error; ++b) {
@@ -895,15 +941,23 @@ static int cg_function(struct cg *cg, LLVMValueRef fn) {
             }
 
             case LLVMLoad: {
-                /* Only i32 loads supported for now. */
+                /* Accept i32 and (4-byte-aligned) i1 / pointer loads — both
+                 * lower to LDW. Narrower loads (i8/i16) need LDB/LDH and are
+                 * pending. */
                 LLVMTypeRef lty = LLVMTypeOf(i);
-                if (LLVMGetTypeKind(lty) != LLVMIntegerTypeKind ||
-                    LLVMGetIntTypeWidth(lty) != 32 ||
+                LLVMTypeKind lk = LLVMGetTypeKind(lty);
+                int ok = 0;
+                if (lk == LLVMPointerTypeKind) ok = 1;
+                else if (lk == LLVMIntegerTypeKind) {
+                    unsigned w = LLVMGetIntTypeWidth(lty);
+                    if (w == 1 || w == 32) ok = 1;
+                }
+                if (!ok ||
                     LLVMGetTypeKind(LLVMTypeOf(LLVMGetOperand(i, 0)))
                         != LLVMPointerTypeKind)
                 {
                     ERR(cg->fn_name,
-                        "load: only i32 through ptr is implemented yet");
+                        "load: only i32/i1/ptr through ptr is implemented yet");
                     cg->had_error = 1;
                     break;
                 }
@@ -914,20 +968,42 @@ static int cg_function(struct cg *cg, LLVMValueRef fn) {
             }
 
             case LLVMStore: {
-                /* Operand 0 = value, operand 1 = pointer. Only i32 supported. */
+                /* Operand 0 = value, operand 1 = pointer. Same widths as load. */
                 LLVMValueRef val_v = LLVMGetOperand(i, 0);
                 LLVMTypeRef  vty   = LLVMTypeOf(val_v);
-                if (LLVMGetTypeKind(vty) != LLVMIntegerTypeKind ||
-                    LLVMGetIntTypeWidth(vty) != 32)
-                {
+                LLVMTypeKind vk    = LLVMGetTypeKind(vty);
+                int ok = 0;
+                if (vk == LLVMPointerTypeKind) ok = 1;
+                else if (vk == LLVMIntegerTypeKind) {
+                    unsigned w = LLVMGetIntTypeWidth(vty);
+                    if (w == 1 || w == 32) ok = 1;
+                }
+                if (!ok) {
                     ERR(cg->fn_name,
-                        "store: only i32 values are implemented yet");
+                        "store: only i32/i1/ptr values are implemented yet");
                     cg->had_error = 1;
                     break;
                 }
                 uint8_t val  = cg_reg_for(cg, val_v);
                 uint8_t addr = cg_reg_for(cg, LLVMGetOperand(i, 1));
                 cg_emit(cg, enc_r(CVM_OP_STW, 0, addr, val));
+                break;
+            }
+
+            /* Pointer/integer reinterprets are no-ops in our world: pointers
+             * live in 32-bit registers, like every other scalar. Same for
+             * width-changing casts when source and dest are both i32 (the
+             * common case at i386-elf -O1 since we have no narrower ops). */
+            case LLVMPtrToInt:
+            case LLVMIntToPtr:
+            case LLVMBitCast:
+            case LLVMTrunc:
+            case LLVMZExt:
+            case LLVMSExt: {
+                uint8_t src = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                if (src != dst)
+                    cg_emit(cg, enc_r(CVM_OP_MOV, dst, src, 0));
                 break;
             }
 
@@ -1110,6 +1186,43 @@ static int cg_function(struct cg *cg, LLVMValueRef fn) {
                     break;
                 }
 
+                /* Calls to cvm_sys_* lower to SYSCALL with the matching
+                 * import index. Args go in R0..R(narg-1); return value
+                 * comes back in R0. */
+                if (strncmp(name, "cvm_sys_", 8) == 0) {
+                    unsigned narg = LLVMGetNumArgOperands(i);
+                    if (narg > 8) {
+                        ERR(cg->fn_name,
+                            "syscall '%s' has %u args; max 8", name, narg);
+                        cg->had_error = 1;
+                        break;
+                    }
+                    int sid = cg_import_lookup_or_add(cg, callee, name);
+                    if (sid > 0xFFFF) {
+                        ERR(cg->fn_name, "more than 65536 imports");
+                        cg->had_error = 1;
+                        break;
+                    }
+                    /* Read all arg sources before any MOV, so cg_reg_for
+                     * for constants emits MOVI ahead of the arg moves. */
+                    uint8_t arg_regs[8];
+                    for (unsigned k = 0; k < narg; ++k)
+                        arg_regs[k] = cg_reg_for(cg, LLVMGetOperand(i, k));
+                    if (cg->had_error) break;
+                    for (unsigned k = 0; k < narg; ++k)
+                        if (arg_regs[k] != k)
+                            cg_emit(cg, enc_r(CVM_OP_MOV,
+                                              (uint8_t)k, arg_regs[k], 0));
+                    cg_emit(cg, enc_i16(CVM_OP_SYSCALL, 0, (int16_t)sid));
+                    LLVMTypeRef rty = LLVMTypeOf(i);
+                    if (LLVMGetTypeKind(rty) != LLVMVoidTypeKind) {
+                        uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                        if (dst != 0)
+                            cg_emit(cg, enc_r(CVM_OP_MOV, dst, 0, 0));
+                    }
+                    break;
+                }
+
                 if (strncmp(name, "llvm.", 5) == 0) {
                     ERR(cg->fn_name,
                         "intrinsic '%s' not yet lowered", name);
@@ -1148,6 +1261,8 @@ static void put_u32_le(uint8_t *p, uint32_t v) {
 static int write_bin(const char *path,
                      const uint32_t *code, uint32_t code_count,
                      const uint8_t *data, uint32_t data_size,
+                     uint32_t reserve_size,
+                     const struct cg_import *imports, int import_count,
                      uint32_t entry)
 {
     FILE *f = fopen(path, "wb");
@@ -1157,11 +1272,36 @@ static int write_bin(const char *path,
         return 1;
     }
 
-    uint32_t section_count = 1u + (data_size > 0 ? 1u : 0u);
+    /* Build IMPORTS payload up front so we know its size. */
+    uint8_t  *imports_buf  = NULL;
+    uint32_t  imports_size = 0;
+    if (import_count > 0) {
+        uint32_t names_off = 4u + (uint32_t)import_count * 4u;
+        uint32_t total = names_off;
+        for (int k = 0; k < import_count; ++k)
+            total += (uint32_t)strlen(imports[k].name) + 1u;
+        imports_buf  = (uint8_t *)calloc(1, total);
+        imports_size = total;
+        put_u32_le(imports_buf, (uint32_t)import_count);
+        uint32_t cursor = names_off;
+        for (int k = 0; k < import_count; ++k) {
+            put_u32_le(imports_buf + 4u + (size_t)k * 4u, cursor);
+            size_t L = strlen(imports[k].name);
+            memcpy(imports_buf + cursor, imports[k].name, L + 1);
+            cursor += (uint32_t)L + 1u;
+        }
+    }
+
+    uint32_t section_count = 1u
+                           + (data_size    > 0 ? 1u : 0u)
+                           + (imports_size > 0 ? 1u : 0u)
+                           + (reserve_size > 0 ? 1u : 0u);
     uint32_t table_off = 24;
     uint32_t code_off  = table_off + section_count * 16;
     uint32_t code_size = code_count * 4u;
-    uint32_t data_off  = data_size > 0 ? code_off + code_size : 0;
+    uint32_t data_off    = data_size    > 0 ? code_off + code_size : 0;
+    uint32_t imports_off = imports_size > 0
+                         ? code_off + code_size + data_size : 0;
 
     uint8_t hdr[24] = {0};
     hdr[0] = 'C'; hdr[1] = 'V'; hdr[2] = 'M'; hdr[3] = '1';
@@ -1187,6 +1327,22 @@ static int write_bin(const char *path,
         put_u32_le(sec + 12, 0u);
         fwrite(sec, sizeof(sec), 1, f);
     }
+    if (imports_size > 0) {
+        memset(sec, 0, sizeof(sec));
+        put_u32_le(sec + 0,  CVM_SEC_IMPORTS);
+        put_u32_le(sec + 4,  imports_off);
+        put_u32_le(sec + 8,  imports_size);
+        put_u32_le(sec + 12, 0u);
+        fwrite(sec, sizeof(sec), 1, f);
+    }
+    if (reserve_size > 0) {
+        memset(sec, 0, sizeof(sec));
+        put_u32_le(sec + 0,  CVM_SEC_HEAP_RESERVE);
+        put_u32_le(sec + 4,  0u);
+        put_u32_le(sec + 8,  reserve_size);
+        put_u32_le(sec + 12, 0u);
+        fwrite(sec, sizeof(sec), 1, f);
+    }
 
     for (uint32_t i = 0; i < code_count; ++i) {
         uint8_t b[4];
@@ -1195,6 +1351,8 @@ static int write_bin(const char *path,
     }
 
     if (data_size > 0) fwrite(data, 1, data_size, f);
+    if (imports_size > 0) fwrite(imports_buf, 1, imports_size, f);
+    free(imports_buf);
 
     int err = ferror(f);
     fclose(f);
@@ -1209,18 +1367,39 @@ static int write_bin(const char *path,
 
 static void usage(void) {
     fprintf(stderr,
-            "Usage: cvm-translate [-o <out.bin>] <input.bc>\n"
-            "  -o <file>   Emit a CronoVM .bin (otherwise validate-only).\n");
+            "Usage: cvm-translate [-o <out.bin>] [--heap-reserve=N[K|M]] <input.bc>\n"
+            "  -o <file>           Emit a CronoVM .bin (otherwise validate-only).\n"
+            "  --heap-reserve=N    Reserve N bytes of free heap for the user\n"
+            "                      allocator. K and M suffixes accepted.\n");
+}
+
+static int parse_size(const char *s, uint32_t *out) {
+    char *end = NULL;
+    unsigned long long v = strtoull(s, &end, 0);
+    if (end == s) return 1;
+    if (*end == 'K' || *end == 'k')      { v <<= 10; ++end; }
+    else if (*end == 'M' || *end == 'm') { v <<= 20; ++end; }
+    if (*end != '\0') return 1;
+    if (v > 0x7FFFFFFFu) return 1;
+    *out = (uint32_t)v;
+    return 0;
 }
 
 int main(int argc, char **argv) {
     const char *input  = NULL;
     const char *output = NULL;
+    uint32_t    heap_reserve = 0;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-o") == 0) {
             if (i + 1 >= argc) { usage(); return 2; }
             output = argv[++i];
+        } else if (strncmp(argv[i], "--heap-reserve=", 15) == 0) {
+            if (parse_size(argv[i] + 15, &heap_reserve) != 0) {
+                fprintf(stderr, "translator: bad --heap-reserve value '%s'\n",
+                        argv[i] + 15);
+                return 2;
+            }
         } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
             fprintf(stderr, "translator: unknown option '%s'\n", argv[i]);
             return 2;
@@ -1291,11 +1470,15 @@ int main(int argc, char **argv) {
             if (cg_function(&cg, first_def) != 0) {
                 rc = 1;
             } else if (write_bin(output, cg.code, cg.count,
-                                  globals.data_bytes, globals.data_size, 0) != 0) {
+                                  globals.data_bytes, globals.data_size,
+                                  heap_reserve,
+                                  cg.imports, cg.import_count, 0) != 0) {
                 rc = 1;
             } else {
-                printf("translator: wrote %s (%u instructions, %u data bytes)\n",
-                       output, cg.count, globals.data_size);
+                printf("translator: wrote %s (%u instructions, %u data bytes, "
+                       "%d imports, %u heap-reserve)\n",
+                       output, cg.count, globals.data_size,
+                       cg.import_count, heap_reserve);
             }
             free(cg.code);
             free(cg.vals);
@@ -1303,6 +1486,7 @@ int main(int argc, char **argv) {
             free(cg.blocks);
             free(cg.block_offsets);
             free(cg.fixups);
+            free(cg.imports);
         }
         cg_globals_dispose(&globals);
     }

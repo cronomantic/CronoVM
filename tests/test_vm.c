@@ -44,6 +44,7 @@ static uint8_t *build_blob_full(const uint32_t *code, uint32_t code_count,
                                 uint32_t bss_size, uint32_t entry,
                                 const char * const *imports, uint32_t import_count,
                                 const uint8_t *data, uint32_t data_size,
+                                uint32_t reserve_size,
                                 size_t *out_len)
 {
     uint32_t header_size  = 24;
@@ -61,7 +62,8 @@ static uint8_t *build_blob_full(const uint32_t *code, uint32_t code_count,
           1u                                /* CODE always */
         + (bss_size > 0 ? 1u : 0u)
         + (import_count > 0 ? 1u : 0u)
-        + (data_size > 0 ? 1u : 0u);
+        + (data_size > 0 ? 1u : 0u)
+        + (reserve_size > 0 ? 1u : 0u);
 
     uint32_t table_off = header_size;
     uint32_t cursor    = table_off + section_count * section_size;
@@ -112,6 +114,13 @@ static uint8_t *build_blob_full(const uint32_t *code, uint32_t code_count,
         put_u32(buf + te + 12, 0u);
         te += section_size;
     }
+    if (reserve_size > 0) {
+        put_u32(buf + te + 0, CVM_SEC_HEAP_RESERVE);
+        put_u32(buf + te + 4, 0u);
+        put_u32(buf + te + 8, reserve_size);
+        put_u32(buf + te + 12, 0u);
+        te += section_size;
+    }
 
     for (uint32_t i = 0; i < code_count; ++i)
         put_u32(buf + code_off + i * 4u, code[i]);
@@ -140,7 +149,7 @@ static uint8_t *build_blob(const uint32_t *code, uint32_t code_count,
                            size_t *out_len)
 {
     return build_blob_full(code, code_count, bss_size, entry,
-                           NULL, 0, NULL, 0, out_len);
+                           NULL, 0, NULL, 0, 0, out_len);
 }
 
 /* --- Test harness -------------------------------------------------------- */
@@ -441,7 +450,7 @@ static void test_syscall_hello_int(void) {
     const char *imports[] = { "cvm_sys_print_int" };
 
     size_t len;
-    uint8_t *blob = build_blob_full(code, 3, 0, 0, imports, 1, NULL, 0, &len);
+    uint8_t *blob = build_blob_full(code, 3, 0, 0, imports, 1, NULL, 0, 0, &len);
     struct cvm_image img;
     int r = cvm_load(blob, len, &img);
     CHECK(r == CVM_OK, "hello: load %s", cvm_strerror(r));
@@ -471,7 +480,7 @@ static void test_syscall_two_args(void) {
     };
     const char *imports[] = { "cvm_sys_add" };
     size_t len;
-    uint8_t *blob = build_blob_full(code, 4, 0, 0, imports, 1, NULL, 0, &len);
+    uint8_t *blob = build_blob_full(code, 4, 0, 0, imports, 1, NULL, 0, 0, &len);
     struct cvm_image img;
     CHECK(cvm_load(blob, len, &img) == CVM_OK, "two: load");
     CHECK(cvm_link(&img, "cvm_sys_add", sys_add, NULL) == CVM_OK, "two: link");
@@ -493,7 +502,7 @@ static void test_syscall_print_string(void) {
     const char *imports[] = { "cvm_sys_print_string" };
     size_t len;
     uint8_t *blob = build_blob_full(code, 3, 0, 0, imports, 1,
-                                    data, sizeof(data), &len);
+                                    data, sizeof(data), 0, &len);
     struct cvm_image img;
     CHECK(cvm_load(blob, len, &img) == CVM_OK, "str: load");
     char captured[64] = {0};
@@ -514,7 +523,7 @@ static void test_syscall_unlinked(void) {
     };
     const char *imports[] = { "cvm_sys_missing" };
     size_t len;
-    uint8_t *blob = build_blob_full(code, 2, 0, 0, imports, 1, NULL, 0, &len);
+    uint8_t *blob = build_blob_full(code, 2, 0, 0, imports, 1, NULL, 0, 0, &len);
     struct cvm_image img;
     CHECK(cvm_load(blob, len, &img) == CVM_OK, "unlinked: load");
     int32_t v = 0;
@@ -527,7 +536,7 @@ static void test_syscall_no_such_import(void) {
     const char *imports[] = { "cvm_sys_real" };
     uint32_t code[] = { enc_r(CVM_OP_HALT, 0, 0, 0) };
     size_t len;
-    uint8_t *blob = build_blob_full(code, 1, 0, 0, imports, 1, NULL, 0, &len);
+    uint8_t *blob = build_blob_full(code, 1, 0, 0, imports, 1, NULL, 0, 0, &len);
     struct cvm_image img;
     CHECK(cvm_load(blob, len, &img) == CVM_OK, "nosuch: load");
     int r = cvm_link(&img, "cvm_sys_imaginary", sys_print_int, NULL);
@@ -542,7 +551,7 @@ static void test_syscall_trap(void) {
     };
     const char *imports[] = { "cvm_sys_trap" };
     size_t len;
-    uint8_t *blob = build_blob_full(code, 2, 0, 0, imports, 1, NULL, 0, &len);
+    uint8_t *blob = build_blob_full(code, 2, 0, 0, imports, 1, NULL, 0, 0, &len);
     struct cvm_image img;
     CHECK(cvm_load(blob, len, &img) == CVM_OK, "trap: load");
     CHECK(cvm_link(&img, "cvm_sys_trap", sys_trap, NULL) == CVM_OK, "trap: link");
@@ -550,6 +559,43 @@ static void test_syscall_trap(void) {
     int r = cvm_run(&img, &v);
     CHECK(r == CVM_E_SYSCALL_TRAP, "trap: got %s", cvm_strerror(r));
     cvm_image_free(&img); free(blob);
+}
+
+static void test_builtin_heap_syscalls(void) {
+    /* DATA = 8 bytes, BSS = 0, RESERVE = 1024.
+     * cvm_sys_heap_start() should return 8 (start of reserve = end of static).
+     * cvm_sys_heap_size()  should return 1024. */
+    uint32_t code[] = {
+        enc_syscall(0),                /* heap_start -> R0 */
+        enc_r(CVM_OP_MOV, 1, 0, 0),    /* save in R1 */
+        enc_syscall(1),                /* heap_size  -> R0 */
+        enc_r(CVM_OP_ADD, 2, 0, 1),    /* sum = size + start = 1024 + 8 */
+        enc_r(CVM_OP_HALT, 2, 0, 0),
+    };
+    const char *imports[] = { "cvm_sys_heap_start", "cvm_sys_heap_size" };
+    static const uint8_t data8[] = { 0,0,0,0, 0,0,0,0 };
+
+    size_t len;
+    uint8_t *blob = build_blob_full(code, 5, 0, 0,
+                                    imports, 2,
+                                    data8, sizeof(data8),
+                                    1024, &len);
+    struct cvm_image img;
+    int r = cvm_load(blob, len, &img);
+    CHECK(r == CVM_OK, "heap_sys: load %s", cvm_strerror(r));
+    CHECK(img.reserve_size == 1024, "heap_sys: reserve_size=%u", img.reserve_size);
+    CHECK(img.heap_size == 8 + 1024, "heap_sys: heap_size=%u", img.heap_size);
+    /* Both syscalls should be auto-bound. */
+    CHECK(img.import_fns[0] != NULL, "heap_sys: heap_start unbound");
+    CHECK(img.import_fns[1] != NULL, "heap_sys: heap_size  unbound");
+
+    int32_t v = 0;
+    r = cvm_run(&img, &v);
+    CHECK(r == CVM_OK, "heap_sys: run %s", cvm_strerror(r));
+    CHECK(v == 1024 + 8, "heap_sys: got %d", v);
+
+    cvm_image_free(&img);
+    free(blob);
 }
 
 static void test_loader_rejects(void) {
@@ -586,6 +632,7 @@ int main(void) {
     test_syscall_unlinked();
     test_syscall_no_such_import();
     test_syscall_trap();
+    test_builtin_heap_syscalls();
 
     if (g_failures) {
         fprintf(stderr, "%d test(s) failed\n", g_failures);

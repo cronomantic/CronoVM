@@ -94,16 +94,47 @@ the gap is what's still being implemented:
   `shl`, `lshr`, `ashr`, `and`, `or`, `xor`
 - comparisons: `icmp` (all 10 predicates)
 - control: `br` (both forms), `phi`, `ret`
-- memory: `load` (i32 only), `store` (i32 only), `getelementptr`
+- memory: `load` / `store` (i32, i1, ptr), `getelementptr`
 - aggregate values via globals: arrays, structs, scalars
 - value selection: `select`
+- pointer reinterprets: `inttoptr`, `ptrtoint`, `bitcast`
+- width casts: `trunc`, `zext`, `sext` (no-op MOV — i32-only register
+  model means these don't change the live value at i386-elf -O1)
 - intrinsic calls: `llvm.abs.i32`, `llvm.smax.i32`, `llvm.smin.i32`,
   `llvm.umax.i32`, `llvm.umin.i32`
+- syscall calls: any `cvm_sys_*` function call lowers to `SYSCALL`
 
-User-defined function calls and the rest of the LLVM intrinsics
+User-defined non-syscall calls and the rest of the LLVM intrinsics
 (`llvm.memcpy`, `llvm.memset`, `llvm.ctlz`, …) still error out — they
-need calling-convention work or per-intrinsic lowerings. Likewise
-`alloca`, i8/i16 loads/stores, and `extern` globals are pending.
+need CALL/RET work or per-intrinsic lowerings. Likewise `alloca`,
+i8/i16 loads/stores, and `extern` data globals are pending.
+
+### Calling convention
+
+Inside a translated function:
+
+- `R0..R7` are reserved as **syscall argument-passing slots**. They
+  never hold SSA values directly; they're scratch around `SYSCALL`
+  instructions.
+- `R8..` is where SSA values live. Function parameters arrive in
+  `R0..R(N-1)` (host calls `cvm_run_args`) and the prologue copies
+  them up to `R8..R(8+N-1)` immediately, so the body sees stable
+  registers regardless of any later syscall clobbering R0..R7.
+- Each function's `MOVI zero` lives at the next free register after
+  the params.
+
+### Syscall lowering
+
+A call to a function whose name begins with `cvm_sys_` is treated as a
+syscall:
+
+1. Each unique callee gets a stable `syscall_id` (its index in the
+   IMPORTS section).
+2. Args are read into temporaries via `cg_reg_for`, then `MOV`'d into
+   `R0..R(narg-1)`.
+3. `SYSCALL imm16=syscall_id` is emitted.
+4. If the callee returns a value, the result (which arrives in `R0`)
+   is `MOV`'d into the call's destination register.
 
 ### Globals layout
 
