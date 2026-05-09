@@ -86,9 +86,17 @@ the gap is what's still being implemented:
 
 ### Instructions currently lowered by codegen
 
-`add`, `sub`, `mul`, `icmp` (all 10 predicates), `select`, `br` (both
-forms), `phi`, `ret`. Calls (including LLVM intrinsics like `llvm.abs`,
-`llvm.smax`) are not yet lowered — that's a near-term step.
+- arithmetic: `add`, `sub`, `mul`, `sdiv`, `udiv`, `srem`, `urem`,
+  `shl`, `lshr`, `ashr`, `and`, `or`, `xor`
+- comparisons: `icmp` (all 10 predicates)
+- control: `br` (both forms), `phi`, `ret`
+- value selection: `select`
+- intrinsic calls: `llvm.abs.i32`, `llvm.smax.i32`, `llvm.smin.i32`,
+  `llvm.umax.i32`, `llvm.umin.i32`
+
+User-defined function calls and the rest of the LLVM intrinsics
+(`llvm.memcpy`, `llvm.memset`, `llvm.ctlz`, …) still error out — they
+need calling-convention work or per-intrinsic lowerings.
 
 ### Instructions rejected
 

@@ -36,6 +36,16 @@ an offset of `0` means "fall through to the next instruction".
 | 0x0F | `CMP_LE` | `A, B, C` | `R[A] = (R[B] <= R[C]) ? 1 : 0` (signed) |
 | 0x10 | `CMP_LTU` | `A, B, C` | unsigned `<` |
 | 0x11 | `CMP_LEU` | `A, B, C` | unsigned `<=` |
+| 0x12 | `DIV` | `A, B, C` | signed division; trap on `R[C]==0` |
+| 0x13 | `DIVU` | `A, B, C` | unsigned division; trap on `R[C]==0` |
+| 0x14 | `MOD` | `A, B, C` | signed remainder; trap on `R[C]==0` |
+| 0x15 | `MODU` | `A, B, C` | unsigned remainder; trap on `R[C]==0` |
+| 0x16 | `SHL` | `A, B, C` | `R[A] = R[B] << (R[C] & 31)` |
+| 0x17 | `SHR` | `A, B, C` | logical right shift, amount `& 31` |
+| 0x18 | `SAR` | `A, B, C` | arithmetic right shift, amount `& 31` |
+| 0x19 | `AND` | `A, B, C` | `R[A] = R[B] & R[C]` |
+| 0x1A | `OR` | `A, B, C` | `R[A] = R[B] \| R[C]` |
+| 0x1B | `XOR` | `A, B, C` | `R[A] = R[B] ^ R[C]` |
 
 ### Forms
 
@@ -69,6 +79,7 @@ calls are not yet defined.
 | `CVM_E_BAD_SYSCALL` | `SYSCALL imm16` references an out-of-range import. |
 | `CVM_E_UNLINKED_SYSCALL` | Import has no host handler bound. |
 | `CVM_E_SYSCALL_TRAP` | Host handler returned non-zero. |
+| `CVM_E_DIV_BY_ZERO` | `DIV`/`DIVU`/`MOD`/`MODU` with `R[C]==0`. |
 
 ## Lowering of i1 conditions
 

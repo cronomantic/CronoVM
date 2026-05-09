@@ -640,15 +640,30 @@ static int cg_function(struct cg *cg, LLVMValueRef fn) {
                 /* phis are eliminated by emit_phi_moves on predecessor edges. */
                 break;
 
-            case LLVMAdd:
-            case LLVMSub:
-            case LLVMMul: {
+            case LLVMAdd:  case LLVMSub:  case LLVMMul:
+            case LLVMSDiv: case LLVMUDiv: case LLVMSRem: case LLVMURem:
+            case LLVMShl:  case LLVMLShr: case LLVMAShr:
+            case LLVMAnd:  case LLVMOr:   case LLVMXor: {
                 uint8_t lhs = cg_reg_for(cg, LLVMGetOperand(i, 0));
                 uint8_t rhs = cg_reg_for(cg, LLVMGetOperand(i, 1));
                 uint8_t dst = cg->regs[cg_lookup(cg, i)];
-                uint8_t cv = (op == LLVMAdd) ? CVM_OP_ADD
-                           : (op == LLVMSub) ? CVM_OP_SUB
-                                             : CVM_OP_MUL;
+                uint8_t cv;
+                switch (op) {
+                case LLVMAdd:  cv = CVM_OP_ADD;  break;
+                case LLVMSub:  cv = CVM_OP_SUB;  break;
+                case LLVMMul:  cv = CVM_OP_MUL;  break;
+                case LLVMSDiv: cv = CVM_OP_DIV;  break;
+                case LLVMUDiv: cv = CVM_OP_DIVU; break;
+                case LLVMSRem: cv = CVM_OP_MOD;  break;
+                case LLVMURem: cv = CVM_OP_MODU; break;
+                case LLVMShl:  cv = CVM_OP_SHL;  break;
+                case LLVMLShr: cv = CVM_OP_SHR;  break;
+                case LLVMAShr: cv = CVM_OP_SAR;  break;
+                case LLVMAnd:  cv = CVM_OP_AND;  break;
+                case LLVMOr:   cv = CVM_OP_OR;   break;
+                case LLVMXor:  cv = CVM_OP_XOR;  break;
+                default:       cv = CVM_OP_ADD;  break; /* unreachable */
+                }
                 cg_emit(cg, enc_r(cv, dst, lhs, rhs));
                 break;
             }
@@ -714,6 +729,80 @@ static int cg_function(struct cg *cg, LLVMValueRef fn) {
                     uint8_t r = cg_reg_for(cg, LLVMGetOperand(i, 0));
                     cg_emit(cg, enc_r(CVM_OP_HALT, r, 0, 0));
                 }
+                break;
+            }
+
+            case LLVMCall: {
+                LLVMValueRef callee = LLVMGetCalledValue(i);
+                size_t name_len = 0;
+                const char *name = callee
+                    ? LLVMGetValueName2(callee, &name_len) : NULL;
+                if (!name || name_len == 0) {
+                    ERR(cg->fn_name, "call with unknown callee");
+                    cg->had_error = 1;
+                    break;
+                }
+
+                /* llvm.abs.i32(%x, _is_int_min_poison)
+                 *   abs(x) = (x<0) ? -x : x
+                 *
+                 *   CMP_LT cond, x, zero
+                 *   SUB    neg, zero, x
+                 *   BEQ    cond, zero, +2   ; x>=0 ? skip true branch
+                 *   MOV    dst, neg
+                 *   JMP    +1
+                 *   MOV    dst, x
+                 */
+                if (strcmp(name, "llvm.abs.i32") == 0) {
+                    uint8_t x    = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                    uint8_t dst  = cg->regs[cg_lookup(cg, i)];
+                    uint8_t cond = cg_alloc_reg(cg);
+                    uint8_t neg  = cg_alloc_reg(cg);
+                    if (cg->had_error) break;
+                    cg_emit(cg, enc_r (CVM_OP_CMP_LT, cond, x, cg->zero_reg));
+                    cg_emit(cg, enc_r (CVM_OP_SUB, neg, cg->zero_reg, x));
+                    cg_emit(cg, enc_br(CVM_OP_BEQ, cond, cg->zero_reg, 2));
+                    cg_emit(cg, enc_r (CVM_OP_MOV, dst, neg, 0));
+                    cg_emit(cg, enc_i24(CVM_OP_JMP, 1));
+                    cg_emit(cg, enc_r (CVM_OP_MOV, dst, x, 0));
+                    break;
+                }
+
+                /* min/max family. Lowered as cmp + branch + 2 MOVs. */
+                int is_min = 0, is_signed = 0, is_minmax = 0;
+                if (strcmp(name, "llvm.smax.i32") == 0) { is_minmax = 1; is_signed = 1; }
+                else if (strcmp(name, "llvm.smin.i32") == 0) { is_minmax = 1; is_signed = 1; is_min = 1; }
+                else if (strcmp(name, "llvm.umax.i32") == 0) { is_minmax = 1; }
+                else if (strcmp(name, "llvm.umin.i32") == 0) { is_minmax = 1; is_min = 1; }
+
+                if (is_minmax) {
+                    uint8_t a    = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                    uint8_t b2   = cg_reg_for(cg, LLVMGetOperand(i, 1));
+                    uint8_t dst  = cg->regs[cg_lookup(cg, i)];
+                    uint8_t cond = cg_alloc_reg(cg);
+                    if (cg->had_error) break;
+                    /* cond = (a < b). For max, true -> b ; false -> a.
+                     * For min, true -> a ; false -> b. */
+                    uint8_t cmp_op = is_signed ? CVM_OP_CMP_LT : CVM_OP_CMP_LTU;
+                    uint8_t true_v  = is_min ? a  : b2;
+                    uint8_t false_v = is_min ? b2 : a;
+                    cg_emit(cg, enc_r (cmp_op, cond, a, b2));
+                    cg_emit(cg, enc_br(CVM_OP_BEQ, cond, cg->zero_reg, 2));
+                    cg_emit(cg, enc_r (CVM_OP_MOV, dst, true_v, 0));
+                    cg_emit(cg, enc_i24(CVM_OP_JMP, 1));
+                    cg_emit(cg, enc_r (CVM_OP_MOV, dst, false_v, 0));
+                    break;
+                }
+
+                if (strncmp(name, "llvm.", 5) == 0) {
+                    ERR(cg->fn_name,
+                        "intrinsic '%s' not yet lowered", name);
+                } else {
+                    ERR(cg->fn_name,
+                        "user-defined call to '%s' not yet lowered "
+                        "(CALL/RET pending)", name);
+                }
+                cg->had_error = 1;
                 break;
             }
 

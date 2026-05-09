@@ -57,6 +57,7 @@ enum cvm_result {
     CVM_E_BAD_SYSCALL,
     CVM_E_UNLINKED_SYSCALL,
     CVM_E_SYSCALL_TRAP,
+    CVM_E_DIV_BY_ZERO,
 };
 
 /* ---------------------------------------------------------------------------
@@ -84,6 +85,11 @@ enum cvm_result {
  *     CMP_LE                               R[A] = (R[B] <= R[C]) ? 1 : 0   (signed)
  *     CMP_LTU                              same as CMP_LT but unsigned
  *     CMP_LEU                              same as CMP_LE but unsigned
+ *     DIV/DIVU A=rd, B=rs1, C=rs2          signed/unsigned division; trap on R[C]==0
+ *     MOD/MODU A=rd, B=rs1, C=rs2          signed/unsigned remainder; trap on R[C]==0
+ *     SHL      A=rd, B=rs1, C=rs2          R[A] = R[B] << (R[C] & 31)
+ *     SHR/SAR                              logical / arithmetic right shift
+ *     AND/OR/XOR                           bitwise
  *
  * All arithmetic is 32-bit two's-complement with wrap-around semantics.
  * Branch offsets are in instructions, relative to the instruction *after*
@@ -115,6 +121,20 @@ enum cvm_opcode {
     CVM_OP_CMP_LE  = 0x0F,
     CVM_OP_CMP_LTU = 0x10,
     CVM_OP_CMP_LEU = 0x11,
+
+    /* Arithmetic completion. DIV/MOD trap on R[C]==0; INT_MIN/-1 wraps to
+     * INT_MIN, INT_MIN%-1 yields 0 (so wrap is total). Shifts mask the
+     * amount to its low 5 bits, matching how most retro hardware behaves. */
+    CVM_OP_DIV     = 0x12,    /* signed */
+    CVM_OP_DIVU    = 0x13,    /* unsigned */
+    CVM_OP_MOD     = 0x14,    /* signed remainder */
+    CVM_OP_MODU    = 0x15,    /* unsigned remainder */
+    CVM_OP_SHL     = 0x16,
+    CVM_OP_SHR     = 0x17,    /* logical shift right */
+    CVM_OP_SAR     = 0x18,    /* arithmetic shift right */
+    CVM_OP_AND     = 0x19,
+    CVM_OP_OR      = 0x1A,
+    CVM_OP_XOR     = 0x1B,
 };
 
 #define CVM_REG_COUNT 256

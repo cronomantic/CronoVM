@@ -326,6 +326,68 @@ static void test_cmp_unsigned(void) {
     CHECK(v == 1,      "cmp_u: got %d", v);
 }
 
+static void test_div_signed(void) {
+    uint32_t code[] = {
+        enc_i16(CVM_OP_MOVI, 0, -17),
+        enc_i16(CVM_OP_MOVI, 1, 5),
+        enc_r  (CVM_OP_DIV, 2, 0, 1),     /* -17 / 5 = -3 (truncated) */
+        enc_r  (CVM_OP_MOD, 3, 0, 1),     /* -17 % 5 = -2  (sign of dividend) */
+        enc_r  (CVM_OP_ADD, 4, 2, 3),     /* -3 + -2 = -5 */
+        enc_r  (CVM_OP_HALT, 4, 0, 0),
+    };
+    int32_t v = 0;
+    int r = run_image(code, 6, 0, 0, &v);
+    CHECK(r == CVM_OK, "div_s: %s", cvm_strerror(r));
+    CHECK(v == -5,     "div_s: got %d", v);
+}
+
+static void test_div_by_zero(void) {
+    uint32_t code[] = {
+        enc_i16(CVM_OP_MOVI, 0, 5),
+        enc_i16(CVM_OP_MOVI, 1, 0),
+        enc_r  (CVM_OP_DIV, 2, 0, 1),
+        enc_r  (CVM_OP_HALT, 2, 0, 0),
+    };
+    int32_t v = 0;
+    int r = run_image(code, 4, 0, 0, &v);
+    CHECK(r == CVM_E_DIV_BY_ZERO, "div0: got %s", cvm_strerror(r));
+}
+
+static void test_shifts(void) {
+    /* 16<<2 = 64 ; 64>>1 = 32 ; arithmetic right of -8 by 1 = -4 */
+    uint32_t code[] = {
+        enc_i16(CVM_OP_MOVI, 0, 16),
+        enc_i16(CVM_OP_MOVI, 1, 2),
+        enc_r  (CVM_OP_SHL, 2, 0, 1),     /* 64 */
+        enc_i16(CVM_OP_MOVI, 3, 1),
+        enc_r  (CVM_OP_SHR, 4, 2, 3),     /* 32 */
+        enc_i16(CVM_OP_MOVI, 5, -8),
+        enc_r  (CVM_OP_SAR, 6, 5, 3),     /* -4 */
+        enc_r  (CVM_OP_ADD, 7, 4, 6),     /* 32 + -4 = 28 */
+        enc_r  (CVM_OP_HALT, 7, 0, 0),
+    };
+    int32_t v = 0;
+    int r = run_image(code, 9, 0, 0, &v);
+    CHECK(r == CVM_OK, "shifts: %s", cvm_strerror(r));
+    CHECK(v == 28,     "shifts: got %d", v);
+}
+
+static void test_bitwise(void) {
+    /* 0xFF & 0x0F = 0x0F; 0xFF ^ 0x0F = 0xF0; 0x0F | 0xF0 = 0xFF -> 255 */
+    uint32_t code[] = {
+        enc_i16(CVM_OP_MOVI, 0, 0xFF),
+        enc_i16(CVM_OP_MOVI, 1, 0x0F),
+        enc_r  (CVM_OP_AND, 2, 0, 1),     /* 0x0F */
+        enc_r  (CVM_OP_XOR, 3, 0, 1),     /* 0xF0 */
+        enc_r  (CVM_OP_OR,  4, 2, 3),     /* 0xFF */
+        enc_r  (CVM_OP_HALT, 4, 0, 0),
+    };
+    int32_t v = 0;
+    int r = run_image(code, 6, 0, 0, &v);
+    CHECK(r == CVM_OK, "bitwise: %s", cvm_strerror(r));
+    CHECK(v == 0xFF,   "bitwise: got 0x%x", (unsigned)v);
+}
+
 /* --- Syscall tests ------------------------------------------------------- */
 
 struct print_capture {
@@ -514,6 +576,10 @@ int main(void) {
     test_loader_rejects();
     test_cmp_signed();
     test_cmp_unsigned();
+    test_div_signed();
+    test_div_by_zero();
+    test_shifts();
+    test_bitwise();
     test_syscall_hello_int();
     test_syscall_two_args();
     test_syscall_print_string();

@@ -233,6 +233,7 @@ const char *cvm_strerror(int result) {
     case CVM_E_BAD_SYSCALL:      return "syscall id out of range";
     case CVM_E_UNLINKED_SYSCALL: return "syscall has no host handler";
     case CVM_E_SYSCALL_TRAP:     return "syscall handler returned a trap";
+    case CVM_E_DIV_BY_ZERO:      return "division by zero";
     default:                     return "unknown error";
     }
 }
@@ -303,6 +304,16 @@ int cvm_run_args(struct cvm_image *img,
         [CVM_OP_CMP_LE]  = &&L_CMP_LE,
         [CVM_OP_CMP_LTU] = &&L_CMP_LTU,
         [CVM_OP_CMP_LEU] = &&L_CMP_LEU,
+        [CVM_OP_DIV]     = &&L_DIV,
+        [CVM_OP_DIVU]    = &&L_DIVU,
+        [CVM_OP_MOD]     = &&L_MOD,
+        [CVM_OP_MODU]    = &&L_MODU,
+        [CVM_OP_SHL]     = &&L_SHL,
+        [CVM_OP_SHR]     = &&L_SHR,
+        [CVM_OP_SAR]     = &&L_SAR,
+        [CVM_OP_AND]     = &&L_AND,
+        [CVM_OP_OR]      = &&L_OR,
+        [CVM_OP_XOR]     = &&L_XOR,
     };
 
 #  define DISPATCH() do {                                  \
@@ -378,6 +389,34 @@ int cvm_run_args(struct cvm_image *img,
     L_CMP_LE:  R[a] = (R[b] <= R[c]) ? 1 : 0; DISPATCH();
     L_CMP_LTU: R[a] = ((uint32_t)R[b] <  (uint32_t)R[c]) ? 1 : 0; DISPATCH();
     L_CMP_LEU: R[a] = ((uint32_t)R[b] <= (uint32_t)R[c]) ? 1 : 0; DISPATCH();
+    L_DIV: {
+        if (R[c] == 0) return CVM_E_DIV_BY_ZERO;
+        if (R[b] == INT32_MIN && R[c] == -1) R[a] = INT32_MIN;
+        else                                 R[a] = R[b] / R[c];
+        DISPATCH();
+    }
+    L_DIVU: {
+        if (R[c] == 0) return CVM_E_DIV_BY_ZERO;
+        R[a] = (int32_t)((uint32_t)R[b] / (uint32_t)R[c]);
+        DISPATCH();
+    }
+    L_MOD: {
+        if (R[c] == 0) return CVM_E_DIV_BY_ZERO;
+        if (R[b] == INT32_MIN && R[c] == -1) R[a] = 0;
+        else                                 R[a] = R[b] % R[c];
+        DISPATCH();
+    }
+    L_MODU: {
+        if (R[c] == 0) return CVM_E_DIV_BY_ZERO;
+        R[a] = (int32_t)((uint32_t)R[b] % (uint32_t)R[c]);
+        DISPATCH();
+    }
+    L_SHL: R[a] = (int32_t)((uint32_t)R[b] << (R[c] & 31)); DISPATCH();
+    L_SHR: R[a] = (int32_t)((uint32_t)R[b] >> (R[c] & 31)); DISPATCH();
+    L_SAR: R[a] = R[b] >> (R[c] & 31);                      DISPATCH();
+    L_AND: R[a] = R[b] & R[c]; DISPATCH();
+    L_OR:  R[a] = R[b] | R[c]; DISPATCH();
+    L_XOR: R[a] = R[b] ^ R[c]; DISPATCH();
 
 #  undef DISPATCH
 
@@ -443,6 +482,30 @@ int cvm_run_args(struct cvm_image *img,
         case CVM_OP_CMP_LE:  R[a] = (R[b] <= R[c]) ? 1 : 0; break;
         case CVM_OP_CMP_LTU: R[a] = ((uint32_t)R[b] <  (uint32_t)R[c]) ? 1 : 0; break;
         case CVM_OP_CMP_LEU: R[a] = ((uint32_t)R[b] <= (uint32_t)R[c]) ? 1 : 0; break;
+        case CVM_OP_DIV:
+            if (R[c] == 0) return CVM_E_DIV_BY_ZERO;
+            if (R[b] == INT32_MIN && R[c] == -1) R[a] = INT32_MIN;
+            else                                 R[a] = R[b] / R[c];
+            break;
+        case CVM_OP_DIVU:
+            if (R[c] == 0) return CVM_E_DIV_BY_ZERO;
+            R[a] = (int32_t)((uint32_t)R[b] / (uint32_t)R[c]);
+            break;
+        case CVM_OP_MOD:
+            if (R[c] == 0) return CVM_E_DIV_BY_ZERO;
+            if (R[b] == INT32_MIN && R[c] == -1) R[a] = 0;
+            else                                 R[a] = R[b] % R[c];
+            break;
+        case CVM_OP_MODU:
+            if (R[c] == 0) return CVM_E_DIV_BY_ZERO;
+            R[a] = (int32_t)((uint32_t)R[b] % (uint32_t)R[c]);
+            break;
+        case CVM_OP_SHL: R[a] = (int32_t)((uint32_t)R[b] << (R[c] & 31)); break;
+        case CVM_OP_SHR: R[a] = (int32_t)((uint32_t)R[b] >> (R[c] & 31)); break;
+        case CVM_OP_SAR: R[a] = R[b] >> (R[c] & 31); break;
+        case CVM_OP_AND: R[a] = R[b] & R[c]; break;
+        case CVM_OP_OR:  R[a] = R[b] | R[c]; break;
+        case CVM_OP_XOR: R[a] = R[b] ^ R[c]; break;
         default:
             return CVM_E_BAD_OPCODE;
         }
