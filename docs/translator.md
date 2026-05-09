@@ -11,20 +11,17 @@ user.c ──[ clang -emit-llvm ]──▶ user.bc ──[ cvm-translate ]──
 The translator is **not** part of the runtime. The VM binary you ship with
 your game has zero LLVM dependency.
 
-## Status (step 10)
+## Status (step 11)
 
 Codegen now covers **scalar i32 arithmetic, comparisons, branches,
-multi-block control flow, `select`, calls between user functions
-(direct, recursive, indirect, with > 8 args), entry-block allocas
-with escaping pointers, i8/i16 memory ops, arbitrary 32-bit
-constants, a NULL-fn-pointer trap, the
+multi-block control flow, `select`, `switch`, calls between user
+functions (direct, recursive, indirect, with > 8 args),
+entry-block allocas with escaping pointers, i8/i16 memory ops,
+arbitrary 32-bit constants, a NULL-fn-pointer trap, the
 `llvm.memcpy`/`llvm.memset`/`llvm.memmove` block intrinsics,
-liveness-based spill at every call site, and **post-emission
-branch relaxation** — conditional brs with imm8 reach are
-optimistically emitted in their 2-instruction form and rewritten
-to a 3-instruction `BEQ +1; JMP imm24; JMP imm24` trampoline if
-their offset turns out to exceed ±127**. The biggest remaining
-gaps are 64-bit and floating-point types.
+liveness-based spill at every call site, and post-emission
+branch relaxation**. The biggest remaining gaps are 64-bit and
+floating-point types.
 
 `fib_recursive.bin` shrank from 135 to 51 instructions when
 liveness landed (62% fewer); a deeply recursive function with
@@ -113,7 +110,7 @@ the gap is what's still being implemented:
 - arithmetic: `add`, `sub`, `mul`, `sdiv`, `udiv`, `srem`, `urem`,
   `shl`, `lshr`, `ashr`, `and`, `or`, `xor`
 - comparisons: `icmp` (all 10 predicates)
-- control: `br` (both forms), `phi`, `ret`
+- control: `br` (both forms), `switch`, `phi`, `ret`
 - memory: `load` / `store` (i1/i8/i16/i32/ptr — narrow loads use `LDB`/`LDH`
   and zero-extend; narrow stores use `STB`/`STH` and write only the low byte
   or halfword), `getelementptr`
@@ -223,6 +220,34 @@ STW/LDW pairs goes down.
 A defensive fallback in the CALL handler reverts to spilling
 everything if a call instruction has no recorded live set —
 correctness never depends on the analysis being complete.
+
+### Switch lowering
+
+`LLVMSwitch` lowers to a chained linear search: for each case
+`(case_const, case_bb)` in source order, emit
+`CMP_EQ tmp, cond, case_const; BNE tmp, zero, case_bb`. After
+all cases, fall through with `JMP default_bb`. The `tmp` and the
+materialised `case_const` register are transient (allocated above
+`ssa_reg_high`), so they don't need to be spilled across calls.
+
+Phi moves for every successor (default + each case) are emitted
+*before* the dispatch sequence. SSA's one-register-per-value
+guarantee means each successor's phi-result registers are unique
+to that successor, so the up-front moves don't interfere with
+each other and the dispatch sequence (which only touches
+transient temps) doesn't disturb them.
+
+LLVM's C API doesn't expose case constants through the generic
+operand list — only successor blocks are there. The case values
+are read via `LLVMGetSwitchCaseValue(switch_inst, k)` where `k`
+is the successor index (matching `LLVMGetSuccessor`'s indexing,
+with 0 = default and 1..N = cases).
+
+A dense jump-table form (one `LDW` from a precomputed table +
+indirect jump) would be faster for switches with many contiguous
+cases but needs a new opcode (`JMPR`). The chained form here is
+opcode-neutral and benefits transparently from branch relaxation
+when a case block sits more than ±127 instructions away.
 
 ### Branch relaxation
 

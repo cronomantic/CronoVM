@@ -1671,6 +1671,72 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 break;
             }
 
+            case LLVMSwitch: {
+                /* Lowered as a chained linear search: for each case k,
+                 * emit `CMP_EQ tmp, cond, case_const_k; BNE tmp, zero,
+                 * case_bb_k`. After all cases, fall through to a `JMP
+                 * default_bb`.
+                 *
+                 * Phi moves for every successor (default + each case) are
+                 * emitted up front, before any case test. Each successor's
+                 * phi-result registers are unique to that successor (SSA
+                 * gives every value its own pre-allocated register), so
+                 * the moves don't interfere with each other and the
+                 * dispatch sequence (which only touches transient temps
+                 * above ssa_reg_high) doesn't disturb the phi values. A
+                 * dense jump-table form would be faster for switches with
+                 * many contiguous cases but needs a new opcode (`JMPR`);
+                 * the chained form here is opcode-neutral. */
+                /* LLVMGetCondition is only valid for LLVMBranchInst; on a
+                 * switch it returns NULL. The condition is at operand 0
+                 * (the same slot as Branch's condition, but accessed via
+                 * the generic operand interface). */
+                LLVMValueRef       cond_v     = LLVMGetOperand(i, 0);
+                LLVMBasicBlockRef  default_bb = LLVMGetSwitchDefaultDest(i);
+                uint8_t            cond_reg   = cg_reg_for(cg, cond_v);
+                if (cg->had_error) break;
+
+                unsigned n_succ = LLVMGetNumSuccessors(i);
+                /* n_succ counts the default plus each case block; LLVM
+                 * guarantees ≥ 1 (the default). Switches with zero cases
+                 * are degenerate but legal — they reduce to a JMP. */
+                cg_emit_phi_moves(cg, cg->cur_block, default_bb);
+                for (unsigned k = 1; k < n_succ; ++k) {
+                    LLVMBasicBlockRef case_bb = LLVMGetSuccessor(i, k);
+                    cg_emit_phi_moves(cg, cg->cur_block, case_bb);
+                }
+                if (cg->had_error) break;
+
+                for (unsigned k = 1; k < n_succ; ++k) {
+                    /* LLVM's C API doesn't expose case constants through
+                     * the generic operand list; only successor blocks are
+                     * there. `LLVMGetSwitchCaseValue(switch, i)` is the
+                     * dedicated accessor — `i` is the successor index,
+                     * with 0 = default and 1..N = cases (matching
+                     * LLVMGetSuccessor's indexing). */
+                    LLVMValueRef      case_val = LLVMGetSwitchCaseValue(i, k);
+                    LLVMBasicBlockRef case_bb  = LLVMGetSuccessor(i, k);
+                    if (!case_val || !LLVMIsAConstantInt(case_val)) {
+                        ERR(cg->fn_name,
+                            "switch case operand is not a constant integer");
+                        cg->had_error = 1;
+                        break;
+                    }
+                    uint8_t case_reg = cg_reg_for(cg, case_val);
+                    if (cg->had_error) break;
+                    uint8_t tmp = cg_alloc_reg(cg);
+                    if (cg->had_error) break;
+                    cg_emit(cg, enc_r(CVM_OP_CMP_EQ, tmp, cond_reg, case_reg));
+                    cg_queue_fixup(cg, cg->count, case_bb, 24, 8);
+                    cg_emit(cg, enc_br(CVM_OP_BNE, tmp, cg->zero_reg, 0));
+                }
+                if (cg->had_error) break;
+
+                cg_queue_fixup(cg, cg->count, default_bb, 8, 24);
+                cg_emit(cg, enc_i24(CVM_OP_JMP, 0));
+                break;
+            }
+
             case LLVMRet: {
                 if (LLVMGetNumOperands(i) > 0) {
                     uint8_t r = cg_reg_for(cg, LLVMGetOperand(i, 0));

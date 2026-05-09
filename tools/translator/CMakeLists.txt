@@ -46,7 +46,7 @@ set(_fixture_targets "")
 foreach(name add pick fib abs max divmod bitops counter sum_global
              alloc_sum two_funcs fib_recursive many_args alloca_swap
              fnptr dispatch_table narrow_ops mem_intrin long_branch
-             reject_double)
+             switch_dispatch reject_double)
     set(_src ${_fixture_dir}/${name}.c)
     set(_bc  ${_fixture_out}/${name}.bc)
     add_custom_command(
@@ -65,7 +65,8 @@ add_custom_target(translator_fixtures DEPENDS ${_fixture_targets})
 set(_emit_targets "")
 foreach(name add pick fib abs max divmod bitops counter sum_global
              two_funcs fib_recursive many_args alloca_swap fnptr
-             dispatch_table narrow_ops mem_intrin long_branch)
+             dispatch_table narrow_ops mem_intrin long_branch
+             switch_dispatch)
     set(_bc  ${_fixture_out}/${name}.bc)
     set(_bin ${_fixture_out}/${name}.bin)
     add_custom_command(
@@ -149,6 +150,17 @@ add_test(NAME e2e_mem_intrin       COMMAND test_e2e ${_fixture_out}/mem_intrin.b
 # final volatile-arithmetic accumulator).
 add_test(NAME e2e_long_branch_zero COMMAND test_e2e ${_fixture_out}/long_branch.bin     999 0)
 add_test(NAME e2e_long_branch_path COMMAND test_e2e ${_fixture_out}/long_branch.bin 1045158 7)
+# switch_dispatch: every case + default + an in-range gap value. Each
+# arm computes a different binary op on (x, y); we pass distinct values
+# so the test result identifies which arm ran.
+#                                                                expected op  x  y
+add_test(NAME e2e_switch_case_0    COMMAND test_e2e ${_fixture_out}/switch_dispatch.bin  10  0  7  3)  # x+y
+add_test(NAME e2e_switch_case_1    COMMAND test_e2e ${_fixture_out}/switch_dispatch.bin   4  1  7  3)  # x-y
+add_test(NAME e2e_switch_case_2    COMMAND test_e2e ${_fixture_out}/switch_dispatch.bin  21  2  7  3)  # x*y
+add_test(NAME e2e_switch_case_5    COMMAND test_e2e ${_fixture_out}/switch_dispatch.bin   4  5  7  3)  # x^y
+add_test(NAME e2e_switch_case_10   COMMAND test_e2e ${_fixture_out}/switch_dispatch.bin   3 10  7  3)  # x&y
+add_test(NAME e2e_switch_default   COMMAND test_e2e ${_fixture_out}/switch_dispatch.bin  -1 99  7  3)  # default
+add_test(NAME e2e_switch_gap       COMMAND test_e2e ${_fixture_out}/switch_dispatch.bin  -1  3  7  3)  # gap → default
 set_tests_properties(
     e2e_add e2e_pick_true e2e_pick_false e2e_fib_10 e2e_fib_0
     e2e_abs_neg e2e_abs_pos e2e_max_lhs e2e_max_rhs
@@ -158,4 +170,7 @@ set_tests_properties(
     e2e_dispatch_add e2e_dispatch_sub e2e_dispatch_mul
     e2e_narrow_ops e2e_mem_intrin
     e2e_long_branch_zero e2e_long_branch_path
+    e2e_switch_case_0 e2e_switch_case_1 e2e_switch_case_2
+    e2e_switch_case_5 e2e_switch_case_10
+    e2e_switch_default e2e_switch_gap
     PROPERTIES FIXTURES_REQUIRED emitted_bins)
