@@ -881,6 +881,135 @@ static void cg_queue_fixup(struct cg *cg, uint32_t inst_index,
     cg->fixup_count++;
 }
 
+/* Branch relaxation: convert any conditional branch (`BNE`/`BEQ` with imm8)
+ * whose target is too far for the 8-bit immediate into a 3-instruction
+ * trampoline that uses imm24 reach. The pattern is:
+ *
+ *     original:        BNE cond, zero, +K            ; imm8 to true_bb
+ *                      JMP +M                        ; imm24 to false_bb
+ *
+ *     relaxed:         BEQ cond, zero, +1            ; skip next if false
+ *                      JMP K'                        ; imm24 to true_bb
+ *                      JMP M'                        ; imm24 to false_bb
+ *
+ * The opcode flips (BNE→BEQ or BEQ→BNE), the imm8 is a hard-coded +1, and
+ * the original imm8 fixup migrates to the inserted JMP with bits=24.
+ *
+ * The pass runs to a fixed point because inserting a trampoline shifts
+ * subsequent code by one instruction, which can push another in-range
+ * branch out of range. Each iteration relaxes at least one fixup, so the
+ * loop is bounded by the fixup count. The interpreter ABI is unchanged —
+ * relaxation only re-shapes the emitted bytecode using existing opcodes. */
+static int cg_relax_branches(struct cg *cg) {
+    if (cg->fixup_count == 0) return 0;
+
+    int *relaxed = (int *)calloc((size_t)cg->fixup_count, sizeof(int));
+    if (!relaxed) { perror("calloc"); return 1; }
+
+    for (int it = 0; it <= cg->fixup_count; ++it) {
+        int changed = 0;
+        for (int i = 0; i < cg->fixup_count; ++i) {
+            if (cg->fixups[i].bits != 8 || relaxed[i]) continue;
+
+            int target_b = cg_find_block(cg, cg->fixups[i].target);
+            if (target_b < 0) {
+                ERR(cg->fn_name, "internal: fixup target block not found");
+                free(relaxed);
+                return 1;
+            }
+            uint32_t orig_target    = cg->block_offsets[target_b];
+            uint32_t orig_pc_after  = cg->fixups[i].inst_index + 1u;
+
+            /* Effective offsets after already-decided relaxations: each
+             * relaxed fixup inserts +1 instruction strictly after its own
+             * inst_index, so positions ≥ inst_index+1 shift by +1. */
+            int target_displ = 0, pc_displ = 0;
+            for (int j = 0; j < cg->fixup_count; ++j) {
+                if (!relaxed[j]) continue;
+                if (cg->fixups[j].inst_index < orig_target)   target_displ++;
+                if (cg->fixups[j].inst_index < orig_pc_after) pc_displ++;
+            }
+            int32_t rel = (int32_t)(orig_target + (uint32_t)target_displ)
+                        - (int32_t)(orig_pc_after + (uint32_t)pc_displ);
+            if (rel < -128 || rel > 127) {
+                relaxed[i] = 1;
+                changed = 1;
+            }
+        }
+        if (!changed) break;
+    }
+
+    int relax_count = 0;
+    for (int i = 0; i < cg->fixup_count; ++i)
+        if (relaxed[i]) relax_count++;
+    if (relax_count == 0) { free(relaxed); return 0; }
+
+    /* Build the new code array. Each relaxed fixup contributes one extra
+     * placeholder JMP right after its BEQ/BNE position. new_pos_of[op]
+     * gives the new index for each old instruction. */
+    uint32_t  old_size = cg->count;
+    uint32_t  new_size = old_size + (uint32_t)relax_count;
+    uint32_t *new_code   = (uint32_t *)malloc((size_t)new_size * sizeof(uint32_t));
+    uint32_t *new_pos_of = (uint32_t *)malloc((size_t)old_size * sizeof(uint32_t));
+    if (!new_code || !new_pos_of) {
+        perror("malloc"); free(new_code); free(new_pos_of); free(relaxed);
+        return 1;
+    }
+
+    uint32_t np = 0;
+    for (uint32_t op = 0; op < old_size; ++op) {
+        new_pos_of[op] = np;
+        new_code[np++] = cg->code[op];
+        for (int f = 0; f < cg->fixup_count; ++f) {
+            if (relaxed[f] && cg->fixups[f].inst_index == op)
+                new_code[np++] = enc_i24(CVM_OP_JMP, 0);
+        }
+    }
+
+    /* Rewrite each relaxed BEQ/BNE: flip the opcode and set imm8 = +1.
+     * Translator-emitted conditional brs only ever use BNE today (the
+     * LLVMBr handler), but the BEQ branch is included for symmetry in
+     * case future codegen paths emit a BEQ that needs relaxing. */
+    for (int f = 0; f < cg->fixup_count; ++f) {
+        if (!relaxed[f]) continue;
+        uint32_t pos    = new_pos_of[cg->fixups[f].inst_index];
+        uint32_t orig   = new_code[pos];
+        uint8_t  op     = (uint8_t)(orig & 0xFFu);
+        uint8_t  rs1    = (uint8_t)((orig >> 8)  & 0xFFu);
+        uint8_t  rs2    = (uint8_t)((orig >> 16) & 0xFFu);
+        uint8_t  new_op = (op == CVM_OP_BNE) ? CVM_OP_BEQ
+                       : (op == CVM_OP_BEQ) ? CVM_OP_BNE
+                       : op;
+        new_code[pos] = enc_br(new_op, rs1, rs2, 1);
+    }
+
+    /* Update fixup positions and (for relaxed ones) bit-field metadata. */
+    for (int f = 0; f < cg->fixup_count; ++f) {
+        uint32_t old_pos = cg->fixups[f].inst_index;
+        if (relaxed[f]) {
+            cg->fixups[f].inst_index = new_pos_of[old_pos] + 1u;
+            cg->fixups[f].shift      = 8;
+            cg->fixups[f].bits       = 24;
+        } else {
+            cg->fixups[f].inst_index = new_pos_of[old_pos];
+        }
+    }
+
+    /* Update block_offsets to their new positions. Empty blocks (offset
+     * past the end) keep that property — clamp to new_size. */
+    for (int b = 0; b < cg->block_count; ++b) {
+        uint32_t orig = cg->block_offsets[b];
+        cg->block_offsets[b] = orig < old_size ? new_pos_of[orig] : new_size;
+    }
+
+    free(cg->code);
+    cg->code  = new_code;
+    cg->count = new_size;
+    free(new_pos_of);
+    free(relaxed);
+    return 0;
+}
+
 static int cg_resolve_fixups(struct cg *cg) {
     for (int i = 0; i < cg->fixup_count; ++i) {
         struct cg_fixup *fx = &cg->fixups[i];
@@ -895,9 +1024,13 @@ static int cg_resolve_fixups(struct cg *cg) {
         int32_t maxv       = (int32_t)(((uint32_t)1 << (fx->bits - 1)) - 1u);
         int32_t minv       = -maxv - 1;
         if (rel < minv || rel > maxv) {
+            /* Defensive: cg_relax_branches should have lifted any
+             * out-of-range imm8 fixup to imm24 before we get here. If
+             * this fires, either relaxation didn't run or a new fixup
+             * shape was introduced without relaxation support. */
             ERR(cg->fn_name,
-                "branch offset %d out of range [%d..%d] for %d-bit field "
-                "(trampolining not yet implemented)",
+                "internal: branch offset %d out of range [%d..%d] for "
+                "%d-bit field after relaxation pass",
                 rel, minv, maxv, fx->bits);
             return 1;
         }
@@ -2095,6 +2228,12 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
         }
     }
 
+    /* Branch relaxation precedes fixup resolution: any imm8 fixup that
+     * doesn't reach its target gets rewritten to a `BEQ +1; JMP imm24`
+     * trampoline (3 instructions instead of 2). After this pass, every
+     * remaining fixup is guaranteed to fit. */
+    if (!cg->had_error && cg_relax_branches(cg) != 0)
+        cg->had_error = 1;
     if (!cg->had_error && cg_resolve_fixups(cg) != 0)
         cg->had_error = 1;
     return cg->had_error ? 1 : 0;

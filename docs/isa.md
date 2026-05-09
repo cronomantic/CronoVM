@@ -181,6 +181,23 @@ adding new opcodes.
 - 64-bit and float opcodes — landing alongside the LLVM IR types they map to.
 - Indexed memory ops with displacement — the encoding has 8 bits left over;
   future revision may carve out room.
-- Long branches — current ±127 reach for `BEQ`/`BNE` (signed `imm8`) is
-  enough for current fixtures. When it isn't, the codegen will need to
-  trampoline through `JMP` (which has 24-bit reach).
+
+## Branch reach and relaxation
+
+`BEQ`/`BNE` carry a signed 8-bit immediate (±127 instructions). When the
+translator's codegen produces a conditional branch whose target sits
+outside that range, a post-emission **relaxation pass** rewrites the
+branch into a 3-instruction trampoline that uses `JMP`'s 24-bit reach
+(±8M instructions):
+
+```text
+relaxed:    BEQ cond, zero, +1     ; skip the next inst if condition false
+            JMP true_target        ; imm24 (long forward/backward reach)
+            JMP false_target       ; imm24 (unchanged from short form)
+```
+
+The opcode flips (`BNE` ↔ `BEQ`) and the imm8 is hard-coded to `+1`. No
+new opcodes are introduced — relaxation only re-shapes emitted bytecode
+using `BEQ`/`BNE` and `JMP`. The fast path (single `BEQ`/`BNE imm8` for
+short branches) is preserved when the offset fits. See
+[translator.md](translator.md) for the relaxation algorithm.

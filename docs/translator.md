@@ -11,22 +11,29 @@ user.c ──[ clang -emit-llvm ]──▶ user.bc ──[ cvm-translate ]──
 The translator is **not** part of the runtime. The VM binary you ship with
 your game has zero LLVM dependency.
 
-## Status (step 9)
+## Status (step 10)
 
 Codegen now covers **scalar i32 arithmetic, comparisons, branches,
 multi-block control flow, `select`, calls between user functions
 (direct, recursive, indirect, with > 8 args), entry-block allocas
 with escaping pointers, i8/i16 memory ops, arbitrary 32-bit
 constants, a NULL-fn-pointer trap, the
-`llvm.memcpy`/`llvm.memset`/`llvm.memmove` block intrinsics, and
-liveness-based spill at every call site (only SSA values still
-live after the call get a STW/LDW round-trip)**. The biggest
-remaining gaps are 64-bit and floating-point types.
+`llvm.memcpy`/`llvm.memset`/`llvm.memmove` block intrinsics,
+liveness-based spill at every call site, and **post-emission
+branch relaxation** — conditional brs with imm8 reach are
+optimistically emitted in their 2-instruction form and rewritten
+to a 3-instruction `BEQ +1; JMP imm24; JMP imm24` trampoline if
+their offset turns out to exceed ±127**. The biggest remaining
+gaps are 64-bit and floating-point types.
 
 `fib_recursive.bin` shrank from 135 to 51 instructions when
 liveness landed (62% fewer); a deeply recursive function with
 several SSA temps in flight is exactly the case the prior
 spill-everything was worst at.
+
+Branch relaxation only kicks in when needed (no overhead on
+fixtures whose branches all fit in imm8); the new
+`long_branch.c` fixture exercises it explicitly.
 
 ```text
 $ cvm-translate build/fib_recursive.bc -o build/fib_recursive.bin
@@ -216,6 +223,48 @@ STW/LDW pairs goes down.
 A defensive fallback in the CALL handler reverts to spilling
 everything if a call instruction has no recorded live set —
 correctness never depends on the analysis being complete.
+
+### Branch relaxation
+
+`cg_relax_branches` runs once per function between block emission
+and `cg_resolve_fixups`. The codegen always emits conditional brs
+in their compact 2-instruction form first (`BNE cond, zero, +K`
+to true_bb, plus `JMP +M` to false_bb). Relaxation then walks the
+fixup list and, for each imm8 fixup whose offset falls outside
+[-128, 127], schedules a rewrite to the 3-instruction
+trampoline:
+
+```text
+[BEQ cond, zero, +1]     ; skip the next inst if condition is false
+[JMP true_bb_imm24]      ; reached when condition is true
+[JMP false_bb_imm24]     ; reached when condition is false (via the +1 skip)
+```
+
+The pass iterates to a fixed point because inserting one
+trampoline shifts all later code by +1 instruction, which can
+push another previously-in-range branch over the edge. Each
+iteration relaxes at least one fixup or terminates, so the loop
+is bounded by the fixup count (typically 1–2 iterations in
+practice). After convergence, the pass:
+
+1. Builds a new `code` array with one extra placeholder `JMP 0`
+   inserted after each relaxed BEQ/BNE.
+2. Rewrites the BEQ/BNE in place: opcode flips
+   (BNE ↔ BEQ) and imm8 is hard-coded to `+1`.
+3. Updates the fixup table: each relaxed fixup migrates to the
+   inserted JMP's position with `bits = 24`.
+4. Updates `block_offsets[]` for all blocks.
+
+`cg_resolve_fixups` then OR-patches every fixup as before. The
+"out of range" branch error in `cg_resolve_fixups` is now
+defensive — it should never fire after relaxation.
+
+The fast path (single `BEQ`/`BNE imm8` for short branches) is
+preserved verbatim: relaxation only rewrites branches that
+actually need it. The included `tests/fixtures/long_branch.c`
+fixture is a 168-instruction function whose entry block branches
+forward over a long volatile-arithmetic body to an
+`end_short:` block, exercising relaxation explicitly.
 
 ### Syscall lowering
 
