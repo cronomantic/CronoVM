@@ -38,14 +38,18 @@ predecessor's terminator. When the moves on a single edge form a cycle
 conflict and round-trips through fresh temporary registers — wasteful but
 always correct. A future pass can break cycles in-place without temps.
 
-## Required input: -O1 (or higher)
+## Required clang flags
 
-Until alloca lowering lands, **bitcode for codegen must be compiled with
-`-O1` or higher** so Clang's `mem2reg` pass has run and the IR is in clean
-SSA form. With `-O0`, parameters live in `alloca` stack slots and
-`load`/`store` shuffles them around — codegen will reject this.
+Bitcode for codegen must be compiled with **`--target=i386-elf` and `-O1`**
+(or higher). Together they ensure:
 
-Validation alone (no `-o`) accepts any optimisation level.
+- 32-bit pointers and 32-bit GEP indices, so the IR stays in `i32`-only
+  territory (the default x86-64 target promotes loop counters to `i64`
+  whenever pointer arithmetic is involved).
+- `mem2reg` has run, so parameters live in registers rather than `alloca`
+  stack slots.
+
+Validation alone (no `-o`) accepts any optimisation level and any target.
 
 ## Supported IR subset (v1.0)
 
@@ -90,13 +94,30 @@ the gap is what's still being implemented:
   `shl`, `lshr`, `ashr`, `and`, `or`, `xor`
 - comparisons: `icmp` (all 10 predicates)
 - control: `br` (both forms), `phi`, `ret`
+- memory: `load` (i32 only), `store` (i32 only), `getelementptr`
+- aggregate values via globals: arrays, structs, scalars
 - value selection: `select`
 - intrinsic calls: `llvm.abs.i32`, `llvm.smax.i32`, `llvm.smin.i32`,
   `llvm.umax.i32`, `llvm.umin.i32`
 
 User-defined function calls and the rest of the LLVM intrinsics
 (`llvm.memcpy`, `llvm.memset`, `llvm.ctlz`, …) still error out — they
-need calling-convention work or per-intrinsic lowerings.
+need calling-convention work or per-intrinsic lowerings. Likewise
+`alloca`, i8/i16 loads/stores, and `extern` globals are pending.
+
+### Globals layout
+
+The translator walks every module global, lays them out one after
+another with their natural alignment, serialises initialisers into a
+single `DATA` section, and emits offsets that user code resolves via
+`MOVI`. Zero-initialised globals get bytes of zero in `DATA` — a `BSS`
+section is supported by the loader but not yet emitted by the
+translator (cheap in binary size for now, swap-in is straightforward
+when something pushes the size up).
+
+The `DATA` section is currently capped at 32 KB because every global
+address is materialised through `MOVI imm16`. When that limit binds, a
+wide-constant lowering (or a constant pool) will lift it.
 
 ### Instructions rejected
 

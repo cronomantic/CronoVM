@@ -10,6 +10,7 @@
 
 #include <llvm-c/BitReader.h>
 #include <llvm-c/Core.h>
+#include <llvm-c/Target.h>
 #include <llvm-c/Types.h>
 
 #include <errno.h>
@@ -309,6 +310,152 @@ static void print_function_summary(LLVMValueRef fn) {
            ins, ins == 1 ? "" : "s");
 }
 
+/* --- globals ------------------------------------------------------------- */
+
+struct cg_global {
+    LLVMValueRef value;
+    uint32_t     offset;     /* heap offset assigned at layout time */
+    uint32_t     size;       /* bytes occupied on the heap */
+};
+
+struct cg_globals {
+    LLVMTargetDataRef td;
+    struct cg_global *items;
+    int               count;
+    int               cap;
+    uint8_t          *data_bytes;
+    uint32_t          data_size;
+    uint32_t          data_cap;
+};
+
+static int cg_globals_lookup(const struct cg_globals *g, LLVMValueRef v) {
+    for (int i = 0; i < g->count; ++i)
+        if (g->items[i].value == v) return i;
+    return -1;
+}
+
+static int cg_globals_append(struct cg_globals *g, LLVMValueRef v,
+                             uint32_t offset, uint32_t size)
+{
+    if (g->count == g->cap) {
+        g->cap = g->cap ? g->cap * 2 : 8;
+        g->items = (struct cg_global *)realloc(g->items,
+                            g->cap * sizeof(*g->items));
+        if (!g->items) { perror("realloc"); return 1; }
+    }
+    g->items[g->count].value  = v;
+    g->items[g->count].offset = offset;
+    g->items[g->count].size   = size;
+    g->count++;
+    return 0;
+}
+
+static void cg_data_reserve(struct cg_globals *g, uint32_t need) {
+    if (g->data_cap >= need) return;
+    uint32_t cap = g->data_cap ? g->data_cap : 64;
+    while (cap < need) cap *= 2;
+    g->data_bytes = (uint8_t *)realloc(g->data_bytes, cap);
+    if (!g->data_bytes) { perror("realloc"); exit(1); }
+    memset(g->data_bytes + g->data_cap, 0, cap - g->data_cap);
+    g->data_cap = cap;
+}
+
+static int serialize_constant(LLVMValueRef c, LLVMTargetDataRef td,
+                              uint8_t *out, uint32_t off, uint32_t cap)
+{
+    LLVMTypeRef ty = LLVMTypeOf(c);
+    uint32_t sz = (uint32_t)LLVMABISizeOfType(td, ty);
+    if (off + sz > cap) return 1;
+
+    if (LLVMIsAConstantAggregateZero(c)) {
+        /* out is calloc/zeroed already; nothing to write. */
+        return 0;
+    }
+    if (LLVMIsAConstantInt(c)) {
+        unsigned long long v = LLVMConstIntGetZExtValue(c);
+        for (uint32_t b = 0; b < sz && b < 8; ++b)
+            out[off + b] = (uint8_t)(v >> (b * 8));
+        return 0;
+    }
+    if (LLVMGetTypeKind(ty) == LLVMArrayTypeKind) {
+        LLVMTypeRef elem = LLVMGetElementType(ty);
+        uint32_t   esz   = (uint32_t)LLVMABISizeOfType(td, elem);
+        unsigned   n     = LLVMGetArrayLength(ty);
+        for (unsigned i = 0; i < n; ++i) {
+            LLVMValueRef e = LLVMGetAggregateElement(c, i);
+            if (!e) return 1;
+            if (serialize_constant(e, td, out, off + i * esz, cap) != 0)
+                return 1;
+        }
+        return 0;
+    }
+    if (LLVMGetTypeKind(ty) == LLVMStructTypeKind) {
+        unsigned n = LLVMCountStructElementTypes(ty);
+        for (unsigned i = 0; i < n; ++i) {
+            LLVMValueRef e = LLVMGetAggregateElement(c, i);
+            if (!e) return 1;
+            uint32_t fo = (uint32_t)LLVMOffsetOfElement(td, ty, i);
+            if (serialize_constant(e, td, out, off + fo, cap) != 0)
+                return 1;
+        }
+        return 0;
+    }
+    return 1;
+}
+
+static int cg_collect_globals(struct cg_globals *g, LLVMModuleRef mod) {
+    char err[256];
+    uint32_t cursor = 0;
+    for (LLVMValueRef gv = LLVMGetFirstGlobal(mod);
+         gv; gv = LLVMGetNextGlobal(gv))
+    {
+        if (!LLVMGlobalGetValueType(gv)) continue;
+        if (LLVMIsDeclaration(gv)) {
+            ERR(NULL, "external global '%s' has no initializer (extern not supported)",
+                value_name(gv));
+            return 1;
+        }
+
+        LLVMTypeRef ty = LLVMGlobalGetValueType(gv);
+        if (!type_in_subset(ty, err, sizeof(err))) {
+            ERR(NULL, "global '%s' rejected: %s", value_name(gv), err);
+            return 1;
+        }
+
+        uint32_t size  = (uint32_t)LLVMABISizeOfType(g->td, ty);
+        uint32_t align = (uint32_t)LLVMABIAlignmentOfType(g->td, ty);
+        if (align == 0) align = 1;
+        cursor = (cursor + align - 1) & ~(align - 1);
+
+        if (cursor > INT16_MAX) {
+            ERR(NULL, "global '%s' offset %u exceeds 16-bit MOVI range "
+                      "(wide-constant lowering pending)",
+                value_name(gv), cursor);
+            return 1;
+        }
+
+        cg_data_reserve(g, cursor + size);
+        LLVMValueRef init = LLVMGetInitializer(gv);
+        if (init && serialize_constant(init, g->td,
+                                       g->data_bytes, cursor, g->data_cap) != 0) {
+            ERR(NULL, "global '%s': unsupported initializer shape",
+                value_name(gv));
+            return 1;
+        }
+        if (cg_globals_append(g, gv, cursor, size) != 0) return 1;
+        cursor += size;
+        if (cursor > g->data_size) g->data_size = cursor;
+    }
+    return 0;
+}
+
+static void cg_globals_dispose(struct cg_globals *g) {
+    free(g->items);
+    free(g->data_bytes);
+    if (g->td) LLVMDisposeTargetData(g->td);
+    memset(g, 0, sizeof(*g));
+}
+
 /* --- codegen ------------------------------------------------------------- */
 
 struct cg_fixup {
@@ -343,6 +490,8 @@ struct cg {
 
     uint8_t           zero_reg;       /* register holding 0, for branch tests */
     LLVMBasicBlockRef cur_block;      /* updated during emit walk */
+
+    struct cg_globals *globals;       /* module-wide; not owned */
 
     int           had_error;
     const char   *fn_name;
@@ -428,6 +577,19 @@ static uint8_t cg_reg_for(struct cg *cg, LLVMValueRef v) {
         }
         uint8_t r = cg_alloc_reg(cg);
         cg_emit(cg, enc_i16(CVM_OP_MOVI, r, (int16_t)imm));
+        return r;
+    }
+
+    if (cg->globals && LLVMIsAGlobalVariable(v)) {
+        int idx = cg_globals_lookup(cg->globals, v);
+        if (idx < 0) {
+            ERR(cg->fn_name, "global '%s' not in layout", value_name(v));
+            cg->had_error = 1;
+            return 0;
+        }
+        uint8_t r = cg_alloc_reg(cg);
+        cg_emit(cg, enc_i16(CVM_OP_MOVI, r,
+                            (int16_t)cg->globals->items[idx].offset));
         return r;
     }
 
@@ -732,6 +894,160 @@ static int cg_function(struct cg *cg, LLVMValueRef fn) {
                 break;
             }
 
+            case LLVMLoad: {
+                /* Only i32 loads supported for now. */
+                LLVMTypeRef lty = LLVMTypeOf(i);
+                if (LLVMGetTypeKind(lty) != LLVMIntegerTypeKind ||
+                    LLVMGetIntTypeWidth(lty) != 32 ||
+                    LLVMGetTypeKind(LLVMTypeOf(LLVMGetOperand(i, 0)))
+                        != LLVMPointerTypeKind)
+                {
+                    ERR(cg->fn_name,
+                        "load: only i32 through ptr is implemented yet");
+                    cg->had_error = 1;
+                    break;
+                }
+                uint8_t addr = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                uint8_t dst  = cg->regs[cg_lookup(cg, i)];
+                cg_emit(cg, enc_r(CVM_OP_LDW, dst, addr, 0));
+                break;
+            }
+
+            case LLVMStore: {
+                /* Operand 0 = value, operand 1 = pointer. Only i32 supported. */
+                LLVMValueRef val_v = LLVMGetOperand(i, 0);
+                LLVMTypeRef  vty   = LLVMTypeOf(val_v);
+                if (LLVMGetTypeKind(vty) != LLVMIntegerTypeKind ||
+                    LLVMGetIntTypeWidth(vty) != 32)
+                {
+                    ERR(cg->fn_name,
+                        "store: only i32 values are implemented yet");
+                    cg->had_error = 1;
+                    break;
+                }
+                uint8_t val  = cg_reg_for(cg, val_v);
+                uint8_t addr = cg_reg_for(cg, LLVMGetOperand(i, 1));
+                cg_emit(cg, enc_r(CVM_OP_STW, 0, addr, val));
+                break;
+            }
+
+            case LLVMGetElementPtr: {
+                /* Lower as: dst = base + sum(index * element-stride).
+                 *   - First index strides over the source element type.
+                 *   - Subsequent indices descend into arrays / structs. */
+                LLVMValueRef base_v = LLVMGetOperand(i, 0);
+                uint8_t base = cg_reg_for(cg, base_v);
+                uint8_t dst  = cg->regs[cg_lookup(cg, i)];
+
+                LLVMTypeRef cur_ty = LLVMGetGEPSourceElementType(i);
+                if (!cur_ty) {
+                    ERR(cg->fn_name, "GEP source element type missing");
+                    cg->had_error = 1;
+                    break;
+                }
+
+                /* Accumulator: constant offset folded at compile time;
+                 * dynamic offset accumulated in a register if any. */
+                long long  const_off = 0;
+                int        have_dyn  = 0;
+                uint8_t    dyn_reg   = 0;
+                unsigned   nidx      = LLVMGetNumIndices(i);
+
+                for (unsigned k = 0; k < nidx; ++k) {
+                    LLVMValueRef idx_v = LLVMGetOperand(i, k + 1);
+
+                    /* Determine stride and the type to descend into. */
+                    uint32_t stride;
+                    LLVMTypeRef next_ty;
+                    if (k == 0) {
+                        stride  = (uint32_t)LLVMABISizeOfType(cg->globals->td,
+                                                              cur_ty);
+                        next_ty = cur_ty;
+                    } else if (LLVMGetTypeKind(cur_ty) == LLVMArrayTypeKind) {
+                        LLVMTypeRef et = LLVMGetElementType(cur_ty);
+                        stride  = (uint32_t)LLVMABISizeOfType(cg->globals->td, et);
+                        next_ty = et;
+                    } else if (LLVMGetTypeKind(cur_ty) == LLVMStructTypeKind) {
+                        if (!LLVMIsAConstantInt(idx_v)) {
+                            ERR(cg->fn_name,
+                                "GEP into struct requires constant index");
+                            cg->had_error = 1;
+                            break;
+                        }
+                        unsigned fi = (unsigned)LLVMConstIntGetZExtValue(idx_v);
+                        const_off += (long long)
+                            LLVMOffsetOfElement(cg->globals->td, cur_ty, fi);
+                        next_ty = LLVMStructGetTypeAtIndex(cur_ty, fi);
+                        cur_ty  = next_ty;
+                        continue;
+                    } else {
+                        ERR(cg->fn_name,
+                            "GEP descended into unsupported aggregate kind");
+                        cg->had_error = 1;
+                        break;
+                    }
+
+                    if (LLVMIsAConstantInt(idx_v)) {
+                        long long ci = LLVMConstIntGetSExtValue(idx_v);
+                        const_off += ci * (long long)stride;
+                    } else {
+                        /* Dynamic: emit  step = idx * stride; dyn += step. */
+                        uint8_t idx_r   = cg_reg_for(cg, idx_v);
+                        uint8_t stride_r = cg_alloc_reg(cg);
+                        if (cg->had_error) break;
+                        if (stride > INT16_MAX) {
+                            ERR(cg->fn_name,
+                                "GEP element stride %u doesn't fit in imm16",
+                                stride);
+                            cg->had_error = 1;
+                            break;
+                        }
+                        cg_emit(cg, enc_i16(CVM_OP_MOVI, stride_r,
+                                            (int16_t)stride));
+                        uint8_t step_r = cg_alloc_reg(cg);
+                        if (cg->had_error) break;
+                        cg_emit(cg, enc_r(CVM_OP_MUL, step_r, idx_r, stride_r));
+                        if (!have_dyn) {
+                            dyn_reg = step_r;
+                            have_dyn = 1;
+                        } else {
+                            uint8_t sum_r = cg_alloc_reg(cg);
+                            if (cg->had_error) break;
+                            cg_emit(cg, enc_r(CVM_OP_ADD, sum_r, dyn_reg, step_r));
+                            dyn_reg = sum_r;
+                        }
+                    }
+                    cur_ty = next_ty;
+                }
+                if (cg->had_error) break;
+
+                /* Combine: dst = base + const_off + dyn_reg. */
+                uint8_t cur = base;
+                if (const_off != 0) {
+                    if (const_off < INT16_MIN || const_off > INT16_MAX) {
+                        ERR(cg->fn_name,
+                            "GEP constant offset %lld doesn't fit in imm16",
+                            const_off);
+                        cg->had_error = 1;
+                        break;
+                    }
+                    uint8_t off_r = cg_alloc_reg(cg);
+                    if (cg->had_error) break;
+                    cg_emit(cg, enc_i16(CVM_OP_MOVI, off_r,
+                                        (int16_t)const_off));
+                    uint8_t sum_r = cg_alloc_reg(cg);
+                    if (cg->had_error) break;
+                    cg_emit(cg, enc_r(CVM_OP_ADD, sum_r, cur, off_r));
+                    cur = sum_r;
+                }
+                if (have_dyn) {
+                    cg_emit(cg, enc_r(CVM_OP_ADD, dst, cur, dyn_reg));
+                } else if (cur != dst) {
+                    cg_emit(cg, enc_r(CVM_OP_MOV, dst, cur, 0));
+                }
+                break;
+            }
+
             case LLVMCall: {
                 LLVMValueRef callee = LLVMGetCalledValue(i);
                 size_t name_len = 0;
@@ -831,6 +1147,7 @@ static void put_u32_le(uint8_t *p, uint32_t v) {
 
 static int write_bin(const char *path,
                      const uint32_t *code, uint32_t code_count,
+                     const uint8_t *data, uint32_t data_size,
                      uint32_t entry)
 {
     FILE *f = fopen(path, "wb");
@@ -840,10 +1157,11 @@ static int write_bin(const char *path,
         return 1;
     }
 
-    uint32_t section_count = 1;
+    uint32_t section_count = 1u + (data_size > 0 ? 1u : 0u);
     uint32_t table_off = 24;
     uint32_t code_off  = table_off + section_count * 16;
     uint32_t code_size = code_count * 4u;
+    uint32_t data_off  = data_size > 0 ? code_off + code_size : 0;
 
     uint8_t hdr[24] = {0};
     hdr[0] = 'C'; hdr[1] = 'V'; hdr[2] = 'M'; hdr[3] = '1';
@@ -861,11 +1179,22 @@ static int write_bin(const char *path,
     put_u32_le(sec + 12, 0u);
     fwrite(sec, sizeof(sec), 1, f);
 
+    if (data_size > 0) {
+        memset(sec, 0, sizeof(sec));
+        put_u32_le(sec + 0,  CVM_SEC_DATA);
+        put_u32_le(sec + 4,  data_off);
+        put_u32_le(sec + 8,  data_size);
+        put_u32_le(sec + 12, 0u);
+        fwrite(sec, sizeof(sec), 1, f);
+    }
+
     for (uint32_t i = 0; i < code_count; ++i) {
         uint8_t b[4];
         put_u32_le(b, code[i]);
         fwrite(b, sizeof(b), 1, f);
     }
+
+    if (data_size > 0) fwrite(data, 1, data_size, f);
 
     int err = ferror(f);
     fclose(f);
@@ -952,21 +1281,30 @@ int main(int argc, char **argv) {
     }
 
     if (g_errors == 0 && output) {
-        struct cg cg = {0};
-        if (cg_function(&cg, first_def) != 0) {
-            rc = 1;
-        } else if (write_bin(output, cg.code, cg.count, 0) != 0) {
+        struct cg_globals globals = {0};
+        globals.td = LLVMCreateTargetData(LLVMGetDataLayoutStr(mod));
+        if (cg_collect_globals(&globals, mod) != 0) {
             rc = 1;
         } else {
-            printf("translator: wrote %s (%u instructions)\n",
-                   output, cg.count);
+            struct cg cg = {0};
+            cg.globals = &globals;
+            if (cg_function(&cg, first_def) != 0) {
+                rc = 1;
+            } else if (write_bin(output, cg.code, cg.count,
+                                  globals.data_bytes, globals.data_size, 0) != 0) {
+                rc = 1;
+            } else {
+                printf("translator: wrote %s (%u instructions, %u data bytes)\n",
+                       output, cg.count, globals.data_size);
+            }
+            free(cg.code);
+            free(cg.vals);
+            free(cg.regs);
+            free(cg.blocks);
+            free(cg.block_offsets);
+            free(cg.fixups);
         }
-        free(cg.code);
-        free(cg.vals);
-        free(cg.regs);
-        free(cg.blocks);
-        free(cg.block_offsets);
-        free(cg.fixups);
+        cg_globals_dispose(&globals);
     }
 
     LLVMDisposeModule(mod);

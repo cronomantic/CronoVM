@@ -17,7 +17,7 @@ execute_process(COMMAND ${LLVM_CONFIG_EXE} --includedir
 execute_process(COMMAND ${LLVM_CONFIG_EXE} --libdir
                 OUTPUT_VARIABLE LLVM_LIBDIR
                 OUTPUT_STRIP_TRAILING_WHITESPACE)
-execute_process(COMMAND ${LLVM_CONFIG_EXE} --libs core bitreader support
+execute_process(COMMAND ${LLVM_CONFIG_EXE} --libs core bitreader support target
                 OUTPUT_VARIABLE LLVM_LIBS_RAW
                 OUTPUT_STRIP_TRAILING_WHITESPACE)
 
@@ -43,12 +43,13 @@ set(_fixture_dir ${CMAKE_SOURCE_DIR}/tests/fixtures)
 set(_fixture_out ${CMAKE_CURRENT_BINARY_DIR})
 
 set(_fixture_targets "")
-foreach(name add pick fib abs max divmod bitops reject_double)
+foreach(name add pick fib abs max divmod bitops counter sum_global reject_double)
     set(_src ${_fixture_dir}/${name}.c)
     set(_bc  ${_fixture_out}/${name}.bc)
     add_custom_command(
         OUTPUT  ${_bc}
-        COMMAND ${CMAKE_C_COMPILER} -emit-llvm -O1 -c ${_src} -o ${_bc}
+        COMMAND ${CMAKE_C_COMPILER} --target=i386-elf -emit-llvm -O1
+                                    -c ${_src} -o ${_bc}
         DEPENDS ${_src}
         VERBATIM
     )
@@ -58,7 +59,7 @@ add_custom_target(translator_fixtures DEPENDS ${_fixture_targets})
 
 # Emit each .bin via the translator. Depends on cvm-translate + the .bc.
 set(_emit_targets "")
-foreach(name add pick fib abs max divmod bitops)
+foreach(name add pick fib abs max divmod bitops counter sum_global)
     set(_bc  ${_fixture_out}/${name}.bc)
     set(_bin ${_fixture_out}/${name}.bin)
     add_custom_command(
@@ -106,8 +107,10 @@ add_test(NAME e2e_max_lhs    COMMAND test_e2e ${_fixture_out}/max.bin      7  7 
 add_test(NAME e2e_max_rhs    COMMAND test_e2e ${_fixture_out}/max.bin      7  3 7)
 add_test(NAME e2e_divmod     COMMAND test_e2e ${_fixture_out}/divmod.bin 302  17 5)
 add_test(NAME e2e_bitops     COMMAND test_e2e ${_fixture_out}/bitops.bin 127  7 3)
+add_test(NAME e2e_counter    COMMAND test_e2e ${_fixture_out}/counter.bin 7  7)
+add_test(NAME e2e_sum_global COMMAND test_e2e ${_fixture_out}/sum_global.bin 55 10)
 set_tests_properties(
     e2e_add e2e_pick_true e2e_pick_false e2e_fib_10 e2e_fib_0
     e2e_abs_neg e2e_abs_pos e2e_max_lhs e2e_max_rhs
-    e2e_divmod e2e_bitops
+    e2e_divmod e2e_bitops e2e_counter e2e_sum_global
     PROPERTIES FIXTURES_REQUIRED emitted_bins)
