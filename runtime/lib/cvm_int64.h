@@ -108,23 +108,19 @@ static inline cvm_i64 cvm_i64_mul(cvm_i64 a, cvm_i64 b) {
 
 /* --- Shifts (amount masked to 6 bits, range 0..63) ------------------- */
 
-/* The split-shift expressions like `(x.hi << n) | (x.lo >> (32-n))` are
- * canonically a funnel shift, and clang folds them to `llvm.fshl.i32` /
- * `llvm.fshr.i32` whenever it recognises the pattern. The translator
- * doesn't lower those intrinsics (they're outside the supported subset),
- * so we route the inverse shift amount through a `volatile` stack slot to
- * break the SSA chain clang uses for pattern matching. The cost is one
- * extra load/store per call — invisible compared to the shift itself, and
- * paid only when the shift amount is in (0, 32). */
+/* The split-shift expressions `(x.hi << n) | (x.lo >> (32-n))` are
+ * canonically a funnel shift; clang folds them to `llvm.fshl.i32` /
+ * `llvm.fshr.i32`. The translator lowers both intrinsics directly, so
+ * the natural plain-C form is enough — no `volatile`-stack-slot trick
+ * needed. */
 __attribute__((noinline))
 static cvm_i64 cvm_u64_shl(cvm_i64 x, uint32_t n_in) {
     uint32_t n = n_in & 63u;
     cvm_i64 r;
     if (n == 0u) { r = x; return r; }
     if (n >= 32u) { r.lo = 0u; r.hi = x.lo << (n - 32u); return r; }
-    volatile uint32_t inv = 32u - n;
     r.lo = x.lo << n;
-    r.hi = (x.hi << n) | (x.lo >> inv);
+    r.hi = (x.hi << n) | (x.lo >> (32u - n));
     return r;
 }
 
@@ -134,9 +130,8 @@ static cvm_i64 cvm_u64_shr(cvm_i64 x, uint32_t n_in) {
     cvm_i64 r;
     if (n == 0u) { r = x; return r; }
     if (n >= 32u) { r.hi = 0u; r.lo = x.hi >> (n - 32u); return r; }
-    volatile uint32_t inv = 32u - n;
     r.hi = x.hi >> n;
-    r.lo = (x.lo >> n) | (x.hi << inv);
+    r.lo = (x.lo >> n) | (x.hi << (32u - n));
     return r;
 }
 
@@ -151,9 +146,8 @@ static cvm_i64 cvm_i64_sar(cvm_i64 x, uint32_t n_in) {
         r.hi = (uint32_t)(hi_signed >> 31);                   /* sign-fill */
         return r;
     }
-    volatile uint32_t inv = 32u - n;
     r.hi = (uint32_t)(hi_signed >> (int32_t)n);
-    r.lo = (x.lo >> n) | (x.hi << inv);
+    r.lo = (x.lo >> n) | (x.hi << (32u - n));
     return r;
 }
 

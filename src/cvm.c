@@ -4,8 +4,16 @@
                          a hardware FPU this resolves to libm/libgcc soft
                          implementation, same trade-off as the FADD/FMUL
                          family already documented for soft-float targets. */
-#include <stdlib.h>
 #include <string.h>
+
+/* Embedded targets that want to forbid the libc malloc/free path entirely
+ * (and avoid linking <stdlib.h>) can build with -DCVM_NO_STDLIB_FALLBACK.
+ * In that mode a NULL allocator is hard-fail: cvm_int_alloc returns NULL,
+ * cvm_int_free is a no-op, and callers must supply a non-NULL
+ * cvm_allocator_t with both function pointers populated. */
+#ifndef CVM_NO_STDLIB_FALLBACK
+#  include <stdlib.h>
+#endif
 
 #define CVM_HEADER_SIZE   24u
 #define CVM_SECTION_SIZE  16u
@@ -24,18 +32,26 @@ static uint32_t read_u32_le(const uint8_t *p) {
  * its individual function pointers) is NULL. The load path threads a
  * `cvm_allocator_t *` around; cvm_image_free recovers the same hooks
  * by passing &img->allocator. Either function pointer being NULL is a
- * legal "use stdlib for this slot" signal. */
+ * legal "use stdlib for this slot" signal — unless built with
+ * CVM_NO_STDLIB_FALLBACK, in which case a missing hook is hard-fail
+ * (alloc returns NULL, free is a no-op). */
 
 static void *cvm_int_alloc(const cvm_allocator_t *a, size_t n) {
     if (n == 0) return NULL;
     if (a && a->alloc_fn) return a->alloc_fn(n, a->user_data);
+#ifdef CVM_NO_STDLIB_FALLBACK
+    return NULL;
+#else
     return malloc(n);
+#endif
 }
 
 static void cvm_int_free(const cvm_allocator_t *a, void *p) {
     if (!p) return;
     if (a && a->free_fn) { a->free_fn(p, a->user_data); return; }
+#ifndef CVM_NO_STDLIB_FALLBACK
     free(p);
+#endif
 }
 
 static void *cvm_int_calloc(const cvm_allocator_t *a,

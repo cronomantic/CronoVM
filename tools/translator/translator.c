@@ -2474,7 +2474,9 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 if (strcmp(name, "llvm.fshl.i32") == 0 ||
                     strcmp(name, "llvm.fshr.i32") == 0)
                 {
-                    int is_fshr = (name[6] == 'r');
+                    /* "llvm.fshl.i32" vs "llvm.fshr.i32" differ at index 8
+                     * (the 'l' / 'r'); index 6 is 's' in both. */
+                    int is_fshr = (name[8] == 'r');
                     if (LLVMGetNumArgOperands(i) != 3) {
                         ERR(cg->fn_name, "%s expects 3 args, got %u", name,
                             LLVMGetNumArgOperands(i));
