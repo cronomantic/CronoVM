@@ -1987,6 +1987,20 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 uint8_t            cond_reg   = cg_reg_for(cg, cond_v);
                 if (cg->had_error) break;
 
+                /* `cond_reg` is whatever the predecessor produced, which
+                 * for an `iN` cond (N < 32) is now zero-extended to N bits
+                 * by the Trunc lowering. Case constants must be read in
+                 * the same width-mod basis — see Trunc/chain-form notes —
+                 * or the table form's `SUB off, cond, lo` would sign-mix
+                 * a 0xFF cond with a 0xFFFFFFFE lo and the CMP_LTU would
+                 * miss every case. Hoisted here so both lowerings agree. */
+                LLVMTypeRef cond_ty = LLVMTypeOf(cond_v);
+                unsigned    cond_w  =
+                    (LLVMGetTypeKind(cond_ty) == LLVMIntegerTypeKind)
+                        ? LLVMGetIntTypeWidth(cond_ty) : 32;
+                uint64_t    cond_mask =
+                    (cond_w >= 64) ? ~0ULL : ((1ULL << cond_w) - 1ULL);
+
                 unsigned n_succ = LLVMGetNumSuccessors(i);
                 /* n_succ counts the default plus each case block; LLVM
                  * guarantees ≥ 1 (the default). Switches with zero cases
@@ -2010,9 +2024,9 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     for (unsigned k = 1; k < n_succ; ++k) {
                         LLVMValueRef cv = LLVMGetSwitchCaseValue(i, k);
                         if (!cv || !LLVMIsAConstantInt(cv)) { valid = 0; break; }
-                        long long v = LLVMConstIntGetSExtValue(cv);
-                        if (v < INT32_MIN || v > INT32_MAX) { valid = 0; break; }
-                        int32_t iv = (int32_t)v;
+                        uint64_t zv = LLVMConstIntGetZExtValue(cv) & cond_mask;
+                        if (zv > (uint64_t)UINT32_MAX) { valid = 0; break; }
+                        int32_t iv = (int32_t)(uint32_t)zv;
                         if (k == 1) { lo = hi = iv; }
                         else { if (iv < lo) lo = iv; if (iv > hi) hi = iv; }
                     }
@@ -2041,7 +2055,8 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     for (uint32_t k = 0; k < n_range; ++k) targets[k] = default_bb;
                     for (unsigned k = 1; k < n_succ; ++k) {
                         LLVMValueRef cv = LLVMGetSwitchCaseValue(i, k);
-                        int32_t  v   = (int32_t)LLVMConstIntGetSExtValue(cv);
+                        int32_t  v   = (int32_t)(uint32_t)
+                                       (LLVMConstIntGetZExtValue(cv) & cond_mask);
                         uint32_t idx = (uint32_t)(v - lo);
                         targets[idx] = LLVMGetSuccessor(i, k);
                     }
@@ -2111,16 +2126,10 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     cg_queue_fixup(cg, cg->count, default_bb, 8, 24);
                     cg_emit(cg, enc_i24(CVM_OP_JMP, 0));
                 } else {
-                    /* Chain form. The case operand type defines a width
-                     * (i8 / i16 / i32). cond_reg holds the cond value
-                     * after Trunc, which is zero-extended to the operand
-                     * width (Trunc masks). Case constants must be loaded
-                     * with the same width-bits — `LLVMConstIntGetSExtValue`
-                     * would sign-extend `i8 -1` to 0xFFFFFFFF and miss the
-                     * 0xFF cond_reg; ZExt drops to 0xFF and matches. */
-                    LLVMTypeRef cond_ty = LLVMTypeOf(cond_v);
-                    unsigned cond_w = (LLVMGetTypeKind(cond_ty) == LLVMIntegerTypeKind)
-                                      ? LLVMGetIntTypeWidth(cond_ty) : 32;
+                    /* Chain form. cond_reg / case constants are taken in
+                     * the cond's narrow width (computed above) — using
+                     * SExt would sign-extend `i8 -1` to 0xFFFFFFFF and
+                     * miss the 0xFF cond_reg. */
                     for (unsigned k = 1; k < n_succ; ++k) {
                         LLVMValueRef      case_val = LLVMGetSwitchCaseValue(i, k);
                         LLVMBasicBlockRef case_bb  = LLVMGetSuccessor(i, k);

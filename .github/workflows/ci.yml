@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [clang, gcc]
+    name: linux-${{ matrix.cc }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # llvm-dev pulls headers + libs for the translator's LLVM-C
+      # bindings; clang is needed at fixture-build time even on the GCC
+      # row, because tools/translator/CMakeLists.txt resolves a separate
+      # clang binary for `--target=i386-elf -emit-llvm`.
+      - name: Install LLVM + toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm llvm-dev cmake ninja-build
+
+      - name: Configure
+        run: cmake -B build -G Ninja -DCMAKE_C_COMPILER=${{ matrix.cc }}
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  linux-no-stdlib-fallback:
+    runs-on: ubuntu-latest
+    name: linux-no-stdlib-fallback
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM + toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm llvm-dev cmake ninja-build
+
+      # The embedded "no libc allocator" gate. Built defines
+      # CVM_NO_STDLIB_FALLBACK across the whole tree, so libcvm's
+      # cvm_int_alloc returns NULL when no allocator hook is supplied.
+      # We can't run the full suite (e2e_add etc. use the default
+      # allocator path), but e2e_allocator exercises the hook end-to-end
+      # — that's the test that validates the gate works.
+      - name: Configure (CVM_NO_STDLIB_FALLBACK)
+        run: >
+          cmake -B build -G Ninja
+                -DCMAKE_C_COMPILER=clang
+                -DCMAKE_C_FLAGS=-DCVM_NO_STDLIB_FALLBACK
+
+      - name: Build
+        run: cmake --build build
+
+      # Only e2e_allocator exercises a non-stdlib alloc path — the rest
+      # of the e2e suite uses cvm_load() with no hook, which under this
+      # gate intentionally hard-fails. ctest auto-runs the bc + bin
+      # fixture-setup tests because e2e_allocator declares them as
+      # FIXTURES_REQUIRED.
+      - name: Test (allocator-hook path only)
+        run: ctest --test-dir build --output-on-failure -R e2e_allocator
+
+  windows:
+    runs-on: windows-latest
+    name: windows-ucrt64-clang
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The local dev environment is MSYS2 UCRT64; match it on CI so
+      # llvm-config / clang behave identically to what the maintainer
+      # tests against.
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-clang
+            mingw-w64-ucrt-x86_64-llvm
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+
+      - name: Configure
+        run: cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  macos:
+    runs-on: macos-latest
+    name: macos-clang
+    steps:
+      - uses: actions/checkout@v4
+
+      # Apple Clang ships without llvm-config (it's part of an internal
+      # toolchain). Brew's LLVM keg gets the standalone tools, including
+      # llvm-config and a clang that supports --target=i386-elf for
+      # fixture compilation.
+      - name: Install LLVM via brew
+        run: |
+          brew update
+          brew install llvm cmake ninja
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+
+      - name: Configure
+        run: cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

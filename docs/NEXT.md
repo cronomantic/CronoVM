@@ -74,42 +74,30 @@ and an "after first feedback" group.
 
 ### Before tagging a non-preview release
 
-1. **GitHub Actions CI**. There's no `.github/workflows/` yet, so
-   the 67/67 ctest run is still local-only. A minimal `ci.yml` with
-   a small matrix (Linux × {Clang, GCC} + Windows × Clang +
-   optionally macOS × Clang) running `cmake --build build && ctest`
-   on every push and PR is enough to catch regressions before they
-   land. Bonus: a separate job that builds with
-   `-DCVM_NO_STDLIB_FALLBACK=ON` to keep the embedded gate from
-   bit-rotting.
-
-2. **Cortex-M cross-compile sanity**. Verify that `src/cvm.c`
+1. **Cortex-M cross-compile sanity**. Verify that `src/cvm.c`
    actually links for `thumbv7m-none-eabi` with
    `-DCVM_NO_STDLIB_FALLBACK` (no test execution needed — just a
    successful link to make sure no libc symbol leaks back in). Tiny
    CMake toolchain file + a CI job is enough. This is the dependency
    for the larger footprint audit below.
 
-3. **Adversarial-fixture pass**. The session-5 bug-find rate (three
+2. **Adversarial-fixture pass**. The session-5 bug-find rate (three
    latent bugs in one session, all surfaced by the same
    not-particularly-exotic fixture) suggests the test surface is
-   starting to bite hard but more lurkers exist. Worth adding:
-     - a switch fixture with negative i8 / i16 case constants
-       (covers the `LLVMConstIntGetSExtValue` → ZExt flip in the
-       table form, which is currently untested);
+   starting to bite hard but more lurkers exist. Remaining items:
      - a function near the R252 SSA limit (catches off-by-one in the
        SSA range now that `CG_MAX_SSA_REG` is 252);
      - a long, call-heavy loop that stresses spill compaction and
        branch relaxation simultaneously.
 
-4. **Translator bitcode-parser fuzzing**. The `.bc` input is
+3. **Translator bitcode-parser fuzzing**. The `.bc` input is
    user-supplied at translation time and the parser is the most
    plausible attack surface. A small libFuzzer harness that feeds
    random / mutated bitcode into `cvm_translate_buffer` would shake
    out crashes before users hit them. Doesn't need to be exhaustive
    — even a few CPU-hours of corpus is high-value at this stage.
 
-5. **`CHANGELOG.md`**. Currently only `git log` exists. For an
+4. **`CHANGELOG.md`**. Currently only `git log` exists. For an
    external audience, a per-tag changelog (entries grouped by
    feature / fix / breaking) makes upgrades much easier. The
    in-flight session_5 work — translator triple-fix, cvm_d_div, the
@@ -134,6 +122,37 @@ and an "after first feedback" group.
 
 ## Recently closed
 
+- ~~**GitHub Actions CI**~~ — landed
+  ([.github/workflows/ci.yml](../.github/workflows/ci.yml)). Four jobs
+  on push-to-main / pull_request:
+  - `linux × {clang, gcc}` running the full ctest suite. GCC builds
+    route fixture compilation through a separately-resolved `clang`
+    binary (see `find_program(CVM_FIXTURE_CC ...)` in
+    `tools/translator/CMakeLists.txt`); previously the fixture step
+    assumed CMAKE_C_COMPILER was clang and broke under GCC.
+  - `linux-no-stdlib-fallback` builds the whole tree with
+    `-DCVM_NO_STDLIB_FALLBACK` and runs only `e2e_allocator`
+    (the rest of the e2e suite intentionally hard-fails under this
+    gate because `cvm_load` without a hook returns NULL). Keeps the
+    embedded gate from bit-rotting.
+  - `windows-ucrt64-clang` via `msys2/setup-msys2@v2`, matching the
+    maintainer's local environment.
+  - `macos-clang` via brew's LLVM (Apple Clang lacks `llvm-config`).
+- ~~**Adversarial switch fixture** with negative `iN` case constants~~ —
+  landed (2026-05-10 session 6). `tests/fixtures/switch_neg_table.c`
+  drives `switch i8` with four contiguous negative cases (-4..-1) over
+  the table-form lowering. Surfaced a latent bug analogous to the
+  session-5 chain-form one: the table form read case constants via
+  `LLVMConstIntGetSExtValue` and computed `lo` in sign-extended space,
+  while `cond_reg` is zero-extended to `iN` bits. With a `case i8 -1`,
+  `lo` was `0xFFFFFFFE` and `SUB off, cond=0xFF, lo` yielded 0x103 —
+  `CMP_LTU off, n_range=4` missed and every input fell through to
+  default. **Fix**: hoisted `cond_w` / `cond_mask` above the
+  chain-vs-table decision and made both lowerings read case constants
+  with `LLVMConstIntGetZExtValue & cond_mask`. Confirmed bug-presence
+  by temporary revert: the two cases at the iN-negative end of the
+  range (`m4`, `m1`) returned default before the fix. 74/74 ctest now
+  (67 prior + 7 new switch_neg cases).
 - ~~**`CVM_NO_STDLIB_FALLBACK` guard** in cvm.c~~ — landed.
   Defining `-DCVM_NO_STDLIB_FALLBACK` at build time skips the
   `<stdlib.h>` include and turns a missing allocator hook into
@@ -146,8 +165,8 @@ and an "after first feedback" group.
 
 ## Current state
 
-67/67 ctest cases pass (64 prior + `e2e_fsqrt` + `e2e_i64_basic` +
-`e2e_f64_basic`). Release build clean.
+74/74 ctest cases pass (67 prior + 7 new `e2e_switch_neg_*` cases
+exercising the table-form negative-`iN` fix). Release build clean.
 Pipeline runs end-to-end exactly as before:
 
 ```text

@@ -39,6 +39,21 @@ target_compile_options(cvm-translate PRIVATE
 # --- Fixtures: compile test C sources to bitcode at build time ------------
 # -O1 promotes allocas (mem2reg) which step-5 codegen requires; the
 # validation tests don't care about the level, so we use -O1 everywhere.
+#
+# Fixture compilation needs clang specifically (`--target=i386-elf
+# -emit-llvm`). On hosts where CMAKE_C_COMPILER is GCC or MSVC,
+# CMAKE_C_COMPILER cannot drive it — so we resolve a separate clang
+# binary here. Fall back to CMAKE_C_COMPILER when no standalone clang
+# is on the PATH (preserves the in-tree dev flow where clang is the
+# C compiler).
+find_program(CVM_FIXTURE_CC NAMES clang)
+if(NOT CVM_FIXTURE_CC)
+    set(CVM_FIXTURE_CC ${CMAKE_C_COMPILER})
+    message(STATUS "Fixture compiler: ${CVM_FIXTURE_CC} (CMAKE_C_COMPILER fallback)")
+else()
+    message(STATUS "Fixture compiler: ${CVM_FIXTURE_CC}")
+endif()
+
 set(_fixture_dir ${CVM_SOURCE_ROOT}/tests/fixtures)
 set(_fixture_out ${CMAKE_CURRENT_BINARY_DIR})
 
@@ -48,12 +63,12 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
              i64_basic f64_basic two_funcs
              fib_recursive many_args alloca_swap fnptr dispatch_table
              narrow_ops mem_intrin long_branch switch_dispatch
-             switch_table reject_double)
+             switch_table switch_neg_table reject_double)
     set(_src ${_fixture_dir}/${name}.c)
     set(_bc  ${_fixture_out}/${name}.bc)
     add_custom_command(
         OUTPUT  ${_bc}
-        COMMAND ${CMAKE_C_COMPILER} --target=i386-elf -emit-llvm -O1
+        COMMAND ${CVM_FIXTURE_CC} --target=i386-elf -emit-llvm -O1
                                     -I${CVM_SOURCE_ROOT}/runtime/lib
                                     -c ${_src} -o ${_bc}
         DEPENDS ${_src}
@@ -73,7 +88,7 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
              mulh float_basic fsqrt i64_basic f64_basic
              two_funcs fib_recursive many_args
              alloca_swap fnptr dispatch_table narrow_ops mem_intrin
-             long_branch switch_dispatch switch_table)
+             long_branch switch_dispatch switch_table switch_neg_table)
     set(_bc  ${_fixture_out}/${name}.bc)
     set(_bin ${_fixture_out}/${name}.bin)
     add_custom_command(
@@ -216,6 +231,17 @@ add_test(NAME e2e_switch_tab_and   COMMAND test_e2e ${_fixture_out}/switch_table
 add_test(NAME e2e_switch_tab_xor   COMMAND test_e2e ${_fixture_out}/switch_table.bin   15  6  12  3)  # x^y
 add_test(NAME e2e_switch_tab_shr   COMMAND test_e2e ${_fixture_out}/switch_table.bin    1  7  12  3)  # x>>y
 add_test(NAME e2e_switch_tab_def   COMMAND test_e2e ${_fixture_out}/switch_table.bin   -1 99  12  3)  # default
+# switch_neg_table: dense 4-case switch with negative i8 case constants
+# (-4..-1). Exercises the table form's case-constant width handling — see
+# the fixture header for the bug class this guards against.
+#                                                                expected op  x  y
+add_test(NAME e2e_switch_neg_m4    COMMAND test_e2e ${_fixture_out}/switch_neg_table.bin 10 -4 7 3)  # x+y
+add_test(NAME e2e_switch_neg_m3    COMMAND test_e2e ${_fixture_out}/switch_neg_table.bin  4 -3 7 3)  # x-y
+add_test(NAME e2e_switch_neg_m2    COMMAND test_e2e ${_fixture_out}/switch_neg_table.bin 21 -2 7 3)  # x*y
+add_test(NAME e2e_switch_neg_m1    COMMAND test_e2e ${_fixture_out}/switch_neg_table.bin  4 -1 7 3)  # x^y
+add_test(NAME e2e_switch_neg_zero  COMMAND test_e2e ${_fixture_out}/switch_neg_table.bin -1  0 7 3)  # default
+add_test(NAME e2e_switch_neg_m5    COMMAND test_e2e ${_fixture_out}/switch_neg_table.bin -1 -5 7 3)  # default (below lo)
+add_test(NAME e2e_switch_neg_pos   COMMAND test_e2e ${_fixture_out}/switch_neg_table.bin -1  5 7 3)  # default (above hi)
 set_tests_properties(
     e2e_add e2e_pick_true e2e_pick_false e2e_fib_10 e2e_fib_0
     e2e_abs_neg e2e_abs_pos e2e_max_lhs e2e_max_rhs
@@ -233,4 +259,6 @@ set_tests_properties(
     e2e_switch_tab_add e2e_switch_tab_sub e2e_switch_tab_mul
     e2e_switch_tab_shl e2e_switch_tab_or  e2e_switch_tab_and
     e2e_switch_tab_xor e2e_switch_tab_shr e2e_switch_tab_def
+    e2e_switch_neg_m4 e2e_switch_neg_m3 e2e_switch_neg_m2 e2e_switch_neg_m1
+    e2e_switch_neg_zero e2e_switch_neg_m5 e2e_switch_neg_pos
     PROPERTIES FIXTURES_REQUIRED emitted_bins)
