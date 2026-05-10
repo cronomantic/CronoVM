@@ -21,7 +21,7 @@ user.c ──[clang -emit-llvm-bc]──▶ user.bc ──[translator]──▶ 
 User-facing command is a single step:
 
 ```
-gamecc user.c -o game.bin
+cvm-cc user.c -o game.bin
 ```
 
 The wrapper hides the Clang invocation. Users never see `.ll`, `.bc`, `.asm`,
@@ -31,7 +31,7 @@ The wrapper hides the Clang invocation. Users never see `.ll`, `.bc`, `.asm`,
 
 1. **The VM interpreter** — single-file C, embeddable, computed-goto dispatch.
 2. **The translator** — reads LLVM bitcode, emits VM bytecode directly.
-3. **The `gamecc` wrapper** — small driver that invokes Clang with the right
+3. **The `cvm-cc` wrapper** — small driver that invokes Clang with the right
    flags and pipes the output through the translator.
 
 We do **not** maintain a C compiler. Clang is upstream. When Clang adds C23
@@ -45,8 +45,15 @@ features, we get them for free.
   future JIT. (Q3VM's stack/OPSTACK design is inheritance to **avoid**, not
   preserve.)
 - **Fixed-width 32-bit instructions**, ~80–120 opcodes target.
-- **32-bit base type system**, with `int64`/`float64` opcodes added (Q3VM
-  lacked `double`, we don't).
+- **32-bit register file with first-class `f32`** (revised 2026-05-10).
+  All arithmetic, all addressing, all bounds checks are 32-bit; `f32`
+  shares the integer register file (bitcast `f32 ↔ i32` is a no-op).
+  `i64` and `f64` are rejected at the ISA level — code that needs them
+  uses runtime headers (`cvm_int64.h` / `cvm_float64.h`) that compose
+  32-bit primitives. `MULH`/`MULHU` give 32×32→64 multiply without
+  leaving the register file. (See [docs/NEXT.md](docs/NEXT.md) "Design
+  constraints" for the full reasoning, including soft-float strategy
+  for FPU-less embedded targets.)
 - **Single contiguous heap** with bounds checking — same sandbox model as
   q3vm, that part was good.
 - **No GC**, no heap allocator built into the VM. Host-provided memory only.
@@ -113,7 +120,7 @@ discussed before implementation starts:
 5. Map a single C function (e.g. `int add(int a, int b)`) end-to-end.
 6. Expand opcode set and translator coverage in lockstep, driven by progressively
    more complex C programs.
-7. `gamecc` wrapper last — only once the pipeline works manually.
+7. `cvm-cc` wrapper last — only once the pipeline works manually.
 
 The goal of this order is to always have **something runnable** rather than
 spending months on infrastructure before the first program executes.

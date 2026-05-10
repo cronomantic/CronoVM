@@ -43,12 +43,16 @@ override them):
 
 | Name | Returns | Purpose |
 | ---- | ------- | ------- |
-| `cvm_sys_heap_start` | first byte after DATA+BSS | Start of the free region; see [memory.md](memory.md). |
+| `cvm_sys_heap_start` | first byte of the free region | Start of `HEAP_RESERVE`; see [memory.md](memory.md). |
 | `cvm_sys_heap_size` | size of the free region in bytes | Equal to the binary's `HEAP_RESERVE` section size, or 0 if absent. |
+| `cvm_sys_get_region` | heap offset of the named region, or `-1` if missing | Discovery for the host-shared regions declared via `--region`; the argument is a heap address pointing at a NUL-terminated name (≤ 16 bytes including the NUL). |
 
 These exist because the user-side allocator needs to know where its
 working memory lives, and the answer depends on the loaded image, not on
-host policy.
+host policy. `cvm_sys_get_region` plays the same role for host-shared
+regions: the binary declares names at translate time, the loader assigns
+offsets at load time, and this syscall resolves a name to its offset at
+runtime.
 
 ## Calling convention (v1.0)
 

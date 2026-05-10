@@ -176,16 +176,27 @@ static int type_in_subset(LLVMTypeRef t, char *err, size_t errlen) {
     case LLVMScalableVectorTypeKind:
         snprintf(err, errlen, "vector types not in the subset");
         return 0;
+    case LLVMFloatTypeKind:
+        /* IEEE 754 binary32 — first-class in the ISA (see CVM_OP_F* in
+         * include/cvm.h). f32 values share the i32 register file, so no
+         * separate register class is needed. */
+        return 1;
+    case LLVMDoubleTypeKind:
+        /* `double` is rejected by design. The runtime header
+         * cvm_float64.h provides software emulation for code that
+         * genuinely needs it, but the ISA stays 32-bit. */
+        snprintf(err, errlen,
+                 "f64 not in the subset; use float, or include "
+                 "cvm_float64.h for software emulation");
+        return 0;
     case LLVMHalfTypeKind:
     case LLVMBFloatTypeKind:
-    case LLVMFloatTypeKind:
-    case LLVMDoubleTypeKind:
     case LLVMX86_FP80TypeKind:
     case LLVMFP128TypeKind:
     case LLVMPPC_FP128TypeKind:
         snprintf(err, errlen,
-                 "floating-point types not yet supported "
-                 "(deferred to float64 opcodes)");
+                 "%s floating-point not in the subset (only f32 supported)",
+                 type_kind_name(k));
         return 0;
     case LLVMTokenTypeKind:
     case LLVMX86_AMXTypeKind:
@@ -209,6 +220,13 @@ static int opcode_in_subset(LLVMOpcode op) {
     case LLVMPtrToInt: case LLVMIntToPtr: case LLVMBitCast:
     case LLVMICmp: case LLVMPHI: case LLVMCall: case LLVMSelect:
     case LLVMExtractValue: case LLVMInsertValue:
+    /* f32 ops — see translator's float codegen. FRem deliberately
+     * excluded (no FREM opcode; users wanting fmod can call libc-style
+     * helper from a future runtime header). FPExt/FPTrunc excluded
+     * because they only apply to double, which we reject. */
+    case LLVMFAdd: case LLVMFSub: case LLVMFMul: case LLVMFDiv:
+    case LLVMFNeg: case LLVMFCmp:
+    case LLVMSIToFP: case LLVMUIToFP: case LLVMFPToSI: case LLVMFPToUI:
         return 1;
     default:
         return 0;
@@ -415,6 +433,22 @@ static int serialize_constant(const struct cg_globals *g, LLVMValueRef c,
             out[off + b] = (uint8_t)(v >> (b * 8));
         return 0;
     }
+    if (LLVMIsAConstantFP(c)) {
+        /* Only float (binary32) is in the subset; the type-subset check
+         * upstream rejects anything else, but assert here so a bad caller
+         * can't slip a double past us. */
+        if (LLVMGetTypeKind(ty) != LLVMFloatTypeKind || sz != 4) return 1;
+        LLVMBool lossy = 0;
+        double   d     = LLVMConstRealGetDouble(c, &lossy);
+        float    f     = (float)d;
+        uint32_t bits;
+        memcpy(&bits, &f, sizeof bits);
+        out[off + 0] = (uint8_t)(bits      );
+        out[off + 1] = (uint8_t)(bits >>  8);
+        out[off + 2] = (uint8_t)(bits >> 16);
+        out[off + 3] = (uint8_t)(bits >> 24);
+        return 0;
+    }
     if (LLVMIsAFunction(c)) {
         /* A function value embedded in a constant initialiser — typically
          * a static dispatch table. We need the function's FUNCS-index,
@@ -504,6 +538,16 @@ struct cg_fixup {
     LLVMBasicBlockRef target;
     int      shift;     /* bit position of the imm field */
     int      bits;      /* width of the imm field (8 or 24) */
+};
+
+/* Switch jump-table entry that points at a basic block. The dispatch
+ * sequence emitted by the table form of LLVMSwitch reads each entry
+ * with LDW and JMPRs to the absolute instruction index, so we resolve
+ * these *after* branch relaxation (when block_offsets is final) and
+ * write the absolute index into globals.data_bytes at `data_off`. */
+struct cg_table_fixup {
+    uint32_t          data_off;     /* byte offset into globals.data_bytes */
+    LLVMBasicBlockRef target;
 };
 
 struct cg_import {
@@ -606,6 +650,12 @@ struct cg {
     int              fixup_count;
     int              fixup_cap;
 
+    /* Switch jump-table entries (see cg_table_fixup). Reset per
+     * function; resolved in cg_function after branch relaxation. */
+    struct cg_table_fixup *table_fixups;
+    int                    table_fixup_count;
+    int                    table_fixup_cap;
+
     /* Allocas in the current function (entry block, static size). */
     struct cg_alloca *allocas;
     int               alloca_count;
@@ -628,7 +678,7 @@ struct cg {
     int                  call_live_cap;
 
     uint32_t          alloca_bytes;   /* total bytes used by alloca area */
-    uint32_t          spill_bytes;    /* (ssa_reg_high - 8) * 4 */
+    uint32_t          spill_bytes;    /* spill_slot_count * 4 — see below. */
     uint32_t          frame_bytes;    /* alloca_bytes + spill_bytes */
     int               ssa_reg_high;   /* next_reg snapshot after pre-alloc.
                                        * Spilling around CALL only covers
@@ -636,6 +686,17 @@ struct cg {
                                        * and per-instruction temps are
                                        * re-materialised on each use, so
                                        * they don't need to survive a CALL. */
+
+    /* Compacted spill layout: only SSA regs that are live across at
+     * least one call get a slot. `ever_spilled` is the union of every
+     * call's live-after set; `slot_of[bit]` maps a spill bit
+     * (reg - 8) to its compact slot index, or 0xFF if the reg never
+     * crossed a call. `spill_slot_count` is the number of distinct
+     * slots — `spill_bytes = spill_slot_count * 4`. The mapping is
+     * recomputed in `cg_function` after `cg_compute_call_liveouts`. */
+    cg_bits           ever_spilled;
+    uint8_t           slot_of[256];
+    int               spill_slot_count;
 
     uint8_t           zero_reg;       /* register holding 0, for branch tests */
     LLVMBasicBlockRef cur_block;      /* updated during emit walk */
@@ -690,6 +751,10 @@ static void cg_reset_function_state(struct cg *cg) {
     cg->cur_block = NULL;
     cg->fn_name = NULL;
     cg->call_live_count = 0;
+    cg_bits_clear(&cg->ever_spilled);
+    memset(cg->slot_of, 0xFF, sizeof cg->slot_of);
+    cg->spill_slot_count = 0;
+    cg->table_fixup_count = 0;
 }
 
 static int cg_import_lookup_or_add(struct cg *cg, LLVMValueRef callee,
@@ -803,6 +868,42 @@ static uint8_t cg_reg_for(struct cg *cg, LLVMValueRef v) {
         return r;
     }
 
+    /* f32 constants. LLVM stores them as `double` internally — the C API
+     * gives a `double`, so we cast to `float` and reinterpret to i32 to
+     * recover the IEEE binary32 bit pattern that goes into the register.
+     * The narrowing is safe: the value originally came from a `float`
+     * literal, so the round-trip is exact for all but the most twisted
+     * IR (which the type subset rejects upstream anyway). */
+    if (LLVMIsAConstantFP(v)) {
+        LLVMTypeRef ty = LLVMTypeOf(v);
+        if (LLVMGetTypeKind(ty) != LLVMFloatTypeKind) {
+            ERR(cg->fn_name,
+                "non-f32 floating-point constant — only float supported");
+            cg->had_error = 1;
+            return 0;
+        }
+        LLVMBool lossy = 0;
+        double   d     = LLVMConstRealGetDouble(v, &lossy);
+        float    f     = (float)d;
+        int32_t  bits;
+        memcpy(&bits, &f, sizeof bits);
+        uint8_t r = cg_alloc_reg(cg);
+        if (cg->had_error) return 0;
+        cg_emit_load_const32(cg, r, bits);
+        return r;
+    }
+
+    /* `undef` (and `poison`, its strict subclass) appears when a value is
+     * dynamically dead on some incoming PHI edge — clang emits it when
+     * -O1 merges control flow that "can't" actually use the value. We
+     * just hand back the dedicated zero register: the dynamic path that
+     * would observe this value is dead by construction, and reusing
+     * zero_reg avoids the per-use register churn a fresh MOVI would
+     * cause (each call site for a phi input goes through cg_reg_for). */
+    if (LLVMIsUndef(v)) {
+        return cg->zero_reg;
+    }
+
     if (cg->globals && LLVMIsAGlobalVariable(v)) {
         int idx = cg_globals_lookup(cg->globals, v);
         if (idx < 0) {
@@ -879,6 +980,43 @@ static void cg_queue_fixup(struct cg *cg, uint32_t inst_index,
     cg->fixups[cg->fixup_count].shift = shift;
     cg->fixups[cg->fixup_count].bits = bits;
     cg->fixup_count++;
+}
+
+static int cg_queue_table_fixup(struct cg *cg, uint32_t data_off,
+                                LLVMBasicBlockRef target)
+{
+    if (cg->table_fixup_count == cg->table_fixup_cap) {
+        cg->table_fixup_cap = cg->table_fixup_cap ? cg->table_fixup_cap * 2 : 16;
+        cg->table_fixups = (struct cg_table_fixup *)realloc(cg->table_fixups,
+                                cg->table_fixup_cap * sizeof(*cg->table_fixups));
+        if (!cg->table_fixups) { perror("realloc"); return 1; }
+    }
+    cg->table_fixups[cg->table_fixup_count].data_off = data_off;
+    cg->table_fixups[cg->table_fixup_count].target   = target;
+    cg->table_fixup_count++;
+    return 0;
+}
+
+/* Resolve every queued switch jump-table entry. Runs after branch
+ * relaxation so block_offsets are stable; writes the absolute
+ * instruction index of each target block into globals.data_bytes at
+ * the entry's reserved 4-byte slot, little-endian. */
+static int cg_resolve_table_fixups(struct cg *cg) {
+    for (int i = 0; i < cg->table_fixup_count; ++i) {
+        struct cg_table_fixup *fx = &cg->table_fixups[i];
+        int b = cg_find_block(cg, fx->target);
+        if (b < 0) {
+            ERR(cg->fn_name, "internal: table fixup target block not found");
+            return 1;
+        }
+        uint32_t off = cg->block_offsets[b];
+        uint8_t *p   = cg->globals->data_bytes + fx->data_off;
+        p[0] = (uint8_t)(off);
+        p[1] = (uint8_t)(off >>  8);
+        p[2] = (uint8_t)(off >> 16);
+        p[3] = (uint8_t)(off >> 24);
+    }
+    return 0;
 }
 
 /* Branch relaxation: convert any conditional branch (`BNE`/`BEQ` with imm8)
@@ -1005,6 +1143,11 @@ static int cg_relax_branches(struct cg *cg) {
     free(cg->code);
     cg->code  = new_code;
     cg->count = new_size;
+    cg->cap   = new_size;   /* malloc above sized to exactly new_size; cg_emit
+                             * compares count == cap to decide when to grow,
+                             * so leaving the old (larger) cap behind would
+                             * let the next function's emit write past the
+                             * fresh allocation. */
     free(new_pos_of);
     free(relaxed);
     return 0;
@@ -1516,21 +1659,42 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
      * counted in spill_bytes. */
     cg->ssa_reg_high = cg->next_reg;
 
-    /* Spill area: one slot per pre-allocated SSA register (R8..R(ssa_reg_high-1)).
-     * Frame layout (low → high): [alloca area | spill area]. The frame is
-     * adjusted once at prologue and reverted at every RET. Anything that
-     * needs to push beyond it (stacked args during a CALL) walks SP further
-     * down only inside that call sequence. */
-    cg->spill_bytes = (uint32_t)(cg->ssa_reg_high - 8) * 4u;
-    cg->frame_bytes = cg->alloca_bytes + cg->spill_bytes;
-    cg->funcs[func_idx].frame_size = cg->frame_bytes;
-
     /* Liveness analysis: lets the LLVMCall handler spill only the SSA
-     * registers actually live across each call site. Slot assignment in
-     * the spill area is unchanged (slot k for register 8+k); we just emit
-     * fewer STW/LDW pairs around each CALL. */
+     * registers actually live across each call site. */
     cg_compute_liveness(cg, fn);
     cg_compute_call_liveouts(cg);
+
+    /* Compact spill layout. The naïve mapping is one slot per
+     * pre-allocated SSA register (R8..R(ssa_reg_high-1)); the
+     * compacted version only allocates a slot when the register is
+     * live across at least one call. For SSA values that never cross
+     * a call (most temporaries in a leaf function), no slot is
+     * needed, and frame_bytes shrinks accordingly.
+     *
+     * Layout (low → high): [alloca area | spill area]. The spill area
+     * holds spill_slot_count i32 slots; slot_of[bit] gives the compact
+     * index for SSA reg (bit + 8), or 0xFF if the reg never crossed a
+     * call (no slot reserved — the LLVMCall handler must not write to
+     * such a register). */
+    int spill_count = cg->ssa_reg_high - 8;
+    if (spill_count > (int)sizeof(cg->slot_of)) {
+        ERR(cg->fn_name,
+            "internal: ssa_reg_high - 8 = %d exceeds slot_of[] capacity (%zu)",
+            spill_count, sizeof(cg->slot_of));
+        return 1;
+    }
+    cg_bits_clear(&cg->ever_spilled);
+    for (int i = 0; i < cg->call_live_count; ++i)
+        cg_bits_or(&cg->ever_spilled, &cg->call_lives[i].live_after);
+    memset(cg->slot_of, 0xFF, sizeof cg->slot_of);
+    cg->spill_slot_count = 0;
+    for (int k = 0; k < spill_count; ++k) {
+        if (cg_bits_test(&cg->ever_spilled, (unsigned)k))
+            cg->slot_of[k] = (uint8_t)cg->spill_slot_count++;
+    }
+    cg->spill_bytes = (uint32_t)cg->spill_slot_count * 4u;
+    cg->frame_bytes = cg->alloca_bytes + cg->spill_bytes;
+    cg->funcs[func_idx].frame_size = cg->frame_bytes;
 
     /* Prologue: SUB SP, SP, frame. */
     if (cg_sp_sub(cg, cg->frame_bytes)) return 1;
@@ -1634,6 +1798,86 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 break;
             }
 
+            /* f32 binops. Mirror the integer-binop pattern; the ISA gives
+             * us a 1:1 opcode for each LLVM op so no synthesis is needed. */
+            case LLVMFAdd: case LLVMFSub: case LLVMFMul: case LLVMFDiv: {
+                uint8_t lhs = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                uint8_t rhs = cg_reg_for(cg, LLVMGetOperand(i, 1));
+                uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                uint8_t cv;
+                switch (op) {
+                case LLVMFAdd: cv = CVM_OP_FADD; break;
+                case LLVMFSub: cv = CVM_OP_FSUB; break;
+                case LLVMFMul: cv = CVM_OP_FMUL; break;
+                case LLVMFDiv: cv = CVM_OP_FDIV; break;
+                default:       cv = CVM_OP_FADD; break; /* unreachable */
+                }
+                cg_emit(cg, enc_r(cv, dst, lhs, rhs));
+                break;
+            }
+
+            case LLVMFNeg: {
+                uint8_t src = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                cg_emit(cg, enc_r(CVM_OP_FNEG, dst, src, 0));
+                break;
+            }
+
+            case LLVMFCmp: {
+                /* LLVM has 14 FP predicates split into ordered (`O*`,
+                 * NaN→false) and unordered (`U*`, NaN→true) flavours.
+                 * The natural C operators map cleanly to a small subset:
+                 *   ==  → OEQ (FCMP_EQ)
+                 *   !=  → UNE (FCMP_NE)        — matches IEEE C semantics
+                 *   <   → OLT (FCMP_LT)
+                 *   <=  → OLE (FCMP_LE)
+                 *   >   → OGT (FCMP_LT, swap)
+                 *   >=  → OGE (FCMP_LE, swap)
+                 * The other eight predicates (ONE, UEQ, ULT, ULE, UGT,
+                 * UGE, ORD, UNO, FALSE, TRUE) almost never appear from
+                 * straight C code; reject and ask the user to rewrite. */
+                LLVMRealPredicate p = LLVMGetFCmpPredicate(i);
+                int op2 = -1, swap = 0;
+                switch (p) {
+                case LLVMRealOEQ: op2 = CVM_OP_FCMP_EQ;             break;
+                case LLVMRealUNE: op2 = CVM_OP_FCMP_NE;             break;
+                case LLVMRealOLT: op2 = CVM_OP_FCMP_LT;             break;
+                case LLVMRealOLE: op2 = CVM_OP_FCMP_LE;             break;
+                case LLVMRealOGT: op2 = CVM_OP_FCMP_LT; swap = 1;   break;
+                case LLVMRealOGE: op2 = CVM_OP_FCMP_LE; swap = 1;   break;
+                default: break;
+                }
+                if (op2 < 0) {
+                    ERR(cg->fn_name,
+                        "fcmp predicate %d not in the supported subset "
+                        "(use ==, !=, <, <=, >, >=)", (int)p);
+                    cg->had_error = 1;
+                    break;
+                }
+                uint8_t lhs = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                uint8_t rhs = cg_reg_for(cg, LLVMGetOperand(i, 1));
+                uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                if (swap) cg_emit(cg, enc_r((uint8_t)op2, dst, rhs, lhs));
+                else      cg_emit(cg, enc_r((uint8_t)op2, dst, lhs, rhs));
+                break;
+            }
+
+            case LLVMSIToFP: case LLVMUIToFP:
+            case LLVMFPToSI: case LLVMFPToUI: {
+                uint8_t src = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                uint8_t cv;
+                switch (op) {
+                case LLVMSIToFP: cv = CVM_OP_I2F_S; break;
+                case LLVMUIToFP: cv = CVM_OP_I2F_U; break;
+                case LLVMFPToSI: cv = CVM_OP_F2I_S; break;
+                case LLVMFPToUI: cv = CVM_OP_F2I_U; break;
+                default:         cv = CVM_OP_I2F_S; break; /* unreachable */
+                }
+                cg_emit(cg, enc_r(cv, dst, src, 0));
+                break;
+            }
+
             case LLVMSelect: {
                 uint8_t cond = cg_reg_for(cg, LLVMGetOperand(i, 0));
                 uint8_t a    = cg_reg_for(cg, LLVMGetOperand(i, 1));
@@ -1672,25 +1916,31 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
             }
 
             case LLVMSwitch: {
-                /* Lowered as a chained linear search: for each case k,
-                 * emit `CMP_EQ tmp, cond, case_const_k; BNE tmp, zero,
-                 * case_bb_k`. After all cases, fall through to a `JMP
-                 * default_bb`.
+                /* Two lowerings:
+                 *   - **Chain**: for each case k, `CMP_EQ tmp, cond, ck;
+                 *     BNE tmp, zero, case_bb_k`, then `JMP default_bb`.
+                 *     O(N) dispatch. Always emitted for sparse / few-case
+                 *     switches.
+                 *   - **Table**: a u32[N_range] table in DATA holding
+                 *     absolute instruction indices, one per slot in
+                 *     [case_min, case_max]. Dispatch is bounds-check +
+                 *     LDW + JMPR. O(1). Emitted when N_cases ≥ 4 AND
+                 *     density ≥ 0.5 (i.e. range ≤ 2 × N_cases).
                  *
                  * Phi moves for every successor (default + each case) are
-                 * emitted up front, before any case test. Each successor's
-                 * phi-result registers are unique to that successor (SSA
-                 * gives every value its own pre-allocated register), so
-                 * the moves don't interfere with each other and the
-                 * dispatch sequence (which only touches transient temps
-                 * above ssa_reg_high) doesn't disturb the phi values. A
-                 * dense jump-table form would be faster for switches with
-                 * many contiguous cases but needs a new opcode (`JMPR`);
-                 * the chained form here is opcode-neutral. */
-                /* LLVMGetCondition is only valid for LLVMBranchInst; on a
-                 * switch it returns NULL. The condition is at operand 0
-                 * (the same slot as Branch's condition, but accessed via
-                 * the generic operand interface). */
+                 * emitted up front, before any test or table dispatch.
+                 * Each successor's phi-result registers are unique to
+                 * that successor (SSA gives every value its own pre-
+                 * allocated register), so the moves don't interfere with
+                 * each other and the dispatch sequence (which only
+                 * touches transient temps above ssa_reg_high) doesn't
+                 * disturb the phi values.
+                 *
+                 * `LLVMGetCondition` is only valid for `LLVMBranchInst`;
+                 * on a switch it returns NULL. The condition is at
+                 * operand 0. Case constants are only reachable via
+                 * `LLVMGetSwitchCaseValue` — the generic operand list
+                 * exposes successor blocks but not the constants. */
                 LLVMValueRef       cond_v     = LLVMGetOperand(i, 0);
                 LLVMBasicBlockRef  default_bb = LLVMGetSwitchDefaultDest(i);
                 uint8_t            cond_reg   = cg_reg_for(cg, cond_v);
@@ -1701,39 +1951,148 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                  * guarantees ≥ 1 (the default). Switches with zero cases
                  * are degenerate but legal — they reduce to a JMP. */
                 cg_emit_phi_moves(cg, cg->cur_block, default_bb);
-                for (unsigned k = 1; k < n_succ; ++k) {
-                    LLVMBasicBlockRef case_bb = LLVMGetSuccessor(i, k);
-                    cg_emit_phi_moves(cg, cg->cur_block, case_bb);
-                }
+                for (unsigned k = 1; k < n_succ; ++k)
+                    cg_emit_phi_moves(cg, cg->cur_block, LLVMGetSuccessor(i, k));
                 if (cg->had_error) break;
 
-                for (unsigned k = 1; k < n_succ; ++k) {
-                    /* LLVM's C API doesn't expose case constants through
-                     * the generic operand list; only successor blocks are
-                     * there. `LLVMGetSwitchCaseValue(switch, i)` is the
-                     * dedicated accessor — `i` is the successor index,
-                     * with 0 = default and 1..N = cases (matching
-                     * LLVMGetSuccessor's indexing). */
-                    LLVMValueRef      case_val = LLVMGetSwitchCaseValue(i, k);
-                    LLVMBasicBlockRef case_bb  = LLVMGetSuccessor(i, k);
-                    if (!case_val || !LLVMIsAConstantInt(case_val)) {
+                unsigned n_cases = n_succ - 1;
+
+                /* Decide chain vs table. Both heuristic conditions
+                 * (N_cases ≥ 4, range ≤ 2 × N_cases) must hold; with
+                 * range ≤ 2 × N_cases the table wastes at most one
+                 * default-pointing slot per real case. */
+                int     use_table = 0;
+                int32_t lo = 0, hi = 0;
+                uint32_t n_range = 0;
+                if (n_cases >= 4) {
+                    int valid = 1;
+                    for (unsigned k = 1; k < n_succ; ++k) {
+                        LLVMValueRef cv = LLVMGetSwitchCaseValue(i, k);
+                        if (!cv || !LLVMIsAConstantInt(cv)) { valid = 0; break; }
+                        long long v = LLVMConstIntGetSExtValue(cv);
+                        if (v < INT32_MIN || v > INT32_MAX) { valid = 0; break; }
+                        int32_t iv = (int32_t)v;
+                        if (k == 1) { lo = hi = iv; }
+                        else { if (iv < lo) lo = iv; if (iv > hi) hi = iv; }
+                    }
+                    if (valid) {
+                        int64_t range = (int64_t)hi - (int64_t)lo + 1;
+                        if (range > 0 && range <= 2 * (int64_t)n_cases) {
+                            n_range   = (uint32_t)range;
+                            use_table = 1;
+                        }
+                    }
+                }
+
+                if (use_table) {
+                    /* Reserve N_range × 4 bytes in DATA and queue a table
+                     * fixup per slot. Slots default to default_bb;
+                     * present cases overwrite their slot's target. */
+                    uint32_t table_off = cg->globals->data_size;
+                    cg_data_reserve(cg->globals, table_off + n_range * 4u);
+                    cg->globals->data_size = table_off + n_range * 4u;
+
+                    LLVMBasicBlockRef *targets =
+                        (LLVMBasicBlockRef *)malloc(n_range * sizeof(*targets));
+                    if (!targets) {
+                        ERR(cg->fn_name, "malloc"); cg->had_error = 1; break;
+                    }
+                    for (uint32_t k = 0; k < n_range; ++k) targets[k] = default_bb;
+                    for (unsigned k = 1; k < n_succ; ++k) {
+                        LLVMValueRef cv = LLVMGetSwitchCaseValue(i, k);
+                        int32_t  v   = (int32_t)LLVMConstIntGetSExtValue(cv);
+                        uint32_t idx = (uint32_t)(v - lo);
+                        targets[idx] = LLVMGetSuccessor(i, k);
+                    }
+                    for (uint32_t k = 0; k < n_range; ++k) {
+                        if (cg_queue_table_fixup(cg, table_off + k * 4u,
+                                                 targets[k]) != 0) {
+                            cg->had_error = 1; break;
+                        }
+                    }
+                    free(targets);
+                    if (cg->had_error) break;
+
+                    /* Dispatch sequence:
+                     *   SUB     off, cond, lo
+                     *   CMP_LTU inrange, off, n_range
+                     *   BEQ     inrange, zero, +M     ; skip past JMPR
+                     *   MOVI    two, 2
+                     *   SHL     idx, off, two
+                     *   MOVI(/MOVHI) base, table_off
+                     *   ADD     addr, base, idx
+                     *   LDW     target, addr
+                     *   JMPR    target
+                     *   JMP     default_bb            ; landing for BEQ */
+                    uint8_t lo_reg = cg_alloc_reg(cg); if (cg->had_error) break;
+                    cg_emit_load_const32(cg, lo_reg, lo);
+                    if (cg->had_error) break;
+                    uint8_t off_reg = cg_alloc_reg(cg); if (cg->had_error) break;
+                    cg_emit(cg, enc_r(CVM_OP_SUB, off_reg, cond_reg, lo_reg));
+                    uint8_t n_reg = cg_alloc_reg(cg); if (cg->had_error) break;
+                    cg_emit_load_const32(cg, n_reg, (int32_t)n_range);
+                    if (cg->had_error) break;
+                    uint8_t inrange = cg_alloc_reg(cg); if (cg->had_error) break;
+                    cg_emit(cg, enc_r(CVM_OP_CMP_LTU, inrange, off_reg, n_reg));
+
+                    /* BEQ placeholder; backpatched once M is known. */
+                    uint32_t beq_pos = cg->count;
+                    cg_emit(cg, 0);
+
+                    uint8_t two_reg = cg_alloc_reg(cg); if (cg->had_error) break;
+                    cg_emit(cg, enc_i16(CVM_OP_MOVI, two_reg, 2));
+                    uint8_t idx_reg = cg_alloc_reg(cg); if (cg->had_error) break;
+                    cg_emit(cg, enc_r(CVM_OP_SHL, idx_reg, off_reg, two_reg));
+                    uint8_t base_reg = cg_alloc_reg(cg); if (cg->had_error) break;
+                    cg_emit_load_const32(cg, base_reg, (int32_t)table_off);
+                    if (cg->had_error) break;
+                    uint8_t addr_reg = cg_alloc_reg(cg); if (cg->had_error) break;
+                    cg_emit(cg, enc_r(CVM_OP_ADD, addr_reg, base_reg, idx_reg));
+                    uint8_t target_reg = cg_alloc_reg(cg); if (cg->had_error) break;
+                    cg_emit(cg, enc_r(CVM_OP_LDW, target_reg, addr_reg, 0));
+                    cg_emit(cg, enc_r(CVM_OP_JMPR, target_reg, 0, 0));
+
+                    /* Backpatch the BEQ to land just after JMPR (i.e.
+                     * on the default JMP below). The skip distance is
+                     * always small (≤ 9 instructions) and well within
+                     * imm8, so no relaxation fixup is needed. */
+                    int32_t skip = (int32_t)(cg->count - (beq_pos + 1));
+                    if (skip < -128 || skip > 127) {
                         ERR(cg->fn_name,
-                            "switch case operand is not a constant integer");
+                            "internal: switch-table BEQ skip %d outside imm8 range",
+                            skip);
                         cg->had_error = 1;
                         break;
                     }
-                    uint8_t case_reg = cg_reg_for(cg, case_val);
-                    if (cg->had_error) break;
-                    uint8_t tmp = cg_alloc_reg(cg);
-                    if (cg->had_error) break;
-                    cg_emit(cg, enc_r(CVM_OP_CMP_EQ, tmp, cond_reg, case_reg));
-                    cg_queue_fixup(cg, cg->count, case_bb, 24, 8);
-                    cg_emit(cg, enc_br(CVM_OP_BNE, tmp, cg->zero_reg, 0));
-                }
-                if (cg->had_error) break;
+                    cg->code[beq_pos] = enc_br(CVM_OP_BEQ, inrange,
+                                               cg->zero_reg, (int8_t)skip);
 
-                cg_queue_fixup(cg, cg->count, default_bb, 8, 24);
-                cg_emit(cg, enc_i24(CVM_OP_JMP, 0));
+                    cg_queue_fixup(cg, cg->count, default_bb, 8, 24);
+                    cg_emit(cg, enc_i24(CVM_OP_JMP, 0));
+                } else {
+                    /* Chain form. */
+                    for (unsigned k = 1; k < n_succ; ++k) {
+                        LLVMValueRef      case_val = LLVMGetSwitchCaseValue(i, k);
+                        LLVMBasicBlockRef case_bb  = LLVMGetSuccessor(i, k);
+                        if (!case_val || !LLVMIsAConstantInt(case_val)) {
+                            ERR(cg->fn_name,
+                                "switch case operand is not a constant integer");
+                            cg->had_error = 1;
+                            break;
+                        }
+                        uint8_t case_reg = cg_reg_for(cg, case_val);
+                        if (cg->had_error) break;
+                        uint8_t tmp = cg_alloc_reg(cg);
+                        if (cg->had_error) break;
+                        cg_emit(cg, enc_r(CVM_OP_CMP_EQ, tmp, cond_reg, case_reg));
+                        cg_queue_fixup(cg, cg->count, case_bb, 24, 8);
+                        cg_emit(cg, enc_br(CVM_OP_BNE, tmp, cg->zero_reg, 0));
+                    }
+                    if (cg->had_error) break;
+
+                    cg_queue_fixup(cg, cg->count, default_bb, 8, 24);
+                    cg_emit(cg, enc_i24(CVM_OP_JMP, 0));
+                }
                 break;
             }
 
@@ -2020,6 +2379,54 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     break;
                 }
 
+                /* `cvm_intrin_*` extern declarations from the runtime
+                 * intrinsics header lower to a single opcode instead of a
+                 * CALL — there's no body anywhere; the name exists only
+                 * so clang has something to reference in the IR. */
+                {
+                    int is_mulh    = (strcmp(name, "cvm_intrin_mulh")       == 0);
+                    int is_mulhu   = (strcmp(name, "cvm_intrin_mulhu")      == 0);
+                    int is_f2i_s   = (strcmp(name, "cvm_intrin_f2i_sat_s")  == 0);
+                    int is_f2i_u   = (strcmp(name, "cvm_intrin_f2i_sat_u")  == 0);
+
+                    int two_arg_op = -1;   /* MULH/MULHU shape */
+                    int one_arg_op = -1;   /* F2I_* shape */
+                    if (is_mulh)       two_arg_op = CVM_OP_MULH;
+                    else if (is_mulhu) two_arg_op = CVM_OP_MULHU;
+                    else if (is_f2i_s) one_arg_op = CVM_OP_F2I_S;
+                    else if (is_f2i_u) one_arg_op = CVM_OP_F2I_U;
+
+                    if (two_arg_op >= 0) {
+                        if (LLVMGetNumArgOperands(i) != 2) {
+                            ERR(cg->fn_name,
+                                "%s expects 2 args, got %u", name,
+                                LLVMGetNumArgOperands(i));
+                            cg->had_error = 1;
+                            break;
+                        }
+                        uint8_t lhs = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                        uint8_t rhs = cg_reg_for(cg, LLVMGetOperand(i, 1));
+                        uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                        if (cg->had_error) break;
+                        cg_emit(cg, enc_r((uint8_t)two_arg_op, dst, lhs, rhs));
+                        break;
+                    }
+                    if (one_arg_op >= 0) {
+                        if (LLVMGetNumArgOperands(i) != 1) {
+                            ERR(cg->fn_name,
+                                "%s expects 1 arg, got %u", name,
+                                LLVMGetNumArgOperands(i));
+                            cg->had_error = 1;
+                            break;
+                        }
+                        uint8_t src = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                        uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                        if (cg->had_error) break;
+                        cg_emit(cg, enc_r((uint8_t)one_arg_op, dst, src, 0));
+                        break;
+                    }
+                }
+
                 /* min/max family. Lowered as cmp + branch + 2 MOVs. */
                 int is_min = 0, is_signed = 0, is_minmax = 0;
                 if (strcmp(name, "llvm.smax.i32") == 0) { is_minmax = 1; is_signed = 1; }
@@ -2202,7 +2609,13 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                  *    (that register is exclusively assigned to the SSA
                  *    value the call is about to define), and the post-call
                  *    `MOV dst, R0` writes the actual return value, so a
-                 *    spill/restore round-trip would just shuffle garbage. */
+                 *    spill/restore round-trip would just shuffle garbage.
+                 *
+                 *    Each spilled reg lands at slot_of[bit] within the
+                 *    spill area (post-allocation compact index, not the
+                 *    raw bit). slot_of[bit] == 0xFF means the analysis
+                 *    didn't see this reg crossing any call, so no slot
+                 *    exists and the spill must be skipped. */
                 cg_bits spill_set;
                 const cg_bits *live = cg_lookup_call_live(cg, i);
                 if (live) {
@@ -2211,20 +2624,23 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     if (my_bit >= 0)
                         cg_bits_clear_bit(&spill_set, (unsigned)my_bit);
                 } else {
-                    /* Defensive fallback: if liveness wasn't recorded for
-                     * this call (shouldn't happen — every LLVMCall is
-                     * snapshotted), fall back to spilling everything so
-                     * correctness never depends on the analysis. */
-                    cg_bits_clear(&spill_set);
-                    int sc = cg->ssa_reg_high - 8;
-                    for (int k = 0; k < sc; ++k)
-                        cg_bits_set(&spill_set, (unsigned)k);
+                    /* Defensive fallback: if liveness wasn't recorded
+                     * for this call (shouldn't happen — every LLVMCall
+                     * is snapshotted), spill the whole ever_spilled set.
+                     * Anything outside it has no slot, so spilling it
+                     * would be a bug anyway. */
+                    spill_set = cg->ever_spilled;
+                    int my_bit = cg_spill_bit_of(cg, i);
+                    if (my_bit >= 0)
+                        cg_bits_clear_bit(&spill_set, (unsigned)my_bit);
                 }
 
                 int spill_count = cg->ssa_reg_high - 8;
                 for (int k = 0; k < spill_count; ++k) {
                     if (!cg_bits_test(&spill_set, (unsigned)k)) continue;
-                    int32_t off = (int32_t)cg->alloca_bytes + k * 4;
+                    uint8_t slot = cg->slot_of[k];
+                    if (slot == 0xFFu) continue;     /* no slot reserved */
+                    int32_t off = (int32_t)cg->alloca_bytes + (int32_t)slot * 4;
                     if (cg_stw_sp_off(cg, off, (uint8_t)(8 + k))) break;
                 }
                 if (cg->had_error) break;
@@ -2263,13 +2679,17 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     if (cg_sp_add(cg, n_stacked * 4u)) break;
                 }
 
-                /* 6. Restore the same registers we spilled in step 1 (and
-                 *    only those; an LDW with no matching STW would load
-                 *    stale spill-area bytes from a previous call site or
-                 *    uninitialised stack memory). */
+                /* 6. Restore the same registers we spilled in step 1
+                 *    (and only those; an LDW with no matching STW would
+                 *    load stale spill-area bytes from a previous call
+                 *    site or uninitialised stack memory). slot_of[k]
+                 *    must mirror step 1 exactly, so the same skip-on-
+                 *    0xFF check applies. */
                 for (int k = 0; k < spill_count; ++k) {
                     if (!cg_bits_test(&spill_set, (unsigned)k)) continue;
-                    int32_t off = (int32_t)cg->alloca_bytes + k * 4;
+                    uint8_t slot = cg->slot_of[k];
+                    if (slot == 0xFFu) continue;
+                    int32_t off = (int32_t)cg->alloca_bytes + (int32_t)slot * 4;
                     if (cg_ldw_sp_off(cg, (uint8_t)(8 + k), off)) break;
                 }
                 if (cg->had_error) break;
@@ -2302,6 +2722,10 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
         cg->had_error = 1;
     if (!cg->had_error && cg_resolve_fixups(cg) != 0)
         cg->had_error = 1;
+    /* Switch jump-table entries are absolute instruction indices, so
+     * they're patched after relaxation freezes block_offsets. */
+    if (!cg->had_error && cg_resolve_table_fixups(cg) != 0)
+        cg->had_error = 1;
     return cg->had_error ? 1 : 0;
 }
 
@@ -2314,6 +2738,12 @@ static void put_u32_le(uint8_t *p, uint32_t v) {
     p[3] = (uint8_t)(v >> 24);
 }
 
+struct cli_region {
+    char     name[16];   /* NUL-terminated within 16 bytes */
+    uint32_t size;
+    uint32_t direction;  /* CVM_REGION_R / W / RW */
+};
+
 static int write_bin(const char *path,
                      const uint32_t *code, uint32_t code_count,
                      const uint8_t *data, uint32_t data_size,
@@ -2322,6 +2752,7 @@ static int write_bin(const char *path,
                      const struct cg_import *imports, int import_count,
                      const struct cg_func *funcs, int func_count,
                      int emit_funcs,
+                     const struct cli_region *regions, int region_count,
                      uint32_t entry)
 {
     FILE *f = fopen(path, "wb");
@@ -2364,12 +2795,31 @@ static int write_bin(const char *path,
             put_u32_le(funcs_buf + (size_t)(k + 1) * 4u, funcs[k].entry_offset);
     }
 
+    /* Build HOST_REGION payload: u32 region_count followed by 28-byte
+     * entries (name[16] + size + direction + flags). The loader assigns
+     * offsets; the binary just declares what it needs. */
+    uint8_t  *regions_buf  = NULL;
+    uint32_t  regions_size = 0;
+    if (region_count > 0) {
+        regions_size = 4u + (uint32_t)region_count * 28u;
+        regions_buf  = (uint8_t *)calloc(1, regions_size);
+        put_u32_le(regions_buf, (uint32_t)region_count);
+        for (int k = 0; k < region_count; ++k) {
+            uint8_t *e = regions_buf + 4u + (size_t)k * 28u;
+            memcpy(e, regions[k].name, 16);
+            put_u32_le(e + 16, regions[k].size);
+            put_u32_le(e + 20, regions[k].direction);
+            put_u32_le(e + 24, 0u);
+        }
+    }
+
     uint32_t section_count = 1u
                            + (data_size          > 0 ? 1u : 0u)
                            + (imports_size       > 0 ? 1u : 0u)
                            + (heap_reserve_size  > 0 ? 1u : 0u)
                            + (stack_reserve_size > 0 ? 1u : 0u)
-                           + (funcs_size         > 0 ? 1u : 0u);
+                           + (funcs_size         > 0 ? 1u : 0u)
+                           + (regions_size       > 0 ? 1u : 0u);
     uint32_t table_off = 24;
     uint32_t code_off  = table_off + section_count * 16;
     uint32_t code_size = code_count * 4u;
@@ -2378,6 +2828,9 @@ static int write_bin(const char *path,
                          ? code_off + code_size + data_size : 0;
     uint32_t funcs_off   = funcs_size > 0
                          ? code_off + code_size + data_size + imports_size : 0;
+    uint32_t regions_off = regions_size > 0
+                         ? code_off + code_size + data_size + imports_size
+                                    + funcs_size : 0;
 
     uint8_t hdr[24] = {0};
     hdr[0] = 'C'; hdr[1] = 'V'; hdr[2] = 'M'; hdr[3] = '1';
@@ -2435,6 +2888,14 @@ static int write_bin(const char *path,
         put_u32_le(sec + 12, 0u);
         fwrite(sec, sizeof(sec), 1, f);
     }
+    if (regions_size > 0) {
+        memset(sec, 0, sizeof(sec));
+        put_u32_le(sec + 0,  CVM_SEC_HOST_REGION);
+        put_u32_le(sec + 4,  regions_off);
+        put_u32_le(sec + 8,  regions_size);
+        put_u32_le(sec + 12, 0u);
+        fwrite(sec, sizeof(sec), 1, f);
+    }
 
     for (uint32_t i = 0; i < code_count; ++i) {
         uint8_t b[4];
@@ -2442,11 +2903,13 @@ static int write_bin(const char *path,
         fwrite(b, sizeof(b), 1, f);
     }
 
-    if (data_size > 0) fwrite(data, 1, data_size, f);
+    if (data_size > 0)    fwrite(data, 1, data_size, f);
     if (imports_size > 0) fwrite(imports_buf, 1, imports_size, f);
     if (funcs_size > 0)   fwrite(funcs_buf, 1, funcs_size, f);
+    if (regions_size > 0) fwrite(regions_buf, 1, regions_size, f);
     free(imports_buf);
     free(funcs_buf);
+    free(regions_buf);
 
     int err = ferror(f);
     fclose(f);
@@ -2462,12 +2925,16 @@ static int write_bin(const char *path,
 static void usage(void) {
     fprintf(stderr,
             "Usage: cvm-translate [-o <out.bin>] [--heap-reserve=N[K|M]] "
-            "[--stack-reserve=N[K|M]] <input.bc>\n"
+            "[--stack-reserve=N[K|M]] [--region=name:size[:rw|r|w]]... <input.bc>\n"
             "  -o <file>            Emit a CronoVM .bin (otherwise validate-only).\n"
             "  --heap-reserve=N     Reserve N bytes of free heap for the user\n"
             "                       allocator. K and M suffixes accepted.\n"
             "  --stack-reserve=N    Reserve N bytes of stack for CALL/RET.\n"
-            "                       Default 16K when the module emits any CALL.\n");
+            "                       Default 16K when the module emits any CALL.\n"
+            "  --region=NAME:SIZE[:DIR]\n"
+            "                       Declare a host-shared region named NAME (max 15\n"
+            "                       chars) of SIZE bytes. DIR is r, w, or rw\n"
+            "                       (default rw). Repeatable.\n");
 }
 
 static int parse_size(const char *s, uint32_t *out) {
@@ -2484,12 +2951,53 @@ static int parse_size(const char *s, uint32_t *out) {
 
 #define CVM_DEFAULT_STACK_RESERVE (16u * 1024u)
 
+/* Parse one --region=name:size[:rw|r|w]. Returns 0 on success. */
+static int parse_region(const char *s, struct cli_region *out) {
+    const char *colon1 = strchr(s, ':');
+    if (!colon1 || colon1 == s) return 1;
+    size_t nlen = (size_t)(colon1 - s);
+    if (nlen >= 16) return 1;          /* leave room for the trailing NUL */
+    memset(out->name, 0, sizeof(out->name));
+    memcpy(out->name, s, nlen);
+    /* Reject characters that would be ambiguous in our serialisation.
+     * Names are arbitrary identifiers, so restrict to printable ASCII. */
+    for (size_t i = 0; i < nlen; ++i) {
+        unsigned char c = (unsigned char)out->name[i];
+        if (c < 0x20 || c >= 0x7Fu) return 1;
+    }
+
+    const char *p = colon1 + 1;
+    char *endp = NULL;
+    unsigned long long v = strtoull(p, &endp, 0);
+    if (endp == p) return 1;
+    if (*endp == 'K' || *endp == 'k')      { v <<= 10; ++endp; }
+    else if (*endp == 'M' || *endp == 'm') { v <<= 20; ++endp; }
+    if (v == 0 || v > 0x7FFFFFFFu) return 1;
+    out->size = (uint32_t)v;
+
+    out->direction = CVM_REGION_RW;    /* default */
+    if (*endp == ':') {
+        ++endp;
+        if      (strcmp(endp, "r")  == 0) out->direction = CVM_REGION_R;
+        else if (strcmp(endp, "w")  == 0) out->direction = CVM_REGION_W;
+        else if (strcmp(endp, "rw") == 0) out->direction = CVM_REGION_RW;
+        else                              return 1;
+    } else if (*endp != '\0') {
+        return 1;
+    }
+    return 0;
+}
+
+#define MAX_CLI_REGIONS 64
+
 int main(int argc, char **argv) {
     const char *input  = NULL;
     const char *output = NULL;
     uint32_t    heap_reserve = 0;
     uint32_t    stack_reserve = 0;
     int         stack_reserve_set = 0;
+    struct cli_region cli_regions[MAX_CLI_REGIONS];
+    int         cli_region_count = 0;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-o") == 0) {
@@ -2508,6 +3016,27 @@ int main(int argc, char **argv) {
                 return 2;
             }
             stack_reserve_set = 1;
+        } else if (strncmp(argv[i], "--region=", 9) == 0) {
+            if (cli_region_count >= MAX_CLI_REGIONS) {
+                fprintf(stderr, "translator: too many --region (max %d)\n",
+                        MAX_CLI_REGIONS);
+                return 2;
+            }
+            struct cli_region *r = &cli_regions[cli_region_count];
+            if (parse_region(argv[i] + 9, r) != 0) {
+                fprintf(stderr, "translator: bad --region value '%s'\n",
+                        argv[i] + 9);
+                return 2;
+            }
+            for (int k = 0; k < cli_region_count; ++k) {
+                if (strncmp(cli_regions[k].name, r->name, 16) == 0) {
+                    fprintf(stderr,
+                            "translator: duplicate --region name '%s'\n",
+                            r->name);
+                    return 2;
+                }
+            }
+            cli_region_count++;
         } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
             fprintf(stderr, "translator: unknown option '%s'\n", argv[i]);
             return 2;
@@ -2622,16 +3151,17 @@ int main(int argc, char **argv) {
                           heap_reserve, stack_size,
                           cg.imports, cg.import_count,
                           cg.funcs, cg.func_count, cg.has_calls,
+                          cli_regions, cli_region_count,
                           entry_off) != 0)
             {
                 rc = 1;
             } else {
                 printf("translator: wrote %s (%u instructions, %u data bytes, "
                        "%d imports, %d funcs, %u heap-reserve, "
-                       "%u stack-reserve)\n",
+                       "%u stack-reserve, %d regions)\n",
                        output, cg.count, globals.data_size,
                        cg.import_count, cg.func_count,
-                       heap_reserve, stack_size);
+                       heap_reserve, stack_size, cli_region_count);
             }
         }
         free(cg.code);
@@ -2640,6 +3170,7 @@ int main(int argc, char **argv) {
         free(cg.blocks);
         free(cg.block_offsets);
         free(cg.fixups);
+        free(cg.table_fixups);
         free(cg.imports);
         free(cg.funcs);
         free(cg.allocas);

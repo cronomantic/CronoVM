@@ -57,6 +57,22 @@ an offset of `0` means "fall through to the next instruction".
 | 0x24 | `MEMCPY` | `A, B, C` | `memcpy(heap+R[A], heap+R[B], R[C])` |
 | 0x25 | `MEMSET` | `A, B, C` | `memset(heap+R[A], R[B] & 0xFF, R[C])` |
 | 0x26 | `MEMMOVE` | `A, B, C` | `memmove(heap+R[A], heap+R[B], R[C])` (overlap-safe) |
+| 0x27 | `MULH` | `A, B, C` | `R[A] = (i32)(((i64)R[B] * (i64)R[C]) >> 32)` (signed high) |
+| 0x28 | `MULHU` | `A, B, C` | `R[A] = (i32)(((u64)R[B] * (u64)R[C]) >> 32)` (unsigned high) |
+| 0x29 | `FADD` | `A, B, C` | `R[A] = bits(f(R[B]) + f(R[C]))` (IEEE 754 binary32) |
+| 0x2A | `FSUB` | `A, B, C` | f32 subtract |
+| 0x2B | `FMUL` | `A, B, C` | f32 multiply |
+| 0x2C | `FDIV` | `A, B, C` | f32 divide; ÷0 → ±Inf, 0/0 → NaN, no trap |
+| 0x2D | `FNEG` | `A, B` | flip sign bit (handles ±0 and NaN uniformly) |
+| 0x2E | `FCMP_EQ` | `A, B, C` | ordered ==  (NaN → 0) |
+| 0x2F | `FCMP_NE` | `A, B, C` | unordered != (NaN → 1; matches C `a != b`) |
+| 0x30 | `FCMP_LT` | `A, B, C` | ordered <  (NaN → 0) |
+| 0x31 | `FCMP_LE` | `A, B, C` | ordered <= (NaN → 0) |
+| 0x32 | `F2I_S` | `A, B` | f32 → i32, **saturating**: NaN → 0, ±overflow → INT32_{MAX,MIN} |
+| 0x33 | `F2I_U` | `A, B` | f32 → u32, saturating: NaN → 0, negatives → 0, overflow → UINT32_MAX |
+| 0x34 | `I2F_S` | `A, B` | i32 → f32 (round-to-nearest-even when magnitude > 2^24) |
+| 0x35 | `I2F_U` | `A, B` | u32 → f32 |
+| 0x36 | `JMPR` | `A` | `pc = (u32)R[A]`, bounds-checked against `code_count`; jump-table dispatcher's primitive |
 
 ### Forms
 
@@ -111,6 +127,107 @@ the lowering target for `llvm.memcpy`/`llvm.memset`/`llvm.memmove` and for
 the `__builtin_mem*` family Clang emits for struct copies and array
 initialisation.
 
+## High-half multiply (MULH / MULHU)
+
+`MUL` returns the low 32 bits of a 32×32 product; `MULH` and `MULHU` return
+the upper 32 bits, signed and unsigned respectively. Together they expose
+the same primitive every embedded ISA exposes (ARM `SMULL`/`UMULL`, MIPS
+`mult`/`mfhi`, RISC-V `MULH`), and are the substitute for the `i64` opcodes
+the design chose not to ship.
+
+```text
+   ; full 64-bit signed product of R8 and R9 lands in (R10:R11):
+   MUL   R10, R8, R9      ; low  32 bits
+   MULH  R11, R8, R9      ; high 32 bits (signed)
+```
+
+The translator surfaces them as extern declarations
+`cvm_intrin_mulh(int32_t, int32_t)` / `cvm_intrin_mulhu(uint32_t, uint32_t)`;
+C code uses the wrappers in `runtime/lib/cvm_intrin.h`:
+
+```c
+#include "cvm_intrin.h"
+
+int32_t lo = (int32_t)((uint32_t)a * (uint32_t)b);    /* MUL */
+int32_t hi = cvm_mulh(a, b);                          /* MULH */
+
+/* Q16.16 fixed-point multiply, full precision, four instructions: */
+int32_t product = cvm_qmul_16_16(a, b);
+```
+
+Calls to these names never reach FUNCS — the translator emits the opcode
+inline. Any other `cvm_intrin_*` name is treated as a regular external
+function and fails the "extern is not supported" check.
+
+## IEEE 754 single-precision floats
+
+`f32` is first-class: a register holds 32 bits and is reinterpreted as
+binary32 inside any `F*` opcode. There is no separate float register
+file — `bitcast f32 → i32` is a no-op MOV.
+
+`double` (and every other floating-point width: `half`, `bfloat`, `x86_fp80`,
+`fp128`, `ppc_fp128`) is **rejected** by the type subset. Code that
+genuinely needs higher precision uses `runtime/lib/cvm_float64.h` (a
+software-emulated double, deferred until a fixture asks for it). The ISA
+itself never grows past 32-bit values in registers.
+
+### Comparisons
+
+LLVM has 14 FP predicates (six "ordered" `O*` that return false when
+either operand is NaN, six "unordered" `U*` that return true on NaN, plus
+`ord` / `uno`). The translator supports the six that natural C code emits:
+
+| C source | LLVM predicate | Lowering |
+| -------- | -------------- | -------- |
+| `a == b` | `oeq` | `FCMP_EQ` |
+| `a != b` | `une` | `FCMP_NE` (matches C's `!=`: NaN counts as unequal) |
+| `a <  b` | `olt` | `FCMP_LT` |
+| `a <= b` | `ole` | `FCMP_LE` |
+| `a >  b` | `ogt` | `FCMP_LT` with operands swapped |
+| `a >= b` | `oge` | `FCMP_LE` with operands swapped |
+
+The other eight (`one`, `ueq`, `ult`, `ule`, `ugt`, `uge`, `ord`, `uno`,
+plus the constants `false`/`true`) are rejected with a clear error;
+they almost never appear from straight C and are easy to rewrite as
+combinations of the six above when needed.
+
+### Saturating float → int
+
+`F2I_S` and `F2I_U` use **pinned saturating semantics**, deterministic
+across every host:
+
+| Input | F2I_S → i32 | F2I_U → u32 |
+| ----- | ----------- | ----------- |
+| NaN | 0 | 0 |
+| `+Inf` or > i32 max | `INT32_MAX` | `UINT32_MAX` |
+| `-Inf` or < i32 min | `INT32_MIN` | 0 |
+| negative finite (F2I_U) | — | 0 |
+| in range | `(int32_t)f` | `(uint32_t)f` |
+
+This matches the modern consensus (ARM `VCVT`, RISC-V `FCVT.W.S`,
+WebAssembly's `*_sat_*` opcodes). x86's `cvttss2si` returns the
+"indefinite integer" `0x80000000` on bad inputs — we explicitly do
+not inherit that, otherwise the same `.bin` would yield different
+results on x86 vs ARM hosts.
+
+There's a subtlety the source language imposes: in C, `(int32_t)f` for
+NaN / out-of-range `f` is **undefined behaviour**, and clang -O1 may
+fold those casts to any value (often 0) before they ever reach the
+opcode. To guarantee saturating from C, route through the runtime
+intrinsics in `cvm_intrin.h`:
+
+```c
+#include "cvm_intrin.h"
+
+int32_t  i = cvm_f2i_sat_s(f);   /* always saturates, even for NaN/Inf */
+uint32_t u = cvm_f2i_sat_u(f);
+```
+
+Both expand to a single F2I_S / F2I_U opcode but the extern call is
+opaque to clang's optimiser, so the runtime saturating semantics are
+preserved. Use plain `(int32_t)f` when you already know the value is
+in range and want max codegen freedom.
+
 ## Wide constants
 
 `MOVI` carries a signed 16-bit immediate, which covers the common case of
@@ -144,6 +261,45 @@ Any additional arguments (the 9th onward) are pushed by the caller on the
 stack at increasing offsets — stacked arg 0 (the 9th overall) sits at
 `SP+4` after `CALL`, stacked arg 1 at `SP+8`, and so on. The caller is
 responsible for restoring SP after `RET`. The return value lands in `R0`.
+
+## Computed jumps (`JMPR`) and dense switches
+
+`JMPR A=rs1` sets `pc = (uint32_t)R[A]` after a single bounds check
+against `code_count`. Unlike `CALL`/`CALLR` it doesn't push a return PC
+or index `FUNCS`; the destination is whatever absolute instruction index
+the register holds. A zero-bit field, no immediate, no inferred return.
+
+The translator uses it for the **table form** of `LLVMSwitch`. For
+sparse or few-case switches the chained `CMP_EQ + BNE` per case stays
+optimal (small instruction count, no DATA footprint), so the lowering
+picks per switch:
+
+| Heuristic | Lowering |
+| --------- | -------- |
+| `n_cases < 4` or `range > 2 × n_cases` | Chained `CMP_EQ + BNE` per case + final `JMP default` (O(N)) |
+| `n_cases ≥ 4` and `range ≤ 2 × n_cases` (density ≥ 0.5) | Jump table in DATA + `LDW + JMPR` (O(1)) |
+
+The table form lays out `n_range` u32 entries in DATA, one per slot in
+`[case_min, case_max]`. Slots without a real case point to `default_bb`;
+present cases overwrite their slot with the case block. Dispatch:
+
+```text
+SUB     off, cond, lo                  ; off = cond - case_min
+CMP_LTU inrange, off, n_range          ; 1 if 0 ≤ off < n_range
+BEQ     inrange, zero, +M              ; not in range → jump to default JMP
+SHL     idx, off, 2                    ; off × 4 (each entry is 4 bytes)
+ADD     addr, table_base, idx
+LDW     target, addr                   ; absolute instruction index
+JMPR    target
+JMP     default_bb                     ; landing for the BEQ skip
+```
+
+Negative case values are handled implicitly by `CMP_LTU`: the `cond -
+lo` underflow wraps to a huge unsigned value, which fails the bounds
+check and falls through to the default. Table entries themselves are
+patched after branch relaxation freezes block offsets — the translator
+queues a `cg_table_fixup` per slot during emission and resolves them
+when block layout is final.
 
 ## Errors raised by the interpreter
 

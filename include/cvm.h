@@ -40,6 +40,18 @@ enum cvm_section_type {
     CVM_SEC_HEAP_RESERVE  = 6,   /* file_off=0, size = free-region bytes */
     CVM_SEC_STACK_RESERVE = 7,   /* file_off=0, size = stack region bytes */
     CVM_SEC_FUNCS         = 8,   /* u32[N] — entry instruction index per func */
+    CVM_SEC_HOST_REGION   = 9,   /* named host-shared regions; payload is
+                                  * u32 region_count followed by 28-byte
+                                  * entries: name[16] + size + direction +
+                                  * flags. Loader carves space inside
+                                  * mem_size and exposes offsets via
+                                  * cvm_image_get_region / cvm_sys_get_region. */
+};
+
+enum cvm_region_dir {
+    CVM_REGION_R  = 1,   /* host writes, VM reads (input, textures) */
+    CVM_REGION_W  = 2,   /* VM writes, host reads (framebuffer, audio) */
+    CVM_REGION_RW = 3,   /* shared in both directions (command buffer) */
 };
 
 enum cvm_result {
@@ -65,6 +77,8 @@ enum cvm_result {
     CVM_E_BAD_FUNC_INDEX,   /* CALL imm24 outside func table */
     CVM_E_STACK_OVERFLOW,   /* SP went past the stack region */
     CVM_E_NULL_FUNC_PTR,    /* CALL/CALLR targeted the reserved slot 0 */
+    CVM_E_BAD_REGION,       /* malformed CVM_SEC_HOST_REGION section */
+    CVM_E_NO_SUCH_REGION,   /* cvm_image_get_region on an unknown name */
 };
 
 /* ---------------------------------------------------------------------------
@@ -80,6 +94,16 @@ enum cvm_result {
  *     MEMCPY  A=rdst, B=rsrc, C=rlen       memcpy (heap+R[A], heap+R[B], R[C])
  *     MEMSET  A=rdst, B=rval, C=rlen       memset (heap+R[A], R[B] & 0xFF, R[C])
  *     MEMMOVE A=rdst, B=rsrc, C=rlen       memmove(heap+R[A], heap+R[B], R[C])
+ *     MULH   A=rd, B=rs1, C=rs2            R[A] = upper32(int64_t)(R[B] * R[C])   (signed)
+ *     MULHU  A=rd, B=rs1, C=rs2            R[A] = upper32(uint64_t)(R[B] * R[C])  (unsigned)
+ *
+ *     FADD/FSUB/FMUL/FDIV  A=rd, B=rs1, C=rs2  IEEE 754 binary32 arith
+ *     FNEG  A=rd, B=rs1                        flip sign bit
+ *     FCMP_EQ/NE/LT/LE  A=rd, B=rs1, C=rs2     EQ/LT/LE are ordered (NaN→0);
+ *                                              NE is unordered (NaN→1) — matches C
+ *     F2I_S / F2I_U  A=rd, B=rs1               saturating: NaN→0, ±overflow→INT_*
+ *     I2F_S / I2F_U  A=rd, B=rs1               int → float, round-to-nearest-even
+ *     JMPR  A=rs1                              pc = (uint32_t)R[A], bounds-checked
  *     MOV   A=rd, B=rs1                    R[A] = R[B]
  *     ADD   A=rd, B=rs1, C=rs2             R[A] = R[B] + R[C]
  *     SUB                                  R[A] = R[B] - R[C]
@@ -207,6 +231,68 @@ enum cvm_opcode {
     CVM_OP_MEMCPY  = 0x24,
     CVM_OP_MEMSET  = 0x25,
     CVM_OP_MEMMOVE = 0x26,
+
+    /* High-half multiply. MUL gives the low 32 bits of a 32×32 product;
+     * MULH / MULHU give the upper 32 bits. With (MUL, MULH) you compose
+     * Q16.16 fixed-point multiply at full precision in four instructions
+     * (MUL, MULH, two shifts) without ever touching a 64-bit value — the
+     * canonical embedded-ISA primitive (ARM SMULL/UMULL, MIPS mult/mfhi,
+     * RISC-V MULH).
+     *   MULH   A=rd, B=rs1, C=rs2   R[A] = (i32)(((i64)R[B] * (i64)R[C]) >> 32)   (signed)
+     *   MULHU  A=rd, B=rs1, C=rs2   R[A] = (i32)(((u64)R[B] * (u64)R[C]) >> 32)   (unsigned)
+     * The translator surfaces them as `cvm_intrin_mulh` / `cvm_intrin_mulhu`
+     * extern decls (see runtime/lib/cvm_intrin.h); C code that uses
+     * cvm_mulh(a, b) compiles to a single MULH instead of a CALL. */
+    CVM_OP_MULH    = 0x27,
+    CVM_OP_MULHU   = 0x28,
+
+    /* IEEE 754 single-precision float ops. f32 values share the i32
+     * register file: a register holds 32 bits and is reinterpreted as
+     * float for the duration of the opcode (host-side memcpy/union).
+     * No `f64` opcodes — `double` is rejected by the translator's type
+     * subset, and a runtime header (cvm_float64.h) provides software
+     * emulation for code that genuinely needs it.
+     *
+     *   FADD/FSUB/FMUL/FDIV  A=rd, B=rs1, C=rs2   IEEE 754 binary32 arithmetic.
+     *                                              FDIV by zero produces ±Inf
+     *                                              (no trap); NaN propagates.
+     *   FNEG                 A=rd, B=rs1          flip the sign bit.
+     *   FCMP_EQ              A=rd, B=rs1, C=rs2   ordered ==  (NaN → 0)
+     *   FCMP_NE              A=rd, B=rs1, C=rs2   unordered != (NaN → 1; matches
+     *                                              C `a != b`).
+     *   FCMP_LT/FCMP_LE      A=rd, B=rs1, C=rs2   ordered <, ≤ (NaN → 0).
+     *   F2I_S / F2I_U        A=rd, B=rs1          float → int32 / uint32, with
+     *                                              saturating semantics: NaN → 0,
+     *                                              +Inf or > max → INT_MAX /
+     *                                              UINT_MAX, -Inf or < min →
+     *                                              INT_MIN / 0. Portable across
+     *                                              hosts (raw `(int)f` would not
+     *                                              be — x86 indefinite vs ARM
+     *                                              saturating).
+     *   I2F_S / I2F_U        A=rd, B=rs1          int32 / uint32 → float; result
+     *                                              rounded to nearest-even when
+     *                                              the magnitude exceeds 2^24. */
+    CVM_OP_FADD    = 0x29,
+    CVM_OP_FSUB    = 0x2A,
+    CVM_OP_FMUL    = 0x2B,
+    CVM_OP_FDIV    = 0x2C,
+    CVM_OP_FNEG    = 0x2D,
+    CVM_OP_FCMP_EQ = 0x2E,
+    CVM_OP_FCMP_NE = 0x2F,
+    CVM_OP_FCMP_LT = 0x30,
+    CVM_OP_FCMP_LE = 0x31,
+    CVM_OP_F2I_S   = 0x32,
+    CVM_OP_F2I_U   = 0x33,
+    CVM_OP_I2F_S   = 0x34,
+    CVM_OP_I2F_U   = 0x35,
+
+    /* Indirect computed jump. Sets pc = (uint32_t)R[A], bounds-checked
+     * against code_count. Distinct from CALLR (which indexes FUNCS and
+     * pushes a return PC); JMPR is the dense-switch / jump-table
+     * dispatcher's primitive. The translator only emits it as the tail
+     * of a jump-table sequence; the table entries are absolute
+     * instruction indices patched in after branch relaxation. */
+    CVM_OP_JMPR    = 0x36,
 };
 
 #define CVM_REG_COUNT 256
@@ -224,24 +310,35 @@ typedef int (*cvm_syscall_fn)(struct cvm_image *img,
                               int32_t *regs,
                               void *user_data);
 
+struct cvm_region {
+    char     name[16];        /* NUL-terminated within 16 bytes */
+    uint32_t offset;          /* assigned by the loader, into img->heap */
+    uint32_t size;
+    uint32_t direction;       /* one of cvm_region_dir; informational only */
+};
+
 struct cvm_image {
     uint32_t *code;
     uint32_t  code_count;
 
     /* Memory layout (single contiguous buffer of mem_size bytes):
      *   heap[0 .. data_size)                            DATA (initialised)
-     *   heap[data_size .. heap_size - reserve_size)     BSS  (zero-filled)
+     *   heap[data_size .. data_size + bss_size)         BSS  (zero-filled)
+     *   heap[... .. ... + region_total)                 REGIONS (zero-filled;
+     *                                                    named host-shared
+     *                                                    slices, offsets via
+     *                                                    cvm_image_get_region)
      *   heap[heap_size - reserve_size .. heap_size)     RESERVE (zero-filled,
      *                                                    free for the user
      *                                                    allocator)
      *   heap[heap_size .. heap_size + stack_size)       STACK (zero-filled,
      *                                                    grows down from top)
      *
-     * heap_size names just the heap portion (data+bss+reserve). LDW/STW
+     * heap_size names just the heap portion (data+bss+regions+reserve). LDW/STW
      * bounds-check against mem_size = heap_size + stack_size so stack
      * accesses use the same opcodes as heap accesses. cvm_sys_heap_start
-     * still returns data_size+bss_size; the stack region is invisible to
-     * the user-side allocator.
+     * still returns heap_size - reserve_size; the stack region is invisible
+     * to the user-side allocator.
      */
     uint8_t  *heap;
     uint32_t  heap_size;
@@ -249,6 +346,11 @@ struct cvm_image {
     uint32_t  reserve_size;
     uint32_t  stack_size;
     uint32_t  mem_size;       /* heap_size + stack_size, for bounds checks */
+
+    /* Host-shared regions, parsed from CVM_SEC_HOST_REGION. Empty if the
+     * binary doesn't declare any. Use cvm_image_get_region for lookups. */
+    struct cvm_region *regions;
+    uint32_t           region_count;
 
     uint32_t  entry;
 
@@ -295,6 +397,19 @@ int cvm_link(struct cvm_image *img,
 
 int cvm_heap_read (struct cvm_image *img, uint32_t addr, void *out, size_t n);
 int cvm_heap_write(struct cvm_image *img, uint32_t addr, const void *in, size_t n);
+
+/* ---------------------------------------------------------------------------
+ * Host-shared region lookup. `name` matches a CVM_SEC_HOST_REGION entry
+ * declared by the binary. On success returns CVM_OK and writes the region's
+ * heap-relative offset and size to the out pointers (either may be NULL).
+ * Returns CVM_E_NO_SUCH_REGION if no region of that name exists. The host
+ * accesses the region's bytes at `img->heap + *out_offset`.
+ * ------------------------------------------------------------------------- */
+
+int cvm_image_get_region(struct cvm_image *img,
+                         const char *name,
+                         uint32_t *out_offset,
+                         uint32_t *out_size);
 
 /* ---------------------------------------------------------------------------
  * Run img to completion. On CVM_OK, *return_value (if non-null) holds the

@@ -48,27 +48,32 @@ appear in any order after the section table.
 | 6 | `HEAP_RESERVE` | no | Zero-filled free region appended after BSS for the user-side allocator; see [memory.md](memory.md). `file_off` must be 0. |
 | 7 | `STACK_RESERVE` | no | Zero-filled stack region above the heap for `CALL`/`RET`. `file_off` must be 0; `size` must be a multiple of 4 and at least 4 (room for the run-completion sentinel). |
 | 8 | `FUNCS` | no | `u32[N]` array of function entry points (instruction indices into CODE), indexed by `CALL imm24`. Required if any `CALL` instruction is emitted. `size` must be a multiple of 4. **Slot 0 is reserved as the null-function-pointer trap target** — the interpreter rejects `CALL imm24=0` / `CALLR R[A]=0` with `CVM_E_NULL_FUNC_PTR` before any indexing, so the value at offset 0 is unused (the translator writes 0). User function `k` (in source order) lives at `FUNCS[k+1]`. |
+| 9 | `HOST_REGION` | no | Named host-shared regions inside `mem_size`. Payload is `u32 region_count` followed by 28-byte entries `{name[16], size:u32, direction:u32, flags:u32}`. The loader carves space between BSS and `HEAP_RESERVE` and assigns each region a heap-relative offset; the host discovers offsets via `cvm_image_get_region`, the binary discovers them at runtime via the `cvm_sys_get_region` built-in syscall. Direction (1=R, 2=W, 3=RW) is informational; the VM does not enforce it. See [memory.md](memory.md). |
 
 Each type may appear at most once except `DEBUG`. CODE is required.
 
 ## Memory layout
 
 After loading, the VM's address space is a single contiguous allocation of
-`data_size + bss_size + heap_reserve + stack_reserve` bytes:
+`data_size + bss_size + region_total + heap_reserve + stack_reserve` bytes:
 
 ```text
-mem  +-----+-----+--------+--------+
-     |DATA |BSS  |RESERVE |STACK   |
-     +-----+-----+--------+--------+
-0       data    data+bss heap_size mem_size
+mem  +-----+-----+---------+--------+--------+
+     |DATA |BSS  |REGIONS  |RESERVE |STACK   |
+     +-----+-----+---------+--------+--------+
+0       data    data+bss   heap     mem_size
+                            -reserve
 ```
 
-The **heap** (DATA + BSS + RESERVE) holds initialised globals, zero
-globals, and the user-side allocator's free region. The **stack region**
-(STACK_RESERVE) sits immediately above and is used by `CALL`/`RET`; SP
-(`R255`) starts at `mem_size` and grows downward. Binaries that don't
-include `HEAP_RESERVE` have no allocator budget; binaries that don't
-include `STACK_RESERVE` cannot use `CALL`/`RET`. See [memory.md](memory.md).
+The **heap** (DATA + BSS + REGIONS + RESERVE) holds initialised globals,
+zero globals, host-shared regions, and the user-side allocator's free
+region. Region offsets are assigned by the loader in declaration order,
+each rounded up to a 4-byte multiple, so the binary doesn't need to know
+where they'll land. The **stack region** (STACK_RESERVE) sits immediately
+above and is used by `CALL`/`RET`; SP (`R255`) starts at `mem_size` and
+grows downward. Binaries that don't include `HEAP_RESERVE` have no
+allocator budget; binaries that don't include `STACK_RESERVE` cannot use
+`CALL`/`RET`. See [memory.md](memory.md).
 
 VM-side addresses are 32-bit byte offsets into this region. Loads and
 stores are bounds-checked against `mem_size`, so the same opcodes can

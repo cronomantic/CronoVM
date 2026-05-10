@@ -10,18 +10,21 @@ reference allocator does for games that don't want to roll their own.
 ## The big picture
 
 ```text
-                       ┌─ data_size  ┌─ data_size + bss_size      ┌─ heap_size
-                       │             │                            │
-heap addr 0  ──────────┴─────────────┴────────────────────────────┴──
-             │   DATA       BSS (zero-filled)  │  free region     │
-             ▼                                 ▼                  ▼
-             initial data       statics        cvm_sys_heap_start()
-                                               cvm_sys_heap_size() bytes long
+heap +------+-------+----------+--------------+
+     | DATA |  BSS  | REGIONS  | free region  |
+     +------+-------+----------+--------------+
+0       data    data+bss    heap_start       heap_size
+                            (cvm_sys_heap_start)
 ```
 
 - `DATA` and `BSS` come from the user's compiled C code, just like in a
   hosted environment. Globals and statics live there.
-- The **free region** beyond BSS is what `malloc` / `free` operate on.
+- `REGIONS` are the host-shared slices declared by the binary via
+  `--region=name:size:dir`. The loader assigns each one a heap-relative
+  offset; the binary discovers it at runtime with `cvm_sys_get_region`,
+  the host gets the same offset via `cvm_image_get_region`. See
+  [regions](#host-shared-regions) below.
+- The **free region** beyond regions is what `malloc` / `free` operate on.
   Its size is declared by the binary itself (see "HEAP_RESERVE section"
   below). If the binary doesn't ask for any, there is no free region.
 - Bounds checking applies across the entire heap; the user-side allocator
@@ -91,14 +94,66 @@ cvm-translate user.bc -o game.bin --heap-reserve=4M
 
 (The flag is sketched here; the syntax may evolve.)
 
-## Reference allocator (`runtime/lib/cvm_alloc.c`)
+## Host-shared regions
+
+A binary can declare named slices of its heap that are visible to the
+host program. Use cases the engine tier needs regardless of renderer
+direction:
+
+| Pattern | Direction | Example use |
+| ------- | --------- | ----------- |
+| Framebuffer | `w` (VM writes, host reads) | Software renderer pixel buffer the host blits to a window. |
+| Command buffer | `w` (VM writes, host reads) | Display-list / draw calls the host consumes at `present()`. |
+| Input state | `r` (host writes, VM reads) | Per-frame controller / keyboard snapshot. |
+| Audio buffer | `w` (VM writes, host reads) | PCM samples the host mixes into the output stream. |
+| Shared comms | `rw` (both) | Anything where both sides update in place. |
+
+The translator declares them with `--region=name:size[:dir]` (default
+direction is `rw`). The loader carves them out of the heap between BSS
+and HEAP_RESERVE, in declaration order, with each size rounded up to a
+4-byte multiple. Names are at most 15 visible chars (16 bytes including
+the trailing NUL).
+
+The `direction` field is **informational** — the VM only enforces heap
+bounds. A future host wrapper can use it to flag misuse (a `w` region
+read by the binary, etc.); the runtime itself does not.
+
+The binary discovers a region's offset at runtime:
+
+```c
+extern int cvm_sys_get_region(const char *name);
+
+int main(void) {
+    int fb_off = cvm_sys_get_region("fb");   /* -1 if not declared */
+    unsigned char *fb = (unsigned char *)fb_off;
+    fb[0] = 0xFF;
+    return 0;
+}
+```
+
+The host discovers the same offset via `cvm_image_get_region`:
+
+```c
+uint32_t fb_off, fb_size;
+if (cvm_image_get_region(&img, "fb", &fb_off, &fb_size) == CVM_OK) {
+    /* img.heap + fb_off is the region's first byte */
+}
+```
+
+`cvm_sys_get_region` returns `-1` for an unknown name (offset 0 cannot
+name a region — regions always sit after DATA+BSS, which together
+occupy at least one byte for any non-trivial binary, and the loader
+rejects empty region names). `cvm_image_get_region` returns
+`CVM_E_NO_SUCH_REGION` in the same case.
+
+## Reference allocator (`runtime/lib/cvm_alloc.h`)
 
 Games that don't want to bring their own allocator can drop in the
-reference one. It's plain portable C — the user compiles it like any
-other source file:
+reference one. It's a header-only library — `#include "cvm_alloc.h"`
+and the helpers compile into the user binary:
 
 ```sh
-clang -emit-llvm -O1 -c game.c runtime/lib/cvm_alloc.c -o game.bc
+clang -emit-llvm -O1 -I runtime/lib -c game.c -o game.bc
 cvm-translate game.bc -o game.bin --heap-reserve=4M
 ```
 
@@ -155,9 +210,13 @@ memory, and zero-fills it. `cvm_sys_heap_start` and `cvm_sys_heap_size`
 are auto-bound built-in syscalls registered on every load. The
 translator accepts `--heap-reserve=N[K|M]` and emits the section.
 
-`runtime/lib/cvm_alloc.h` ships a header-only **bump allocator** as the
-reference: `cvm_alloc_init` / `cvm_malloc` / `cvm_free` (free is a
-no-op for now). It's enough for retro-game patterns of "allocate at
-startup, never free" or "arena reset between levels". A full free-list
-allocator with reclaim lands when CALL/RET enables multi-function
-binaries; the API stays the same.
+`runtime/lib/cvm_alloc.h` ships a header-only **first-fit free-list
+allocator**: `cvm_alloc_init` / `cvm_malloc` / `cvm_free`. Each block
+carries a one-word header (size + free flag in the low bit, no boundary
+tags); `cvm_malloc` walks the heap and splits if the remainder is at
+least one minimum block; `cvm_free` marks the block free and runs a
+single forward coalesce pass merging every adjacent free pair. The
+helpers are `__attribute__((noinline))` so the loop doesn't get inlined
+into every call site — that would otherwise blow past the translator's
+register budget the moment a function makes more than a couple of
+allocations.

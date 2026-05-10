@@ -342,10 +342,19 @@ Exit codes:
 - `1` — input has issues, or write failed; messages on stderr
 - `2` — usage error
 
-The expected pipeline (until `gamecc` is built) is:
+The two-step pipeline is normally driven by the `cvm-cc` wrapper
+(`tools/cvm-cc/`), which runs clang with the right flags and pipes
+the bitcode through:
 
 ```sh
-clang -emit-llvm -O1 -c user.c -o user.bc
+cvm-cc user.c -o game.bin [--heap-reserve=N] [--region=name:size:dir]...
+```
+
+Manual invocation, when you want to inspect the intermediate `.bc` or
+override clang flags directly:
+
+```sh
+clang --target=i386-elf -emit-llvm -O1 -I runtime/lib -c user.c -o user.bc
 cvm-translate user.bc -o game.bin
 ```
 

@@ -32,5 +32,15 @@ target_compile_options(test_e2e PRIVATE
     $<$<C_COMPILER_ID:MSVC>:/W4>
 )
 
+add_executable(test_regions tests/test_regions.c)
+target_link_libraries(test_regions PRIVATE cvm)
+target_compile_options(test_regions PRIVATE
+    $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic>
+    $<$<C_COMPILER_ID:MSVC>:/W4>
+)
+
 # --- Optional: translator (requires LLVM dev install with llvm-config) ----
 add_subdirectory(tools/translator)
+
+# --- cvm-cc: thin driver, no LLVM dependency. Always built. -----------
+add_subdirectory(tools/cvm-cc)

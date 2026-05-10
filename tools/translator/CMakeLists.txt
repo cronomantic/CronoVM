@@ -44,9 +44,10 @@ set(_fixture_out ${CMAKE_CURRENT_BINARY_DIR})
 
 set(_fixture_targets "")
 foreach(name add pick fib abs max divmod bitops counter sum_global
-             alloc_sum two_funcs fib_recursive many_args alloca_swap
-             fnptr dispatch_table narrow_ops mem_intrin long_branch
-             switch_dispatch reject_double)
+             alloc_sum free_list regions mulh float_basic two_funcs
+             fib_recursive many_args alloca_swap fnptr dispatch_table
+             narrow_ops mem_intrin long_branch switch_dispatch
+             switch_table reject_double)
     set(_src ${_fixture_dir}/${name}.c)
     set(_bc  ${_fixture_out}/${name}.bc)
     add_custom_command(
@@ -54,7 +55,9 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
         COMMAND ${CMAKE_C_COMPILER} --target=i386-elf -emit-llvm -O1
                                     -I${CMAKE_SOURCE_DIR}/runtime/lib
                                     -c ${_src} -o ${_bc}
-        DEPENDS ${_src} ${CMAKE_SOURCE_DIR}/runtime/lib/cvm_alloc.h
+        DEPENDS ${_src}
+                ${CMAKE_SOURCE_DIR}/runtime/lib/cvm_alloc.h
+                ${CMAKE_SOURCE_DIR}/runtime/lib/cvm_intrin.h
         VERBATIM
     )
     list(APPEND _fixture_targets ${_bc})
@@ -64,9 +67,9 @@ add_custom_target(translator_fixtures DEPENDS ${_fixture_targets})
 # Emit each .bin via the translator. Depends on cvm-translate + the .bc.
 set(_emit_targets "")
 foreach(name add pick fib abs max divmod bitops counter sum_global
-             two_funcs fib_recursive many_args alloca_swap fnptr
-             dispatch_table narrow_ops mem_intrin long_branch
-             switch_dispatch)
+             mulh float_basic two_funcs fib_recursive many_args
+             alloca_swap fnptr dispatch_table narrow_ops mem_intrin
+             long_branch switch_dispatch switch_table)
     set(_bc  ${_fixture_out}/${name}.bc)
     set(_bin ${_fixture_out}/${name}.bin)
     add_custom_command(
@@ -88,6 +91,31 @@ add_custom_command(
     VERBATIM
 )
 list(APPEND _emit_targets ${_fixture_out}/alloc_sum.bin)
+
+# free_list pins the tail of a 512-byte heap on purpose to force coalescing
+# to be the only path that satisfies the final allocation.
+add_custom_command(
+    OUTPUT  ${_fixture_out}/free_list.bin
+    COMMAND $<TARGET_FILE:cvm-translate> ${_fixture_out}/free_list.bc
+                                          --heap-reserve=512
+                                          -o ${_fixture_out}/free_list.bin
+    DEPENDS cvm-translate ${_fixture_out}/free_list.bc
+    VERBATIM
+)
+list(APPEND _emit_targets ${_fixture_out}/free_list.bin)
+
+# regions: an "input" region (4 B, host writes) and a "fb" region (16 B, VM
+# writes). The host harness pre-fills input, runs, and verifies fb.
+add_custom_command(
+    OUTPUT  ${_fixture_out}/regions.bin
+    COMMAND $<TARGET_FILE:cvm-translate> ${_fixture_out}/regions.bc
+                                          --region=input:4:r
+                                          --region=fb:16:w
+                                          -o ${_fixture_out}/regions.bin
+    DEPENDS cvm-translate ${_fixture_out}/regions.bc
+    VERBATIM
+)
+list(APPEND _emit_targets ${_fixture_out}/regions.bin)
 add_custom_target(translator_emit_fixtures DEPENDS ${_emit_targets})
 
 add_test(NAME translator_build_fixtures
@@ -128,6 +156,12 @@ add_test(NAME e2e_bitops     COMMAND test_e2e ${_fixture_out}/bitops.bin 127  7 
 add_test(NAME e2e_counter    COMMAND test_e2e ${_fixture_out}/counter.bin 7  7)
 add_test(NAME e2e_sum_global COMMAND test_e2e ${_fixture_out}/sum_global.bin 55 10)
 add_test(NAME e2e_alloc_sum  COMMAND test_e2e ${_fixture_out}/alloc_sum.bin 15 5)
+add_test(NAME e2e_free_list  COMMAND test_e2e ${_fixture_out}/free_list.bin  0 0)
+add_test(NAME e2e_regions    COMMAND test_regions ${_fixture_out}/regions.bin)
+add_test(NAME e2e_mulh       COMMAND test_e2e ${_fixture_out}/mulh.bin  0 0)
+add_test(NAME e2e_float_basic COMMAND test_e2e ${_fixture_out}/float_basic.bin 0 0)
+# (cvm-cc's end-to-end test is registered in tools/cvm-cc/CMakeLists.txt
+# so the cvm-cc target exists when the test is being defined.)
 add_test(NAME e2e_two_funcs  COMMAND test_e2e ${_fixture_out}/two_funcs.bin 13 7 5)
 add_test(NAME e2e_fib_rec_10 COMMAND test_e2e ${_fixture_out}/fib_recursive.bin 55 10)
 add_test(NAME e2e_fib_rec_1  COMMAND test_e2e ${_fixture_out}/fib_recursive.bin  1  1)
@@ -161,10 +195,24 @@ add_test(NAME e2e_switch_case_5    COMMAND test_e2e ${_fixture_out}/switch_dispa
 add_test(NAME e2e_switch_case_10   COMMAND test_e2e ${_fixture_out}/switch_dispatch.bin   3 10  7  3)  # x&y
 add_test(NAME e2e_switch_default   COMMAND test_e2e ${_fixture_out}/switch_dispatch.bin  -1 99  7  3)  # default
 add_test(NAME e2e_switch_gap       COMMAND test_e2e ${_fixture_out}/switch_dispatch.bin  -1  3  7  3)  # gap → default
+# switch_table: dense 8-case switch that triggers the jump-table form
+# (n_cases=8, range=8, density=1.0). Each case picks a different binary
+# op on (x=12, y=3); expected values verify which arm ran.
+#                                                                expected op  x   y
+add_test(NAME e2e_switch_tab_add   COMMAND test_e2e ${_fixture_out}/switch_table.bin   15  0  12  3)  # x+y
+add_test(NAME e2e_switch_tab_sub   COMMAND test_e2e ${_fixture_out}/switch_table.bin    9  1  12  3)  # x-y
+add_test(NAME e2e_switch_tab_mul   COMMAND test_e2e ${_fixture_out}/switch_table.bin   36  2  12  3)  # x*y
+add_test(NAME e2e_switch_tab_shl   COMMAND test_e2e ${_fixture_out}/switch_table.bin   96  3  12  3)  # x<<y
+add_test(NAME e2e_switch_tab_or    COMMAND test_e2e ${_fixture_out}/switch_table.bin   15  4  12  3)  # x|y
+add_test(NAME e2e_switch_tab_and   COMMAND test_e2e ${_fixture_out}/switch_table.bin    0  5  12  3)  # x&y
+add_test(NAME e2e_switch_tab_xor   COMMAND test_e2e ${_fixture_out}/switch_table.bin   15  6  12  3)  # x^y
+add_test(NAME e2e_switch_tab_shr   COMMAND test_e2e ${_fixture_out}/switch_table.bin    1  7  12  3)  # x>>y
+add_test(NAME e2e_switch_tab_def   COMMAND test_e2e ${_fixture_out}/switch_table.bin   -1 99  12  3)  # default
 set_tests_properties(
     e2e_add e2e_pick_true e2e_pick_false e2e_fib_10 e2e_fib_0
     e2e_abs_neg e2e_abs_pos e2e_max_lhs e2e_max_rhs
     e2e_divmod e2e_bitops e2e_counter e2e_sum_global e2e_alloc_sum
+    e2e_free_list e2e_regions e2e_mulh e2e_float_basic
     e2e_two_funcs e2e_fib_rec_10 e2e_fib_rec_1 e2e_fib_rec_0
     e2e_many_args e2e_alloca_swap e2e_fnptr_add e2e_fnptr_sub
     e2e_dispatch_add e2e_dispatch_sub e2e_dispatch_mul
@@ -173,4 +221,7 @@ set_tests_properties(
     e2e_switch_case_0 e2e_switch_case_1 e2e_switch_case_2
     e2e_switch_case_5 e2e_switch_case_10
     e2e_switch_default e2e_switch_gap
+    e2e_switch_tab_add e2e_switch_tab_sub e2e_switch_tab_mul
+    e2e_switch_tab_shl e2e_switch_tab_or  e2e_switch_tab_and
+    e2e_switch_tab_xor e2e_switch_tab_shr e2e_switch_tab_def
     PROPERTIES FIXTURES_REQUIRED emitted_bins)

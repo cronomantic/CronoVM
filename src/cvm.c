@@ -5,7 +5,8 @@
 
 #define CVM_HEADER_SIZE   24u
 #define CVM_SECTION_SIZE  16u
-#define CVM_MAX_SEC_TYPE  8u
+#define CVM_MAX_SEC_TYPE  9u
+#define CVM_REGION_ENTRY_SIZE 28u   /* name[16] + size + direction + flags */
 
 static uint32_t read_u32_le(const uint8_t *p) {
     return  (uint32_t)p[0]
@@ -32,12 +33,44 @@ static int builtin_sys_heap_size(struct cvm_image *img,
     return 0;
 }
 
+/* cvm_sys_get_region(name_addr) — name_addr is a heap address pointing at a
+ * NUL-terminated string. Returns the region's offset on hit, or -1 on miss
+ * (the caller can test for a negative return; offset 0 can never name a
+ * region since regions always sit after DATA+BSS). The string is read from
+ * VM memory with bounds checks, so a malicious VM can't escape the heap. */
+static int builtin_sys_get_region(struct cvm_image *img,
+                                  int32_t *regs, void *ud)
+{
+    (void)ud;
+    uint32_t addr = (uint32_t)regs[0];
+    if (addr >= img->heap_size) { regs[0] = -1; return 0; }
+    /* Find a NUL within reach. Cap at 16 since region names are at most 16
+     * bytes (NUL included); a longer string can't possibly match anyway. */
+    uint32_t maxlen = img->heap_size - addr;
+    if (maxlen > 16u) maxlen = 16u;
+    const char *s = (const char *)(img->heap + addr);
+    uint32_t nlen = 0;
+    while (nlen < maxlen && s[nlen] != '\0') ++nlen;
+    if (nlen == maxlen) { regs[0] = -1; return 0; }     /* no NUL in 16 bytes */
+    for (uint32_t i = 0; i < img->region_count; ++i) {
+        if (strncmp(img->regions[i].name, s, 16) == 0
+         && img->regions[i].name[nlen] == '\0')
+        {
+            regs[0] = (int32_t)img->regions[i].offset;
+            return 0;
+        }
+    }
+    regs[0] = -1;
+    return 0;
+}
+
 static const struct {
     const char    *name;
     cvm_syscall_fn fn;
 } BUILTIN_SYSCALLS[] = {
     { "cvm_sys_heap_start", builtin_sys_heap_start },
     { "cvm_sys_heap_size",  builtin_sys_heap_size  },
+    { "cvm_sys_get_region", builtin_sys_get_region },
 };
 
 static void auto_bind_builtins(struct cvm_image *img) {
@@ -85,6 +118,7 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
     uint32_t stack_size = 0;
     uint32_t imports_off = 0, imports_size = 0;
     uint32_t funcs_off = 0, funcs_size = 0;
+    uint32_t regions_off = 0, regions_size = 0;
     int      has_code = 0;
 
     for (uint32_t i = 0; i < section_count; ++i) {
@@ -101,10 +135,10 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
             seen[type] = 1;
         }
 
-        if (type != CVM_SEC_BSS
-         && type != CVM_SEC_HEAP_RESERVE
-         && type != CVM_SEC_STACK_RESERVE)
-        {
+        int has_payload = (type != CVM_SEC_BSS
+                        && type != CVM_SEC_HEAP_RESERVE
+                        && type != CVM_SEC_STACK_RESERVE);
+        if (has_payload) {
             if ((uint64_t)file_off + size > len) return CVM_E_TRUNCATED;
         } else if (file_off != 0) {
             return CVM_E_BAD_SECTION;
@@ -139,6 +173,10 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
             funcs_off  = file_off;
             funcs_size = size;
             break;
+        case CVM_SEC_HOST_REGION:
+            regions_off  = file_off;
+            regions_size = size;
+            break;
         case CVM_SEC_DEBUG:
         default:
             break;
@@ -150,8 +188,46 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
     uint32_t code_count = code_size / 4u;
     if (entry >= code_count) return CVM_E_BAD_ENTRY;
 
+    /* Pre-validate HOST_REGION layout. Each region's payload sits between
+     * BSS and HEAP_RESERVE in img->heap. We round each region's size up to
+     * 4 so that LDW/STW into a region naturally hit aligned addresses. */
+    uint32_t region_count = 0;
+    uint64_t region_total = 0;
+    if (regions_size > 0) {
+        if (regions_size < 4) return CVM_E_BAD_REGION;
+        const uint8_t *rp = base + regions_off;
+        region_count = read_u32_le(rp);
+        if (region_count > 0xFFFFu) return CVM_E_BAD_REGION;
+        uint64_t entries_end = 4u + (uint64_t)region_count * CVM_REGION_ENTRY_SIZE;
+        if (entries_end > regions_size) return CVM_E_BAD_REGION;
+        for (uint32_t i = 0; i < region_count; ++i) {
+            const uint8_t *e = rp + 4u + (size_t)i * CVM_REGION_ENTRY_SIZE;
+            /* Name field must be NUL-terminated within its 16 bytes. */
+            if (memchr(e, 0, 16) == NULL) return CVM_E_BAD_REGION;
+            /* First byte == 0 means an empty name; reject. */
+            if (e[0] == 0) return CVM_E_BAD_REGION;
+            uint32_t rsize = read_u32_le(e + 16);
+            uint32_t rdir  = read_u32_le(e + 20);
+            uint32_t rflag = read_u32_le(e + 24);
+            if (rflag != 0) return CVM_E_BAD_REGION;
+            if (rdir < CVM_REGION_R || rdir > CVM_REGION_RW)
+                return CVM_E_BAD_REGION;
+            /* Reject duplicate names. O(N²) but N is bounded by 65535 in
+             * principle; in practice dozens at most. */
+            for (uint32_t j = 0; j < i; ++j) {
+                const uint8_t *o = rp + 4u + (size_t)j * CVM_REGION_ENTRY_SIZE;
+                if (strncmp((const char *)e, (const char *)o, 16) == 0)
+                    return CVM_E_BAD_REGION;
+            }
+            uint64_t aligned = ((uint64_t)rsize + 3u) & ~(uint64_t)3u;
+            region_total += aligned;
+            if (region_total > 0xFFFFFFFFu) return CVM_E_BAD_REGION;
+        }
+    }
+
     uint64_t heap_total = (uint64_t)data_size
                         + (uint64_t)bss_size
+                        + region_total
                         + (uint64_t)reserve_size;
     if (heap_total > 0xFFFFFFFFu) return CVM_E_BAD_SECTION;
 
@@ -177,14 +253,15 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
         }
     }
 
-    uint32_t       *code         = (uint32_t *)malloc((size_t)code_size);
-    uint8_t        *heap         = NULL;
-    char           *import_blob  = NULL;
-    char          **import_names = NULL;
-    cvm_syscall_fn *import_fns   = NULL;
-    void          **import_ud    = NULL;
-    uint32_t       *func_offsets = NULL;
-    uint32_t        func_count   = 0;
+    uint32_t          *code         = (uint32_t *)malloc((size_t)code_size);
+    uint8_t           *heap         = NULL;
+    char              *import_blob  = NULL;
+    char             **import_names = NULL;
+    cvm_syscall_fn    *import_fns   = NULL;
+    void             **import_ud    = NULL;
+    uint32_t          *func_offsets = NULL;
+    uint32_t           func_count   = 0;
+    struct cvm_region *regions      = NULL;
     if (!code) goto oom;
 
     if (mem_total > 0) {
@@ -195,6 +272,11 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
         func_count   = funcs_size / 4u;
         func_offsets = (uint32_t *)malloc(funcs_size);
         if (!func_offsets) goto oom;
+    }
+    if (region_count > 0) {
+        regions = (struct cvm_region *)calloc(region_count,
+                                              sizeof(struct cvm_region));
+        if (!regions) goto oom;
     }
     if (imports_size > 0) {
         import_blob = (char *)malloc((size_t)imports_size);
@@ -233,6 +315,19 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
         }
     }
 
+    if (region_count > 0) {
+        const uint8_t *rp = base + regions_off;
+        uint32_t cursor = data_size + bss_size;   /* regions sit after BSS */
+        for (uint32_t i = 0; i < region_count; ++i) {
+            const uint8_t *e = rp + 4u + (size_t)i * CVM_REGION_ENTRY_SIZE;
+            memcpy(regions[i].name, e, 16);       /* already validated NUL */
+            regions[i].size      = read_u32_le(e + 16);
+            regions[i].direction = read_u32_le(e + 20);
+            regions[i].offset    = cursor;
+            cursor += (regions[i].size + 3u) & ~(uint32_t)3u;
+        }
+    }
+
     out->code             = code;
     out->code_count       = code_count;
     out->heap             = heap;
@@ -249,6 +344,8 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
     out->import_fns       = import_fns;
     out->import_userdata  = import_ud;
     out->_import_blob     = import_blob;
+    out->regions          = regions;
+    out->region_count     = region_count;
     auto_bind_builtins(out);
     return CVM_OK;
 
@@ -260,6 +357,7 @@ oom:
     free(import_fns);
     free(import_ud);
     free(func_offsets);
+    free(regions);
     return CVM_E_NOMEM;
 }
 
@@ -272,6 +370,7 @@ void cvm_image_free(struct cvm_image *img) {
     free(img->import_userdata);
     free(img->_import_blob);
     free(img->func_offsets);
+    free(img->regions);
     memset(img, 0, sizeof(*img));
 }
 
@@ -305,6 +404,20 @@ int cvm_heap_write(struct cvm_image *img, uint32_t addr, const void *in, size_t 
     return CVM_OK;
 }
 
+int cvm_image_get_region(struct cvm_image *img, const char *name,
+                         uint32_t *out_offset, uint32_t *out_size)
+{
+    if (!img || !name) return CVM_E_NO_SUCH_REGION;
+    for (uint32_t i = 0; i < img->region_count; ++i) {
+        if (strncmp(img->regions[i].name, name, 16) == 0) {
+            if (out_offset) *out_offset = img->regions[i].offset;
+            if (out_size)   *out_size   = img->regions[i].size;
+            return CVM_OK;
+        }
+    }
+    return CVM_E_NO_SUCH_REGION;
+}
+
 const char *cvm_strerror(int result) {
     switch (result) {
     case CVM_OK:            return "ok";
@@ -329,11 +442,43 @@ const char *cvm_strerror(int result) {
     case CVM_E_BAD_FUNC_INDEX:   return "call target index out of range";
     case CVM_E_STACK_OVERFLOW:   return "stack overflow";
     case CVM_E_NULL_FUNC_PTR:    return "null function pointer call";
+    case CVM_E_BAD_REGION:       return "malformed host_region section";
+    case CVM_E_NO_SUCH_REGION:   return "no region with that name";
     default:                     return "unknown error";
     }
 }
 
 /* --- Interpreter --------------------------------------------------------- */
+
+/* Bitcast helpers: f32 values share the i32 register file. memcpy is the
+ * strict-aliasing-safe way to round-trip the bits, and clang/gcc optimise
+ * a 4-byte memcpy into nothing on every target we care about. */
+static inline float    cvm_bits_to_f32(int32_t bits) {
+    float f; memcpy(&f, &bits, sizeof f); return f;
+}
+static inline int32_t  cvm_f32_to_bits(float f) {
+    int32_t b; memcpy(&b, &f, sizeof b); return b;
+}
+
+/* Saturating float→int with NaN→0. Pinned semantics so the same .bin
+ * gives the same result on every host (raw `(int32_t)f` is x86 indefinite
+ * vs ARM saturating vs RISC-V saturating — we can't trust the C cast).
+ * Boundary values: 2147483648.0f is exactly 2^31 so any f >= it overflows
+ * INT32_MAX; -2147483648.0f represents INT32_MIN exactly so f < it is
+ * underflow. Same logic for the unsigned variant against 4294967296.0f
+ * (exactly 2^32) and 0. */
+static inline int32_t  cvm_f32_to_i32_sat(float f) {
+    if (f != f)                 return 0;
+    if (f >=  2147483648.0f)    return INT32_MAX;
+    if (f <  -2147483648.0f)    return INT32_MIN;
+    return (int32_t)f;
+}
+static inline uint32_t cvm_f32_to_u32_sat(float f) {
+    if (f != f)                 return 0;
+    if (f >=  4294967296.0f)    return UINT32_MAX;
+    if (f <   0.0f)             return 0;
+    return (uint32_t)f;
+}
 
 #if defined(__GNUC__) || defined(__clang__)
 #  define CVM_THREADED 1
@@ -434,6 +579,22 @@ int cvm_run_args(struct cvm_image *img,
         [CVM_OP_MEMCPY]  = &&L_MEMCPY,
         [CVM_OP_MEMSET]  = &&L_MEMSET,
         [CVM_OP_MEMMOVE] = &&L_MEMMOVE,
+        [CVM_OP_MULH]    = &&L_MULH,
+        [CVM_OP_MULHU]   = &&L_MULHU,
+        [CVM_OP_FADD]    = &&L_FADD,
+        [CVM_OP_FSUB]    = &&L_FSUB,
+        [CVM_OP_FMUL]    = &&L_FMUL,
+        [CVM_OP_FDIV]    = &&L_FDIV,
+        [CVM_OP_FNEG]    = &&L_FNEG,
+        [CVM_OP_FCMP_EQ] = &&L_FCMP_EQ,
+        [CVM_OP_FCMP_NE] = &&L_FCMP_NE,
+        [CVM_OP_FCMP_LT] = &&L_FCMP_LT,
+        [CVM_OP_FCMP_LE] = &&L_FCMP_LE,
+        [CVM_OP_F2I_S]   = &&L_F2I_S,
+        [CVM_OP_F2I_U]   = &&L_F2I_U,
+        [CVM_OP_I2F_S]   = &&L_I2F_S,
+        [CVM_OP_I2F_U]   = &&L_I2F_U,
+        [CVM_OP_JMPR]    = &&L_JMPR,
     };
 
 #  define DISPATCH() do {                                  \
@@ -637,6 +798,60 @@ int cvm_run_args(struct cvm_image *img,
         }
         DISPATCH();
     }
+    L_MULH:
+        R[a] = (int32_t)(((int64_t)R[b] * (int64_t)R[c]) >> 32);
+        DISPATCH();
+    L_MULHU:
+        R[a] = (int32_t)(((uint64_t)(uint32_t)R[b]
+                        * (uint64_t)(uint32_t)R[c]) >> 32);
+        DISPATCH();
+    L_FADD:
+        R[a] = cvm_f32_to_bits(cvm_bits_to_f32(R[b]) + cvm_bits_to_f32(R[c]));
+        DISPATCH();
+    L_FSUB:
+        R[a] = cvm_f32_to_bits(cvm_bits_to_f32(R[b]) - cvm_bits_to_f32(R[c]));
+        DISPATCH();
+    L_FMUL:
+        R[a] = cvm_f32_to_bits(cvm_bits_to_f32(R[b]) * cvm_bits_to_f32(R[c]));
+        DISPATCH();
+    L_FDIV:
+        /* IEEE 754 ÷0 = ±Inf (sign of dividend), 0/0 = NaN. No trap. */
+        R[a] = cvm_f32_to_bits(cvm_bits_to_f32(R[b]) / cvm_bits_to_f32(R[c]));
+        DISPATCH();
+    L_FNEG:
+        /* Sign-bit toggle handles every value uniformly: -NaN stays NaN, -0 ↔ +0. */
+        R[a] = R[b] ^ (int32_t)0x80000000;
+        DISPATCH();
+    L_FCMP_EQ:
+        R[a] = (cvm_bits_to_f32(R[b]) == cvm_bits_to_f32(R[c])) ? 1 : 0;
+        DISPATCH();
+    L_FCMP_NE:
+        R[a] = (cvm_bits_to_f32(R[b]) != cvm_bits_to_f32(R[c])) ? 1 : 0;
+        DISPATCH();
+    L_FCMP_LT:
+        R[a] = (cvm_bits_to_f32(R[b]) <  cvm_bits_to_f32(R[c])) ? 1 : 0;
+        DISPATCH();
+    L_FCMP_LE:
+        R[a] = (cvm_bits_to_f32(R[b]) <= cvm_bits_to_f32(R[c])) ? 1 : 0;
+        DISPATCH();
+    L_F2I_S:
+        R[a] = cvm_f32_to_i32_sat(cvm_bits_to_f32(R[b]));
+        DISPATCH();
+    L_F2I_U:
+        R[a] = (int32_t)cvm_f32_to_u32_sat(cvm_bits_to_f32(R[b]));
+        DISPATCH();
+    L_I2F_S:
+        R[a] = cvm_f32_to_bits((float)R[b]);
+        DISPATCH();
+    L_I2F_U:
+        R[a] = cvm_f32_to_bits((float)(uint32_t)R[b]);
+        DISPATCH();
+    L_JMPR: {
+        uint32_t target = (uint32_t)R[a];
+        if (target >= code_count) return CVM_E_BAD_PC;
+        pc = target;
+        DISPATCH();
+    }
 
 #  undef DISPATCH
 
@@ -824,6 +1039,58 @@ int cvm_run_args(struct cvm_image *img,
                 if (src > mem_size || mem_size - src < len) return CVM_E_BAD_ADDR;
                 memmove(heap + dst, heap + src, len);
             }
+            break;
+        }
+        case CVM_OP_MULH:
+            R[a] = (int32_t)(((int64_t)R[b] * (int64_t)R[c]) >> 32);
+            break;
+        case CVM_OP_MULHU:
+            R[a] = (int32_t)(((uint64_t)(uint32_t)R[b]
+                            * (uint64_t)(uint32_t)R[c]) >> 32);
+            break;
+        case CVM_OP_FADD:
+            R[a] = cvm_f32_to_bits(cvm_bits_to_f32(R[b]) + cvm_bits_to_f32(R[c]));
+            break;
+        case CVM_OP_FSUB:
+            R[a] = cvm_f32_to_bits(cvm_bits_to_f32(R[b]) - cvm_bits_to_f32(R[c]));
+            break;
+        case CVM_OP_FMUL:
+            R[a] = cvm_f32_to_bits(cvm_bits_to_f32(R[b]) * cvm_bits_to_f32(R[c]));
+            break;
+        case CVM_OP_FDIV:
+            R[a] = cvm_f32_to_bits(cvm_bits_to_f32(R[b]) / cvm_bits_to_f32(R[c]));
+            break;
+        case CVM_OP_FNEG:
+            R[a] = R[b] ^ (int32_t)0x80000000;
+            break;
+        case CVM_OP_FCMP_EQ:
+            R[a] = (cvm_bits_to_f32(R[b]) == cvm_bits_to_f32(R[c])) ? 1 : 0;
+            break;
+        case CVM_OP_FCMP_NE:
+            R[a] = (cvm_bits_to_f32(R[b]) != cvm_bits_to_f32(R[c])) ? 1 : 0;
+            break;
+        case CVM_OP_FCMP_LT:
+            R[a] = (cvm_bits_to_f32(R[b]) <  cvm_bits_to_f32(R[c])) ? 1 : 0;
+            break;
+        case CVM_OP_FCMP_LE:
+            R[a] = (cvm_bits_to_f32(R[b]) <= cvm_bits_to_f32(R[c])) ? 1 : 0;
+            break;
+        case CVM_OP_F2I_S:
+            R[a] = cvm_f32_to_i32_sat(cvm_bits_to_f32(R[b]));
+            break;
+        case CVM_OP_F2I_U:
+            R[a] = (int32_t)cvm_f32_to_u32_sat(cvm_bits_to_f32(R[b]));
+            break;
+        case CVM_OP_I2F_S:
+            R[a] = cvm_f32_to_bits((float)R[b]);
+            break;
+        case CVM_OP_I2F_U:
+            R[a] = cvm_f32_to_bits((float)(uint32_t)R[b]);
+            break;
+        case CVM_OP_JMPR: {
+            uint32_t target = (uint32_t)R[a];
+            if (target >= code_count) return CVM_E_BAD_PC;
+            pc = target;
             break;
         }
         default:
