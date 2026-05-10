@@ -73,6 +73,7 @@ an offset of `0` means "fall through to the next instruction".
 | 0x34 | `I2F_S` | `A, B` | i32 → f32 (round-to-nearest-even when magnitude > 2^24) |
 | 0x35 | `I2F_U` | `A, B` | u32 → f32 |
 | 0x36 | `JMPR` | `A` | `pc = (u32)R[A]`, bounds-checked against `code_count`; jump-table dispatcher's primitive |
+| 0x37 | `FSQRT` | `A, B` | `R[A] = sqrtf(f32(R[B]))` — single-precision square root via the host's `sqrtf()`. NaN / negative inputs propagate to NaN; `sqrt(±0)=±0`; `sqrt(+Inf)=+Inf`. Surfaced from `cvm_intrin_fsqrt` (see [`runtime/lib/cvm_intrin.h`](../runtime/lib/cvm_intrin.h)) — users call `cvm_fsqrt(x)`. |
 
 ### Forms
 

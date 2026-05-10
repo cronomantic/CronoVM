@@ -1,5 +1,9 @@
 #include "cvm.h"
 
+#include <math.h>     /* sqrtf() — used by CVM_OP_FSQRT. On hosts without
+                         a hardware FPU this resolves to libm/libgcc soft
+                         implementation, same trade-off as the FADD/FMUL
+                         family already documented for soft-float targets. */
 #include <stdlib.h>
 #include <string.h>
 
@@ -663,6 +667,7 @@ int cvm_run_args(struct cvm_image *img,
         [CVM_OP_I2F_S]   = &&L_I2F_S,
         [CVM_OP_I2F_U]   = &&L_I2F_U,
         [CVM_OP_JMPR]    = &&L_JMPR,
+        [CVM_OP_FSQRT]   = &&L_FSQRT,
     };
 
 #  define DISPATCH() do {                                  \
@@ -920,6 +925,9 @@ int cvm_run_args(struct cvm_image *img,
         pc = target;
         DISPATCH();
     }
+    L_FSQRT:
+        R[a] = cvm_f32_to_bits(sqrtf(cvm_bits_to_f32(R[b])));
+        DISPATCH();
 
 #  undef DISPATCH
 
@@ -1161,6 +1169,9 @@ int cvm_run_args(struct cvm_image *img,
             pc = target;
             break;
         }
+        case CVM_OP_FSQRT:
+            R[a] = cvm_f32_to_bits(sqrtf(cvm_bits_to_f32(R[b])));
+            break;
         default:
             return CVM_E_BAD_OPCODE;
         }

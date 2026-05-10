@@ -572,7 +572,15 @@ struct cg_alloca {
  * Never holds an SSA value, so it doesn't need to be spilled across CALLs. */
 #define CG_REG_SP      255u
 #define CG_REG_SCRATCH 254u
-#define CG_MAX_SSA_REG 254u   /* SSA values use R8..R253 (R254=scratch, R255=SP) */
+#define CG_REG_ZERO    253u   /* dedicated register holding 0 across the
+                                * whole function. Sits OUTSIDE the
+                                * spillable SSA range so a callee's body
+                                * never overwrites it; every function's
+                                * prologue MOVIs it to 0, so on return
+                                * the caller's R253 is still 0 (the
+                                * callee just re-set it on entry). */
+#define CG_MAX_SSA_REG 252u   /* SSA values use R8..R252 (R253=zero,
+                                * R254=scratch, R255=SP) */
 
 /* --- Liveness bitset ---------------------------------------------------- */
 /* 256 bits, indexed by (register - 8). Covers any pre-allocated SSA
@@ -1401,7 +1409,12 @@ static void cg_pre_alloc_function(struct cg *cg, LLVMValueRef fn) {
         LLVMValueRef p = LLVMGetParam(fn, i);
         cg_assign(cg, p, cg_alloc_reg(cg));   /* R8..R(8+N-1) */
     }
-    cg->zero_reg = cg_alloc_reg(cg);          /* dedicated zero register */
+    /* zero_reg lives at the fixed CG_REG_ZERO (R253) across every
+     * function — outside the spillable SSA range so callees can't
+     * overwrite it. Each function's prologue still MOVIs R253 to 0
+     * (see cg_function), which means after any call the caller's R253
+     * is still 0 (the callee just re-set it on entry). */
+    cg->zero_reg = (uint8_t)CG_REG_ZERO;
 
     for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn);
          bb; bb = LLVMGetNextBasicBlock(bb))
@@ -1833,11 +1846,18 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                  *   <=  → OLE (FCMP_LE)
                  *   >   → OGT (FCMP_LT, swap)
                  *   >=  → OGE (FCMP_LE, swap)
-                 * The other eight predicates (ONE, UEQ, ULT, ULE, UGT,
-                 * UGE, ORD, UNO, FALSE, TRUE) almost never appear from
-                 * straight C code; reject and ask the user to rewrite. */
+                 * Plus two NaN-only predicates that clang -O1 InstCombine
+                 * loves to introduce by folding `x == x` and isnan-style
+                 * bit-pattern checks:
+                 *   ord(a,b) ↔ both not NaN  → FCMP_EQ a,a AND FCMP_EQ b,b
+                 *   uno(a,b) ↔ either is NaN → FCMP_NE a,a OR  FCMP_NE b,b
+                 * Lowered to three instructions each since IEEE NaN
+                 * compares unequal to itself. The remaining six predicates
+                 * (ONE, UEQ, ULT, ULE, UGT, UGE) almost never appear from
+                 * straight C code and are rejected. */
                 LLVMRealPredicate p = LLVMGetFCmpPredicate(i);
                 int op2 = -1, swap = 0;
+                int compound_kind = 0;       /* 0=normal, 1=ord, 2=uno */
                 switch (p) {
                 case LLVMRealOEQ: op2 = CVM_OP_FCMP_EQ;             break;
                 case LLVMRealUNE: op2 = CVM_OP_FCMP_NE;             break;
@@ -1845,9 +1865,11 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 case LLVMRealOLE: op2 = CVM_OP_FCMP_LE;             break;
                 case LLVMRealOGT: op2 = CVM_OP_FCMP_LT; swap = 1;   break;
                 case LLVMRealOGE: op2 = CVM_OP_FCMP_LE; swap = 1;   break;
+                case LLVMRealORD: compound_kind = 1;                break;
+                case LLVMRealUNO: compound_kind = 2;                break;
                 default: break;
                 }
-                if (op2 < 0) {
+                if (op2 < 0 && compound_kind == 0) {
                     ERR(cg->fn_name,
                         "fcmp predicate %d not in the supported subset "
                         "(use ==, !=, <, <=, >, >=)", (int)p);
@@ -1857,8 +1879,27 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 uint8_t lhs = cg_reg_for(cg, LLVMGetOperand(i, 0));
                 uint8_t rhs = cg_reg_for(cg, LLVMGetOperand(i, 1));
                 uint8_t dst = cg->regs[cg_lookup(cg, i)];
-                if (swap) cg_emit(cg, enc_r((uint8_t)op2, dst, rhs, lhs));
-                else      cg_emit(cg, enc_r((uint8_t)op2, dst, lhs, rhs));
+                if (compound_kind == 1) {
+                    /* ord(a,b) = (a==a) & (b==b) */
+                    uint8_t t1 = cg_alloc_reg(cg);
+                    uint8_t t2 = cg_alloc_reg(cg);
+                    if (cg->had_error) break;
+                    cg_emit(cg, enc_r(CVM_OP_FCMP_EQ, t1,  lhs, lhs));
+                    cg_emit(cg, enc_r(CVM_OP_FCMP_EQ, t2,  rhs, rhs));
+                    cg_emit(cg, enc_r(CVM_OP_AND,     dst, t1,  t2 ));
+                } else if (compound_kind == 2) {
+                    /* uno(a,b) = (a!=a) | (b!=b) */
+                    uint8_t t1 = cg_alloc_reg(cg);
+                    uint8_t t2 = cg_alloc_reg(cg);
+                    if (cg->had_error) break;
+                    cg_emit(cg, enc_r(CVM_OP_FCMP_NE, t1,  lhs, lhs));
+                    cg_emit(cg, enc_r(CVM_OP_FCMP_NE, t2,  rhs, rhs));
+                    cg_emit(cg, enc_r(CVM_OP_OR,      dst, t1,  t2 ));
+                } else if (swap) {
+                    cg_emit(cg, enc_r((uint8_t)op2, dst, rhs, lhs));
+                } else {
+                    cg_emit(cg, enc_r((uint8_t)op2, dst, lhs, rhs));
+                }
                 break;
             }
 
@@ -2070,7 +2111,16 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     cg_queue_fixup(cg, cg->count, default_bb, 8, 24);
                     cg_emit(cg, enc_i24(CVM_OP_JMP, 0));
                 } else {
-                    /* Chain form. */
+                    /* Chain form. The case operand type defines a width
+                     * (i8 / i16 / i32). cond_reg holds the cond value
+                     * after Trunc, which is zero-extended to the operand
+                     * width (Trunc masks). Case constants must be loaded
+                     * with the same width-bits — `LLVMConstIntGetSExtValue`
+                     * would sign-extend `i8 -1` to 0xFFFFFFFF and miss the
+                     * 0xFF cond_reg; ZExt drops to 0xFF and matches. */
+                    LLVMTypeRef cond_ty = LLVMTypeOf(cond_v);
+                    unsigned cond_w = (LLVMGetTypeKind(cond_ty) == LLVMIntegerTypeKind)
+                                      ? LLVMGetIntTypeWidth(cond_ty) : 32;
                     for (unsigned k = 1; k < n_succ; ++k) {
                         LLVMValueRef      case_val = LLVMGetSwitchCaseValue(i, k);
                         LLVMBasicBlockRef case_bb  = LLVMGetSuccessor(i, k);
@@ -2080,7 +2130,11 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                             cg->had_error = 1;
                             break;
                         }
-                        uint8_t case_reg = cg_reg_for(cg, case_val);
+                        unsigned long long zv = LLVMConstIntGetZExtValue(case_val);
+                        if (cond_w < 64) zv &= ((1ULL << cond_w) - 1ULL);
+                        uint8_t case_reg = cg_alloc_reg(cg);
+                        if (cg->had_error) break;
+                        cg_emit_load_const32(cg, case_reg, (int32_t)zv);
                         if (cg->had_error) break;
                         uint8_t tmp = cg_alloc_reg(cg);
                         if (cg->had_error) break;
@@ -2185,12 +2239,36 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
             case LLVMPtrToInt:
             case LLVMIntToPtr:
             case LLVMBitCast:
-            case LLVMTrunc:
             case LLVMZExt: {
                 uint8_t src = cg_reg_for(cg, LLVMGetOperand(i, 0));
                 uint8_t dst = cg->regs[cg_lookup(cg, i)];
                 if (src != dst)
                     cg_emit(cg, enc_r(CVM_OP_MOV, dst, src, 0));
+                break;
+            }
+
+            /* Trunc to iN must zero out the high (32 - N) bits. The natural
+             * register convention (matching LDB/LDH and ZExt) is that
+             * narrow values are stored zero-extended; if Trunc just MOV'd,
+             * a subsequent equality compare against an `iN k` case
+             * constant could see stale upper bits and miscompare. The mask
+             * is materialised via MOVI/MOVHI (no immediate AND). For
+             * Trunc-to-i32 (legal but a no-op) we degenerate to a MOV. */
+            case LLVMTrunc: {
+                uint8_t src = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                LLVMTypeRef dty = LLVMTypeOf(i);
+                unsigned dw = LLVMGetIntTypeWidth(dty);
+                if (dw >= 32) {
+                    if (src != dst)
+                        cg_emit(cg, enc_r(CVM_OP_MOV, dst, src, 0));
+                } else {
+                    uint32_t mask = (dw == 0) ? 0u
+                                              : (uint32_t)(((uint64_t)1 << dw) - 1u);
+                    cg_emit_load_const32(cg, (uint8_t)CG_REG_SCRATCH, (int32_t)mask);
+                    cg_emit(cg, enc_r(CVM_OP_AND, dst, src,
+                                      (uint8_t)CG_REG_SCRATCH));
+                }
                 break;
             }
 
@@ -2379,6 +2457,61 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     break;
                 }
 
+                /* Funnel-shift intrinsics — clang -O1 emits these for the
+                 * canonical multi-precision shift pattern
+                 *   `(a << n) | (b >> (32 - n))`.
+                 * Spec (with c modulo 32):
+                 *   fshl(a, b, c): top 32 bits of (a:b << c)  → a if c==0
+                 *   fshr(a, b, c): bottom 32 bits of (a:b >> c) → b if c==0
+                 *
+                 * Lowered as 9 opcodes including a c==0 fixup. The VM's
+                 * SHL/SHR mask the shift amount to its low 5 bits, so for
+                 * c2=(c & 31)==0 the inverse-shift `b >> (32-c2)` becomes
+                 * `b >> 0 == b`, contaminating the OR. The BNE+MOV at the
+                 * end overrides dst with the correct identity value (a or
+                 * b) when c2==0. Used by the soft-i64 / soft-double
+                 * runtime headers for their multi-precision shifts. */
+                if (strcmp(name, "llvm.fshl.i32") == 0 ||
+                    strcmp(name, "llvm.fshr.i32") == 0)
+                {
+                    int is_fshr = (name[6] == 'r');
+                    if (LLVMGetNumArgOperands(i) != 3) {
+                        ERR(cg->fn_name, "%s expects 3 args, got %u", name,
+                            LLVMGetNumArgOperands(i));
+                        cg->had_error = 1;
+                        break;
+                    }
+                    uint8_t a    = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                    uint8_t b    = cg_reg_for(cg, LLVMGetOperand(i, 1));
+                    uint8_t c    = cg_reg_for(cg, LLVMGetOperand(i, 2));
+                    uint8_t dst  = cg->regs[cg_lookup(cg, i)];
+                    uint8_t a_sh = cg_alloc_reg(cg);
+                    uint8_t b_sh = cg_alloc_reg(cg);
+                    uint8_t inv  = cg_alloc_reg(cg);
+                    uint8_t c2   = cg_alloc_reg(cg);
+                    if (cg->had_error) break;
+
+                    /* Forward-shift first (a<<c for fshl, b>>c for fshr). */
+                    if (is_fshr) cg_emit(cg, enc_r(CVM_OP_SHR, b_sh, b, c));
+                    else         cg_emit(cg, enc_r(CVM_OP_SHL, a_sh, a, c));
+                    /* inv = 32 - c. Materialise 32 in scratch, then SUB. */
+                    cg_movi_scratch(cg, 32);
+                    cg_emit(cg, enc_r(CVM_OP_SUB, inv,
+                                      (uint8_t)CG_REG_SCRATCH, c));
+                    /* Inverse shift on the other operand. */
+                    if (is_fshr) cg_emit(cg, enc_r(CVM_OP_SHL, a_sh, a, inv));
+                    else         cg_emit(cg, enc_r(CVM_OP_SHR, b_sh, b, inv));
+                    cg_emit(cg, enc_r(CVM_OP_OR, dst, a_sh, b_sh));
+                    /* Fixup for c2==0. */
+                    cg_movi_scratch(cg, 31);
+                    cg_emit(cg, enc_r(CVM_OP_AND, c2, c,
+                                      (uint8_t)CG_REG_SCRATCH));
+                    cg_emit(cg, enc_br(CVM_OP_BNE, c2, cg->zero_reg, 1));
+                    cg_emit(cg, enc_r(CVM_OP_MOV, dst,
+                                      is_fshr ? b : a, 0));
+                    break;
+                }
+
                 /* `cvm_intrin_*` extern declarations from the runtime
                  * intrinsics header lower to a single opcode instead of a
                  * CALL — there's no body anywhere; the name exists only
@@ -2388,13 +2521,15 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     int is_mulhu   = (strcmp(name, "cvm_intrin_mulhu")      == 0);
                     int is_f2i_s   = (strcmp(name, "cvm_intrin_f2i_sat_s")  == 0);
                     int is_f2i_u   = (strcmp(name, "cvm_intrin_f2i_sat_u")  == 0);
+                    int is_fsqrt   = (strcmp(name, "cvm_intrin_fsqrt")      == 0);
 
                     int two_arg_op = -1;   /* MULH/MULHU shape */
-                    int one_arg_op = -1;   /* F2I_* shape */
+                    int one_arg_op = -1;   /* F2I_* / FSQRT shape */
                     if (is_mulh)       two_arg_op = CVM_OP_MULH;
                     else if (is_mulhu) two_arg_op = CVM_OP_MULHU;
                     else if (is_f2i_s) one_arg_op = CVM_OP_F2I_S;
                     else if (is_f2i_u) one_arg_op = CVM_OP_F2I_U;
+                    else if (is_fsqrt) one_arg_op = CVM_OP_FSQRT;
 
                     if (two_arg_op >= 0) {
                         if (LLVMGetNumArgOperands(i) != 2) {
@@ -2702,6 +2837,7 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     if (dst != 0)
                         cg_emit(cg, enc_r(CVM_OP_MOV, dst, 0, 0));
                 }
+
                 break;
             }
 

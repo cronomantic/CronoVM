@@ -16,8 +16,12 @@
  *     - clang: --clang= flag, then PATH.
  *     - cvm-translate: --translate= flag, then sibling of cvm-cc, then
  *       CVM_TRANSLATOR_DEFAULT (CMake-baked build-tree path), then PATH.
- *     - runtime headers: --runtime-dir= flag, then CVM_RUNTIME_DIR
- *       configured at build time by CMake.
+ *     - runtime headers: --runtime-dir= flag, then the installed-tree
+ *       layout `<exedir>/../share/cronovm/runtime/lib`, then
+ *       CVM_RUNTIME_DIR baked in by CMake (the build-tree path).
+ *       Build-tree first via the bake means in-tree development
+ *       continues to work; the install probe activates only when
+ *       cvm-cc is run from `<prefix>/bin/`.
  */
 
 #include <errno.h>
@@ -178,6 +182,38 @@ static int file_exists(const char *path) {
     return 1;
 }
 
+/* If cvm-cc lives in `<prefix>/bin/`, the install layout puts the
+ * runtime headers at `<prefix>/share/cronovm/runtime/lib/`. Probe by
+ * looking for `cvm_intrin.h` there; on hit, return the directory.
+ * Caller owns the returned string. */
+static char *find_install_runtime_dir(const char *argv0) {
+    const char *slash = strrchr(argv0, '/');
+#if defined(_WIN32)
+    const char *back = strrchr(argv0, '\\');
+    if (back && (!slash || back > slash)) slash = back;
+#endif
+    if (!slash) return NULL;
+    size_t dirlen = (size_t)(slash - argv0);
+
+    char probe[1024];
+    int n = snprintf(probe, sizeof probe,
+                     "%.*s%c..%cshare%ccronovm%cruntime%clib%ccvm_intrin.h",
+                     (int)dirlen, argv0,
+                     PATH_SEP, PATH_SEP, PATH_SEP,
+                     PATH_SEP, PATH_SEP, PATH_SEP);
+    if (n < 0 || n >= (int)sizeof probe) return NULL;
+    if (!file_exists(probe)) return NULL;
+
+    char *result = (char *)malloc((size_t)n + 1);  /* same envelope */
+    if (!result) return NULL;
+    snprintf(result, (size_t)n + 1,
+             "%.*s%c..%cshare%ccronovm%cruntime%clib",
+             (int)dirlen, argv0,
+             PATH_SEP, PATH_SEP, PATH_SEP,
+             PATH_SEP, PATH_SEP);
+    return result;
+}
+
 /* Locate cvm-translate. Order:
  *   1. --translate=PATH (explicit override)
  *   2. sibling of cvm-cc (the install layout)
@@ -205,7 +241,8 @@ static char *find_translator(const struct cli *cli, const char *argv0) {
 
 static int parse_argv(int argc, char **argv, struct cli *cli) {
     cli->opt_level   = "1";
-    cli->runtime_dir = CVM_RUNTIME_DIR;
+    /* runtime_dir resolved in main() after parse_argv: either user's
+     * --runtime-dir, or the install-layout probe, or the build-tree bake. */
 
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
@@ -268,6 +305,13 @@ int main(int argc, char **argv) {
     memset(&cli, 0, sizeof cli);
     int rc = parse_argv(argc, argv, &cli);
     if (rc) return rc;
+
+    /* Resolve runtime_dir: explicit > install-layout probe > build-tree bake.
+     * `installed` is leaked deliberately — its lifetime is the process. */
+    if (!cli.runtime_dir) {
+        char *installed = find_install_runtime_dir(argv[0]);
+        cli.runtime_dir = installed ? installed : CVM_RUNTIME_DIR;
+    }
 
     int   input_is_c = has_suffix(cli.input, ".c");
     int   input_is_bc = has_suffix(cli.input, ".bc");

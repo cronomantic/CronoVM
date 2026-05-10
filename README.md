@@ -18,7 +18,7 @@ small set of runtime headers.
 | Interpreter | `src/cvm.c` (linked as `cvm` — single static library) | Loads `.bin` images, runs them, exposes a thread-safe-ish `cvm_run` |
 | Translator | `tools/translator/cvm-translate` | Reads LLVM bitcode, emits CronoVM `.bin` |
 | Wrapper | `tools/cvm-cc/cvm-cc` | Single-command driver: `cvm-cc x.c -o x.bin` |
-| Runtime headers | `runtime/lib/` | `cvm_alloc.h` (free-list malloc/free), `cvm_intrin.h` (MULH, F2I_SAT) |
+| Runtime headers | `runtime/lib/` | `cvm_alloc.h` (free-list malloc/free), `cvm_intrin.h` (MULH, F2I_SAT, FSQRT), `cvm_int64.h` (soft i64), `cvm_float64.h` (soft double) |
 | Example consumer | `examples/embedder/` | Minimal downstream pattern via `add_subdirectory` |
 
 ## Quick example
@@ -101,8 +101,42 @@ and runs as part of the test suite.
 
 ### `find_package` (release / install)
 
-Not yet implemented; on the roadmap. Until then,
-`add_subdirectory()` is the canonical path.
+```sh
+# Build + install CronoVM into a prefix you control.
+cmake -S CronoVM -B build -G Ninja
+cmake --build build
+cmake --install build --prefix /opt/cronovm
+```
+
+```cmake
+# in your CMakeLists.txt
+list(APPEND CMAKE_PREFIX_PATH /opt/cronovm)
+find_package(CronoVM 0.1 REQUIRED)
+
+target_link_libraries(my_host PRIVATE cronovm::cvm)
+
+# Drive bytecode compilation from CMake — same shape as the
+# add_subdirectory pattern, just with the namespaced target.
+add_custom_command(
+    OUTPUT  ${CMAKE_BINARY_DIR}/game.bin
+    COMMAND $<TARGET_FILE:cronovm::cvm-cc>
+            ${CMAKE_CURRENT_SOURCE_DIR}/game.c
+            -o ${CMAKE_BINARY_DIR}/game.bin
+    DEPENDS cronovm::cvm-cc ${CMAKE_CURRENT_SOURCE_DIR}/game.c
+    VERBATIM
+)
+```
+
+Targets exported under the `cronovm::` namespace mirror the
+`add_subdirectory` set: `cronovm::cvm`, `cronovm::cvm-cc`, and —
+when CronoVM was built with `llvm-config` available —
+`cronovm::cvm-translate`. The package also defines
+`CRONOVM_RUNTIME_DIR` for consumers that want to pass it as an
+extra `-I` to clang directly (cvm-cc finds it automatically).
+
+A complete worked example lives under
+[`examples/installed_consumer/`](examples/installed_consumer) and
+is exercised end-to-end by the `installed_*` ctest entries.
 
 ## Runtime APIs
 
@@ -148,13 +182,17 @@ FreeRTOS heap_4, Zephyr `k_malloc`, a fixed-pool allocator, etc.
 ## Project status
 
 **Pre-1.0.** The binary format and ABI are not yet stabilised — minor
-versions may break compatibility. 60+ ctest cases cover the
-opcode set, codegen, translator subset, host APIs, and the consumer
-pattern; both release and AddressSanitizer builds pass clean.
+versions may break compatibility. 67 ctest cases cover the
+opcode set (55 opcodes incl. FSQRT), codegen, translator subset,
+host APIs, the soft-i64 / soft-double runtime headers, and both
+consumer patterns (`add_subdirectory` and `find_package` against
+a freshly-installed prefix); release build clean.
 
 ## License
 
-License pending — to be decided by the project owner.
+MIT — see [LICENSE](LICENSE). You can vendor CronoVM into commercial or
+closed-source projects; the only requirement is to preserve the copyright
+notice in your distribution.
 
 ## Origin
 

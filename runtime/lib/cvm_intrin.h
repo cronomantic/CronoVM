@@ -7,8 +7,12 @@
  * in the IR.
  *
  * Surface:
- *   cvm_mulh(a, b)   signed   high 32 bits of (int64_t)(a * b)
- *   cvm_mulhu(a, b)  unsigned high 32 bits of (uint64_t)(a * b)
+ *   cvm_mulh(a, b)         signed   high 32 bits of (int64_t)(a * b)
+ *   cvm_mulhu(a, b)        unsigned high 32 bits of (uint64_t)(a * b)
+ *   cvm_fsqrt(f)           single-precision square root (FSQRT opcode)
+ *   cvm_f2i_sat_s(f)       float → int32  with saturating semantics
+ *   cvm_f2i_sat_u(f)       float → uint32 with saturating semantics
+ *   cvm_qmul_16_16(a, b)   Q16.16 fixed-point multiply (composes MUL + MULH)
  *
  * With (low = a*b, hi = cvm_mulh(a, b)) you get the full 64-bit product
  * of two 32-bit operands without any 64-bit value ever appearing in a
@@ -44,6 +48,19 @@ extern uint32_t cvm_intrin_f2i_sat_u(float f);
 
 static inline int32_t  cvm_f2i_sat_s(float f) { return cvm_intrin_f2i_sat_s(f); }
 static inline uint32_t cvm_f2i_sat_u(float f) { return cvm_intrin_f2i_sat_u(f); }
+
+/* Single-precision square root via the FSQRT opcode. The translator
+ * pattern-matches the `cvm_intrin_fsqrt` name and emits FSQRT inline
+ * (no CALL). Routed through the intrinsic shim rather than declaring
+ * `extern float sqrtf(float)` directly because the latter would (a)
+ * potentially conflict with libm declarations on the host build of the
+ * .c source if any test code is compiled outside the VM, and (b) make
+ * cvm-compiled .bc files with `sqrtf` calls accidentally portable to
+ * non-CronoVM hosts that link against libm. The wrapper makes the
+ * dependency on the VM explicit. */
+extern float cvm_intrin_fsqrt(float f);
+
+static inline float cvm_fsqrt(float f) { return cvm_intrin_fsqrt(f); }
 
 /* Q16.16 multiply: result = (a × b) >> 16 in fixed-point.
  * The (low, hi) full product is shifted right by 16 across the boundary,

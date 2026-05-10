@@ -1,0 +1,18 @@
+@PACKAGE_INIT@
+
+# Resolved at install time to <prefix>/share/cronovm/runtime/lib —
+# the directory holding cvm_intrin.h / cvm_alloc.h. Consumers that
+# build .c sources without going through cvm-cc can use this to set
+# their own -I (cvm-cc itself probes for this directory automatically).
+set_and_check(CRONOVM_RUNTIME_DIR
+              "@PACKAGE_CMAKE_INSTALL_DATADIR@/cronovm/runtime/lib")
+
+include("${CMAKE_CURRENT_LIST_DIR}/CronoVMTargets.cmake")
+
+# cronovm::cvm           — the static library (always present)
+# cronovm::cvm-cc        — the one-shot driver (always present)
+# cronovm::cvm-translate — only present if CronoVM was built with
+#                          llvm-config available; consumers that need
+#                          end-to-end .c → .bin should guard with
+#                          `if(TARGET cronovm::cvm-translate)`.
+check_required_components(CronoVM)

@@ -22,10 +22,14 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 add_library(cvm STATIC src/cvm.c)
-# PUBLIC include path uses CVM_SOURCE_ROOT so consumers that pull this
-# in via add_subdirectory() see `cvm.h` regardless of where their own
-# CMAKE_CURRENT_SOURCE_DIR points.
-target_include_directories(cvm PUBLIC ${CVM_SOURCE_ROOT}/include)
+# PUBLIC include path uses CVM_SOURCE_ROOT for the build interface so
+# consumers that pull this in via add_subdirectory() see `cvm.h`
+# regardless of where their own CMAKE_CURRENT_SOURCE_DIR points.
+# The INSTALL_INTERFACE form (`include`, relative to install prefix)
+# is what `find_package(CronoVM)` consumers see post-install.
+target_include_directories(cvm PUBLIC
+    $<BUILD_INTERFACE:${CVM_SOURCE_ROOT}/include>
+    $<INSTALL_INTERFACE:include>)
 target_compile_options(cvm PRIVATE
     $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic>
     $<$<C_COMPILER_ID:MSVC>:/W4>
@@ -101,4 +105,104 @@ if(TARGET cvm-translate)
                                     FIXTURES_SETUP    embedder_built)
     set_tests_properties(embedder_run
                          PROPERTIES FIXTURES_REQUIRED embedder_built)
+endif()
+
+# --- Install / find_package(CronoVM) ----------------------------------
+#
+# Default ON only when CronoVM is the top-level project being built —
+# parent projects that pull CronoVM in via add_subdirectory() shouldn't
+# silently inherit our install rules (they'd clash with the parent's
+# own install layout). Override either way with -DCRONOVM_INSTALL=ON/OFF.
+if(CMAKE_SOURCE_DIR STREQUAL CVM_SOURCE_ROOT)
+    set(_cvm_install_default ON)
+else()
+    set(_cvm_install_default OFF)
+endif()
+option(CRONOVM_INSTALL "Generate install rules for CronoVM"
+       ${_cvm_install_default})
+
+if(CRONOVM_INSTALL)
+    include(GNUInstallDirs)
+    include(CMakePackageConfigHelpers)
+
+    # cvm-translate is conditional on llvm-config being available; only
+    # add it to the install set if the target was actually defined.
+    set(_cvm_install_targets cvm cvm-cc)
+    if(TARGET cvm-translate)
+        list(APPEND _cvm_install_targets cvm-translate)
+    endif()
+
+    install(TARGETS ${_cvm_install_targets}
+        EXPORT   CronoVMTargets
+        RUNTIME  DESTINATION ${CMAKE_INSTALL_BINDIR}
+        ARCHIVE  DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        LIBRARY  DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+    install(FILES ${CVM_SOURCE_ROOT}/include/cvm.h
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+    # Runtime headers (cvm_intrin.h, cvm_alloc.h) live under share/ so
+    # cvm-cc's install-layout probe finds them at
+    # `<bindir>/../share/cronovm/runtime/lib/`.
+    install(DIRECTORY ${CVM_SOURCE_ROOT}/runtime/lib/
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/cronovm/runtime/lib
+        FILES_MATCHING PATTERN "*.h")
+
+    install(EXPORT CronoVMTargets
+        FILE      CronoVMTargets.cmake
+        NAMESPACE cronovm::
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/CronoVM)
+
+    configure_package_config_file(
+        ${CVM_SOURCE_ROOT}/cmake/CronoVMConfig.cmake.in
+        ${CMAKE_CURRENT_BINARY_DIR}/CronoVMConfig.cmake
+        INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/CronoVM
+        PATH_VARS CMAKE_INSTALL_DATADIR)
+
+    write_basic_package_version_file(
+        ${CMAKE_CURRENT_BINARY_DIR}/CronoVMConfigVersion.cmake
+        VERSION       ${PROJECT_VERSION}
+        COMPATIBILITY SameMinorVersion)
+
+    install(FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/CronoVMConfig.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/CronoVMConfigVersion.cmake
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/CronoVM)
+
+    # --- ctest: install + find_package(CronoVM) round trip ------------
+    # Mirrors the embedder pattern: configure + build + run a separate
+    # mini-project from examples/installed_consumer/, but here the
+    # consumer pulls CronoVM in via find_package against an install
+    # prefix we populate at test time. Catches regressions in the
+    # exported targets, the runtime-header layout, and the cvm-cc
+    # install-layout probe. Skipped when the translator isn't available
+    # (the consumer needs cvm-cc end-to-end, which needs cvm-translate).
+    if(TARGET cvm-translate)
+        set(_inst_prefix ${CMAKE_BINARY_DIR}/install_prefix)
+        set(_inst_src    ${CVM_SOURCE_ROOT}/examples/installed_consumer)
+        set(_inst_bin    ${CMAKE_BINARY_DIR}/installed_consumer_test)
+        add_test(NAME installed_install
+                 COMMAND ${CMAKE_COMMAND} --install ${CMAKE_BINARY_DIR}
+                                          --prefix ${_inst_prefix})
+        add_test(NAME installed_configure
+                 COMMAND ${CMAKE_COMMAND} -S ${_inst_src} -B ${_inst_bin}
+                                          -G ${CMAKE_GENERATOR}
+                                          -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+                                          -DCMAKE_PREFIX_PATH=${_inst_prefix})
+        add_test(NAME installed_build
+                 COMMAND ${CMAKE_COMMAND} --build ${_inst_bin})
+        add_test(NAME installed_run
+                 COMMAND ${_inst_bin}/installed_host ${_inst_bin}/game.bin)
+        set_tests_properties(installed_install
+                             PROPERTIES FIXTURES_SETUP    cvm_installed)
+        set_tests_properties(installed_configure
+                             PROPERTIES FIXTURES_REQUIRED cvm_installed
+                                        FIXTURES_SETUP    inst_cfg)
+        set_tests_properties(installed_build
+                             PROPERTIES FIXTURES_REQUIRED inst_cfg
+                                        FIXTURES_SETUP    inst_built)
+        set_tests_properties(installed_run
+                             PROPERTIES FIXTURES_REQUIRED inst_built)
+    endif()
 endif()

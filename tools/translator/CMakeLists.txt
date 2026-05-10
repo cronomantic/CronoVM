@@ -44,7 +44,8 @@ set(_fixture_out ${CMAKE_CURRENT_BINARY_DIR})
 
 set(_fixture_targets "")
 foreach(name add pick fib abs max divmod bitops counter sum_global
-             alloc_sum free_list regions mulh float_basic two_funcs
+             alloc_sum free_list regions mulh float_basic fsqrt
+             i64_basic f64_basic two_funcs
              fib_recursive many_args alloca_swap fnptr dispatch_table
              narrow_ops mem_intrin long_branch switch_dispatch
              switch_table reject_double)
@@ -58,6 +59,8 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
         DEPENDS ${_src}
                 ${CVM_SOURCE_ROOT}/runtime/lib/cvm_alloc.h
                 ${CVM_SOURCE_ROOT}/runtime/lib/cvm_intrin.h
+                ${CVM_SOURCE_ROOT}/runtime/lib/cvm_int64.h
+                ${CVM_SOURCE_ROOT}/runtime/lib/cvm_float64.h
         VERBATIM
     )
     list(APPEND _fixture_targets ${_bc})
@@ -67,7 +70,8 @@ add_custom_target(translator_fixtures DEPENDS ${_fixture_targets})
 # Emit each .bin via the translator. Depends on cvm-translate + the .bc.
 set(_emit_targets "")
 foreach(name add pick fib abs max divmod bitops counter sum_global
-             mulh float_basic two_funcs fib_recursive many_args
+             mulh float_basic fsqrt i64_basic f64_basic
+             two_funcs fib_recursive many_args
              alloca_swap fnptr dispatch_table narrow_ops mem_intrin
              long_branch switch_dispatch switch_table)
     set(_bc  ${_fixture_out}/${name}.bc)
@@ -161,6 +165,9 @@ add_test(NAME e2e_regions    COMMAND test_regions ${_fixture_out}/regions.bin)
 add_test(NAME e2e_allocator  COMMAND test_allocator ${_fixture_out}/add.bin)
 add_test(NAME e2e_mulh       COMMAND test_e2e ${_fixture_out}/mulh.bin  0 0)
 add_test(NAME e2e_float_basic COMMAND test_e2e ${_fixture_out}/float_basic.bin 0 0)
+add_test(NAME e2e_fsqrt       COMMAND test_e2e ${_fixture_out}/fsqrt.bin       0 0)
+add_test(NAME e2e_i64_basic   COMMAND test_e2e ${_fixture_out}/i64_basic.bin   0 0)
+add_test(NAME e2e_f64_basic   COMMAND test_e2e ${_fixture_out}/f64_basic.bin   0 0)
 # (cvm-cc's end-to-end test is registered in tools/cvm-cc/CMakeLists.txt
 # so the cvm-cc target exists when the test is being defined.)
 add_test(NAME e2e_two_funcs  COMMAND test_e2e ${_fixture_out}/two_funcs.bin 13 7 5)
@@ -214,6 +221,7 @@ set_tests_properties(
     e2e_abs_neg e2e_abs_pos e2e_max_lhs e2e_max_rhs
     e2e_divmod e2e_bitops e2e_counter e2e_sum_global e2e_alloc_sum
     e2e_free_list e2e_regions e2e_allocator e2e_mulh e2e_float_basic
+    e2e_fsqrt e2e_i64_basic e2e_f64_basic
     e2e_two_funcs e2e_fib_rec_10 e2e_fib_rec_1 e2e_fib_rec_0
     e2e_many_args e2e_alloca_swap e2e_fnptr_add e2e_fnptr_sub
     e2e_dispatch_add e2e_dispatch_sub e2e_dispatch_mul

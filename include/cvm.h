@@ -294,7 +294,14 @@ enum cvm_opcode {
      *                                              saturating).
      *   I2F_S / I2F_U        A=rd, B=rs1          int32 / uint32 → float; result
      *                                              rounded to nearest-even when
-     *                                              the magnitude exceeds 2^24. */
+     *                                              the magnitude exceeds 2^24.
+     *   FSQRT                A=rd, B=rs1          single-precision square root via
+     *                                              the host's `sqrtf()`. Negative
+     *                                              inputs and NaN propagate to
+     *                                              NaN; sqrt(±0)=±0; sqrt(+Inf)=+Inf.
+     *                                              Surfaced by the translator from
+     *                                              `cvm_intrin_fsqrt` (see
+     *                                              runtime/lib/cvm_intrin.h). */
     CVM_OP_FADD    = 0x29,
     CVM_OP_FSUB    = 0x2A,
     CVM_OP_FMUL    = 0x2B,
@@ -316,6 +323,12 @@ enum cvm_opcode {
      * of a jump-table sequence; the table entries are absolute
      * instruction indices patched in after branch relaxation. */
     CVM_OP_JMPR    = 0x36,
+
+    /* Single-precision square root. Sole f32 unary that's not just a sign
+     * tweak — uses the host's `sqrtf()` rather than fold to a single ALU
+     * op like FNEG does. Surfaced by the translator from `cvm_intrin_fsqrt`
+     * in cvm_intrin.h; users call `cvm_fsqrt(x)`. */
+    CVM_OP_FSQRT   = 0x37,
 };
 
 #define CVM_REG_COUNT 256
