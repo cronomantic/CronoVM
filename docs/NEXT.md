@@ -78,23 +78,26 @@ both DONE. Remaining backlog is small:
    toolchain (Cortex-M GCC) that doesn't exist in this tree yet.
    Once it does: build `src/cvm.c` for thumbv7m-none-eabi, measure
    .text under `-Os`, decide whether to gate optional opcodes
-   behind `#ifdef CVM_ENABLE_*`.
+   behind `#ifdef CVM_ENABLE_*`. Note: the `CVM_NO_STDLIB_FALLBACK`
+   gate (below) is now in place, so a thumbv7m build won't pull in
+   libc malloc/free unless the host explicitly wants it.
 
-3. **`CVM_NO_STDLIB_FALLBACK` guard** in cvm.c — one-line
-   `#ifdef` around the malloc/free fallback bodies of
-   `cvm_int_alloc` / `cvm_int_free` for embedded targets that
-   want to forbid the stdlib path entirely. Trivial; ship when
-   asked.
-
-4. **Drop the `volatile uint32_t inv` workaround** in
-   `cvm_int64.h`'s shifts. Strictly redundant since the
-   translator handles `fshl/fshr` directly. Carried from the
-   previous session's notes.
-
-5. **Round-to-nearest in `cvm_d_div`** (optional). Currently
+3. **Round-to-nearest in `cvm_d_div`** (optional). Currently
    truncates (round-toward-zero). Within 1 ULP of IEEE, sufficient
    for game math, but worth revisiting if a fixture exposes the
    gap.
+
+## Recently closed
+
+- ~~**`CVM_NO_STDLIB_FALLBACK` guard** in cvm.c~~ — landed.
+  Defining `-DCVM_NO_STDLIB_FALLBACK` at build time skips the
+  `<stdlib.h>` include and turns a missing allocator hook into
+  hard-fail (alloc → NULL, free → no-op). Default builds
+  unchanged.
+- ~~**Drop the `volatile uint32_t inv` workaround**~~ — landed,
+  along with a fix to a typo in the translator's fshr/fshl
+  discriminator (`name[6]` → `name[8]`) that the workaround had
+  been hiding.
 
 ## Current state
 
