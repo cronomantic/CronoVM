@@ -1,19 +1,57 @@
 # Where I left off
 
 > Short orientation note for the next coding session. Last touched
-> **2026-05-10**, end of step pair G + I from the deferred backlog:
-> spill-area compaction (frames now hold a slot only for SSA regs
-> live across some call) and dense-switch jump-table form (`JMPR`
-> opcode + DATA-resident table; chosen automatically when
-> `n_cases ≥ 4` AND density ≥ 0.5).
+> **2026-05-10**, end of distribution + embedded-hardening work:
+> CronoVM is now consumable as a dependency via
+> `add_subdirectory()`, `cvm_load_ex` accepts a pluggable allocator
+> (`cvm_allocator_t`), and a README plus a working `examples/embedder/`
+> consumer demonstrate the pattern.
+
+## Next session — pinned items
+
+In priority order. Each unblocks something specific; pick whichever
+matches the day's energy.
+
+1. **License decision (blocker for downstream)**. The README ends
+   with "License pending — to be decided by the project owner".
+   Until a license is picked, the game project (separate repo) has
+   no formal way to consume this. Cheapest decision, biggest
+   downstream impact. No code work — just pick (MIT, Apache-2.0,
+   BSD, dual-license, etc.), add `LICENSE` file at the root, and
+   replace the placeholder in `README.md`.
+
+2. **`cmake --install` + `find_package(CronoVM)`**. The other half
+   of the distribution story. `add_subdirectory()` already works
+   (shipped this session); the install + Find-package path is what
+   consumers using a stable installed copy need. Standard CMake
+   moderno: `install(TARGETS cvm cvm-cc cvm-translate ...)`,
+   `install(FILES include/cvm.h ...)`, `install(EXPORT ...)` plus
+   a `CronoVMConfig.cmake.in` template. Add a parallel ctest entry
+   that runs `cmake --install build --prefix /tmp/cronovm-install`
+   and then `find_package(CronoVM)` from a third mini-project under
+   `examples/`. ~2-3 hours.
+
+3. **Runtime libs + FSQRT (defer-until-asked, surface only when
+   a fixture pushes)**. The own rule from earlier sessions
+   (`cvm_int64.h`, `cvm_float64.h`, FSQRT opcode) — wait until the
+   game project's IR genuinely requires them. Listed here as a
+   reminder, not a TODO. Concrete shapes:
+   - `runtime/lib/cvm_int64.h`: `struct {uint32_t lo, hi}` plus
+     add/sub/mul (via MULH) / shl / shr / cmp helpers. User-side
+     only, zero VM changes.
+   - `runtime/lib/cvm_float64.h`: software `double`. Berkeley
+     SoftFloat would be the starting point. Heavyweight (multi-KB
+     code, slow). User-side only.
+   - **FSQRT opcode**: would unlock vector length / normalisation
+     in one instruction. Currently expressible via Newton-Raphson
+     on i32 (slow). New opcode, both interpreter paths, translator
+     intrinsic detection (`cvm_intrin_fsqrt`), fixture.
 
 ## Current state
 
-56/56 ctest cases pass (47 prior + 9 new `e2e_switch_tab_*` covering
-all 8 cases of the dense switch + default). G is observable as
-slightly smaller binaries for call-heavy fixtures (`free_list`
-went 371 → 367 instructions); I is observable as `switch_table.bin`
-having a 32-byte DATA section holding the 8-entry jump table.
+60/60 ctest cases pass (56 prior + 1 `e2e_allocator` (custom alloc
+with leak / count tracking) + 3 `embedder_*` (configure / build / run
+of the consumer mini-project). Both release and ASAN builds clean.
 Pipeline runs end-to-end exactly as before:
 
 ```text
@@ -306,36 +344,72 @@ lowerings are exercised by the suite.
 - **Saturating arithmetic** (`ADDS`/`SUBS`): useful for audio
   mixing and blends. Niche; add when a fixture asks.
 
-## Embedded-specific concerns to address before "embed-ready"
+## Distribution / consumer surface  *(done 2026-05-10)*
 
-### Pluggable allocator at load time
+The VM is now consumable as a CMake dependency. `add_subdirectory()`
+wires up the `cvm` library plus the `cvm-cc` and `cvm-translate`
+executable targets; `examples/embedder/` is a standalone mini-project
+that exercises the full pattern (configure + build + run) and is
+asserted by ctest. CronoVM's own CMakeLists captures
+`CVM_SOURCE_ROOT` so subdir paths don't leak through `CMAKE_SOURCE_DIR`
+when the parent project takes over the top-level role.
 
-`cvm_load` calls `malloc` directly. Embedded systems often have
-no malloc, custom allocators (FreeRTOS heap_4, Zephyr k_malloc),
-or fixed memory pools. Two options that complement each other:
+`project(cronovm VERSION 0.1.0)` exposes the library version both via
+the runtime API (`cvm_version_string()`, `cvm_version_number()`) and
+via compile-time macros (`CVM_VERSION_MAJOR/MINOR/PATCH`,
+`CVM_VERSION_STRING`). Distinct from `CVM_VERSION_1_0` which names the
+binary-format magic.
 
-- Add `cvm_allocator_t` (`malloc_fn`, `free_fn`) parameter to a
-  new `cvm_load_ex` overload. Existing `cvm_load` keeps working
-  with the system malloc.
-- Add `cvm_load_with_workspace(bytes, len, void *ws, size_t
-  ws_size, ...)` that takes a pre-allocated buffer for *all*
-  load-time allocations. Lets bare-metal targets without dynamic
-  malloc run binaries.
+Still pending for full distribution: `cmake --install` / `find_package`
+(the install layout). `add_subdirectory()` covers monorepo and
+git-submodule consumers; `find_package` is for consumers that want a
+stable installed copy. Add when the first such consumer asks.
+
+## Embedded-specific concerns
+
+### ~~Pluggable allocator at load time~~  *(done 2026-05-10)*
+
+`cvm_load_ex(bytes, len, out, &allocator)` accepts a `cvm_allocator_t
+{alloc_fn, free_fn, user_data}`. Either function pointer NULL means
+"fall through to stdlib"; passing `NULL` for the whole struct is
+identical to calling the original `cvm_load`. The image stashes the
+allocator so `cvm_image_free` releases blocks via the matching free.
+Test `e2e_allocator` (`tests/test_allocator.c`) drives a counting
+allocator and asserts every block reaches a paired free.
+
+The `cvm_load_with_workspace` variant (fixed buffer for all
+load-time allocations) wasn't shipped and isn't planned — you can
+write a 50-line bump-from-buffer allocator on top of the existing
+hooks. Document the recipe when an embedded fixture needs it.
+
+### ~~libc-freestanding audit~~  *(done 2026-05-10)*
+
+Confirmed by grep on `src/cvm.c`. The only stdlib symbols pulled in
+are:
+
+- `<stdlib.h>`: `malloc` / `free` — both routed through
+  `cvm_int_alloc` / `cvm_int_free`, which fall through only when the
+  allocator hook is NULL. An embedded host that always passes a
+  custom allocator never invokes the stdlib path.
+- `<string.h>`: `memcpy`, `memset`, `memcmp`, `memchr`, `memmove`,
+  `strcmp`, `strncmp`. All in the C-standard freestanding subset.
+
+Hot loop uses only `memcpy` / `memset` / `memmove` (the block memory
+opcodes plus the f32 bitcast helpers). No `printf`, `errno`,
+`assert`, `exit`, file I/O, or env access anywhere.
+
+If a future build wants to avoid the stdlib `malloc`/`free` fallback
+entirely, that's a one-line `#ifdef CVM_NO_STDLIB_FALLBACK` guard
+around the fallback bodies of `cvm_int_alloc` / `cvm_int_free`.
+Defer until a target asks.
 
 ### Interpreter footprint audit
 
 `src/cvm.c` should compile under 16 KiB on Cortex-M with `-Os`.
-Measure when there's a real target; if it grows too much,
-guard optional opcodes behind compile-time `#ifdef CVM_ENABLE_*`
-flags so a minimal build can drop them.
-
-### libc-freestanding audit
-
-Hot loop uses `memcpy`/`memset` only — both available in
-freestanding builds. Load-time path uses `malloc`/`free`/
-`strcmp`/`strlen` — also freestanding. Confirm no `printf`,
-`assert`, or `errno` slip in (one quick `grep` when
-embed-readiness becomes a milestone).
+Measure when there's a real target; if it grows too much, guard
+optional opcodes behind compile-time `#ifdef CVM_ENABLE_*` flags so
+a minimal build can drop them. Not done yet — needs a cross-compile
+toolchain that doesn't yet exist in this tree.
 
 ### Default sizes
 

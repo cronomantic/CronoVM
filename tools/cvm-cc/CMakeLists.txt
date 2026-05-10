@@ -11,7 +11,7 @@ target_compile_options(cvm-cc PRIVATE
 # `cvm_intrin.h` etc. without having to set -I themselves. The CLI
 # flag --runtime-dir overrides at run time.
 target_compile_definitions(cvm-cc PRIVATE
-    CVM_RUNTIME_DIR="${CMAKE_SOURCE_DIR}/runtime/lib"
+    CVM_RUNTIME_DIR="${CVM_SOURCE_ROOT}/runtime/lib"
 )
 
 # Same trick for cvm-translate: bake in the build-tree path so cvm-cc
@@ -29,7 +29,7 @@ if(TARGET cvm-translate)
     # wrapper's argv plumbing, tool discovery, and intermediate-file
     # handling. Lives here (not under tools/translator) so both the
     # cvm-cc and cvm-translate targets exist when the test is defined.
-    set(_fixture_dir ${CMAKE_SOURCE_DIR}/tests/fixtures)
+    set(_fixture_dir ${CVM_SOURCE_ROOT}/tests/fixtures)
     set(_cvmcc_bin ${CMAKE_CURRENT_BINARY_DIR}/cvm_cc_add.bin)
     add_custom_command(
         OUTPUT  ${_cvmcc_bin}

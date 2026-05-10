@@ -27,7 +27,7 @@ list(TRANSFORM LLVM_LIBS REPLACE "^-l" "")
 message(STATUS "Found LLVM ${LLVM_VERSION} (${LLVM_CONFIG_EXE})")
 
 add_executable(cvm-translate translator.c)
-target_include_directories(cvm-translate PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(cvm-translate PRIVATE ${CVM_SOURCE_ROOT}/include)
 target_include_directories(cvm-translate SYSTEM PRIVATE ${LLVM_INCDIR})
 target_link_directories(cvm-translate PRIVATE ${LLVM_LIBDIR})
 target_link_libraries(cvm-translate PRIVATE ${LLVM_LIBS})
@@ -39,7 +39,7 @@ target_compile_options(cvm-translate PRIVATE
 # --- Fixtures: compile test C sources to bitcode at build time ------------
 # -O1 promotes allocas (mem2reg) which step-5 codegen requires; the
 # validation tests don't care about the level, so we use -O1 everywhere.
-set(_fixture_dir ${CMAKE_SOURCE_DIR}/tests/fixtures)
+set(_fixture_dir ${CVM_SOURCE_ROOT}/tests/fixtures)
 set(_fixture_out ${CMAKE_CURRENT_BINARY_DIR})
 
 set(_fixture_targets "")
@@ -53,11 +53,11 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
     add_custom_command(
         OUTPUT  ${_bc}
         COMMAND ${CMAKE_C_COMPILER} --target=i386-elf -emit-llvm -O1
-                                    -I${CMAKE_SOURCE_DIR}/runtime/lib
+                                    -I${CVM_SOURCE_ROOT}/runtime/lib
                                     -c ${_src} -o ${_bc}
         DEPENDS ${_src}
-                ${CMAKE_SOURCE_DIR}/runtime/lib/cvm_alloc.h
-                ${CMAKE_SOURCE_DIR}/runtime/lib/cvm_intrin.h
+                ${CVM_SOURCE_ROOT}/runtime/lib/cvm_alloc.h
+                ${CVM_SOURCE_ROOT}/runtime/lib/cvm_intrin.h
         VERBATIM
     )
     list(APPEND _fixture_targets ${_bc})
@@ -158,6 +158,7 @@ add_test(NAME e2e_sum_global COMMAND test_e2e ${_fixture_out}/sum_global.bin 55 
 add_test(NAME e2e_alloc_sum  COMMAND test_e2e ${_fixture_out}/alloc_sum.bin 15 5)
 add_test(NAME e2e_free_list  COMMAND test_e2e ${_fixture_out}/free_list.bin  0 0)
 add_test(NAME e2e_regions    COMMAND test_regions ${_fixture_out}/regions.bin)
+add_test(NAME e2e_allocator  COMMAND test_allocator ${_fixture_out}/add.bin)
 add_test(NAME e2e_mulh       COMMAND test_e2e ${_fixture_out}/mulh.bin  0 0)
 add_test(NAME e2e_float_basic COMMAND test_e2e ${_fixture_out}/float_basic.bin 0 0)
 # (cvm-cc's end-to-end test is registered in tools/cvm-cc/CMakeLists.txt
@@ -212,7 +213,7 @@ set_tests_properties(
     e2e_add e2e_pick_true e2e_pick_false e2e_fib_10 e2e_fib_0
     e2e_abs_neg e2e_abs_pos e2e_max_lhs e2e_max_rhs
     e2e_divmod e2e_bitops e2e_counter e2e_sum_global e2e_alloc_sum
-    e2e_free_list e2e_regions e2e_mulh e2e_float_basic
+    e2e_free_list e2e_regions e2e_allocator e2e_mulh e2e_float_basic
     e2e_two_funcs e2e_fib_rec_10 e2e_fib_rec_1 e2e_fib_rec_0
     e2e_many_args e2e_alloca_swap e2e_fnptr_add e2e_fnptr_sub
     e2e_dispatch_add e2e_dispatch_sub e2e_dispatch_mul

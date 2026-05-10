@@ -31,6 +31,29 @@ extern "C" {
 
 #define CVM_VERSION_1_0   0x00010000u
 
+/* CronoVM library release version. Distinct from CVM_VERSION_1_0
+ * above — that's the binary-format magic number a `.bin` carries.
+ * CVM_VERSION_* names the build of the library / toolchain itself, so
+ * a downstream consumer can log it or compile-time check against a
+ * minimum. CMake's project(cronovm VERSION ...) bakes the real values
+ * in via target_compile_definitions; the fallbacks here only kick in
+ * for ad-hoc compilations without CMake. */
+#ifndef CVM_VERSION_MAJOR
+#  define CVM_VERSION_MAJOR 0
+#endif
+#ifndef CVM_VERSION_MINOR
+#  define CVM_VERSION_MINOR 1
+#endif
+#ifndef CVM_VERSION_PATCH
+#  define CVM_VERSION_PATCH 0
+#endif
+#ifndef CVM_VERSION_STRING
+#  define CVM_VERSION_STRING "0.1.0"
+#endif
+
+const char *cvm_version_string(void);          /* "0.1.0" etc. */
+uint32_t    cvm_version_number(void);          /* (M<<16) | (m<<8) | p */
+
 enum cvm_section_type {
     CVM_SEC_CODE          = 1,
     CVM_SEC_DATA          = 2,
@@ -352,6 +375,16 @@ struct cvm_image {
     struct cvm_region *regions;
     uint32_t           region_count;
 
+    /* Allocator captured at cvm_load_ex time; used by cvm_image_free
+     * to release the image's owned memory. Both function pointers
+     * being NULL means "use stdlib malloc/free" — that's the
+     * effective shape produced by cvm_load (no allocator). */
+    struct {
+        void *(*alloc_fn)(size_t bytes, void *user_data);
+        void  (*free_fn) (void *ptr,    void *user_data);
+        void   *user_data;
+    } allocator;
+
     uint32_t  entry;
 
     /* FUNCS section: img->func_offsets[i] is the instruction index in CODE
@@ -377,6 +410,41 @@ struct cvm_image {
 int  cvm_load(const void *bytes, size_t len, struct cvm_image *out);
 void cvm_image_free(struct cvm_image *img);
 const char *cvm_strerror(int result);
+
+/* ---------------------------------------------------------------------------
+ * Pluggable allocator. Embedded targets often have no `malloc`, custom
+ * pool allocators (FreeRTOS heap_4, Zephyr k_malloc, picolibc), or
+ * fixed memory budgets, so the load path takes a `cvm_allocator_t`
+ * with two function pointers. Either pointer may be NULL to fall
+ * through to the stdlib equivalent; passing the whole allocator as
+ * NULL is identical to calling cvm_load.
+ *
+ * The image stashes the allocator at load time so `cvm_image_free`
+ * uses the matching free for every block it returns. The allocator's
+ * `user_data` is opaque — pass whatever the alloc/free implementations
+ * need (a pool pointer, a stats counter, …).
+ *
+ * After a successful cvm_load_ex the binary holds these allocations:
+ *   - one block for the code array (4 × code_count bytes),
+ *   - one block for the heap (mem_size bytes; may be zero),
+ *   - one block for the imports name blob (when IMPORTS is present),
+ *   - up to three small blocks for import name pointers / handlers /
+ *     userdata,
+ *   - one block for the FUNCS table (when present),
+ *   - one block for the host_region descriptors (when present).
+ * Zero-size sections allocate nothing. The host can therefore
+ * pre-budget the worst-case allocation count if it's running with a
+ * fixed-pool allocator. */
+
+typedef struct {
+    void *(*alloc_fn)(size_t bytes, void *user_data);
+    void  (*free_fn) (void *ptr,    void *user_data);
+    void   *user_data;
+} cvm_allocator_t;
+
+int cvm_load_ex(const void *bytes, size_t len,
+                struct cvm_image *out,
+                const cvm_allocator_t *allocator);
 
 /* ---------------------------------------------------------------------------
  * Linking — bind a host C function to the named import.

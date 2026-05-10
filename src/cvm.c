@@ -15,6 +15,45 @@ static uint32_t read_u32_le(const uint8_t *p) {
          | ((uint32_t)p[3] << 24);
 }
 
+/* --- Allocator routing --------------------------------------------------- *
+ * Internal helpers that fall through to stdlib when the allocator (or
+ * its individual function pointers) is NULL. The load path threads a
+ * `cvm_allocator_t *` around; cvm_image_free recovers the same hooks
+ * by passing &img->allocator. Either function pointer being NULL is a
+ * legal "use stdlib for this slot" signal. */
+
+static void *cvm_int_alloc(const cvm_allocator_t *a, size_t n) {
+    if (n == 0) return NULL;
+    if (a && a->alloc_fn) return a->alloc_fn(n, a->user_data);
+    return malloc(n);
+}
+
+static void cvm_int_free(const cvm_allocator_t *a, void *p) {
+    if (!p) return;
+    if (a && a->free_fn) { a->free_fn(p, a->user_data); return; }
+    free(p);
+}
+
+static void *cvm_int_calloc(const cvm_allocator_t *a,
+                            size_t n_elem, size_t elem_size)
+{
+    if (n_elem != 0 && elem_size > (size_t)(-1) / n_elem) return NULL;
+    size_t total = n_elem * elem_size;
+    void  *p     = cvm_int_alloc(a, total);
+    if (p) memset(p, 0, total);
+    return p;
+}
+
+/* --- Library version ----------------------------------------------------- */
+
+const char *cvm_version_string(void) { return CVM_VERSION_STRING; }
+
+uint32_t cvm_version_number(void) {
+    return ((uint32_t)CVM_VERSION_MAJOR << 16)
+         | ((uint32_t)CVM_VERSION_MINOR <<  8)
+         |  (uint32_t)CVM_VERSION_PATCH;
+}
+
 /* --- Built-in syscalls --------------------------------------------------- */
 
 static int builtin_sys_heap_start(struct cvm_image *img,
@@ -88,6 +127,12 @@ static void auto_bind_builtins(struct cvm_image *img) {
 }
 
 int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
+    return cvm_load_ex(bytes, len, out, NULL);
+}
+
+int cvm_load_ex(const void *bytes, size_t len, struct cvm_image *out,
+                const cvm_allocator_t *allocator)
+{
     if (!bytes || !out) return CVM_E_TRUNCATED;
     memset(out, 0, sizeof(*out));
 
@@ -253,7 +298,7 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
         }
     }
 
-    uint32_t          *code         = (uint32_t *)malloc((size_t)code_size);
+    uint32_t          *code         = (uint32_t *)cvm_int_alloc(allocator, (size_t)code_size);
     uint8_t           *heap         = NULL;
     char              *import_blob  = NULL;
     char             **import_names = NULL;
@@ -265,26 +310,26 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
     if (!code) goto oom;
 
     if (mem_total > 0) {
-        heap = (uint8_t *)malloc((size_t)mem_total);
+        heap = (uint8_t *)cvm_int_alloc(allocator, (size_t)mem_total);
         if (!heap) goto oom;
     }
     if (funcs_size > 0) {
         func_count   = funcs_size / 4u;
-        func_offsets = (uint32_t *)malloc(funcs_size);
+        func_offsets = (uint32_t *)cvm_int_alloc(allocator, funcs_size);
         if (!func_offsets) goto oom;
     }
     if (region_count > 0) {
-        regions = (struct cvm_region *)calloc(region_count,
-                                              sizeof(struct cvm_region));
+        regions = (struct cvm_region *)cvm_int_calloc(allocator, region_count,
+                                                      sizeof(struct cvm_region));
         if (!regions) goto oom;
     }
     if (imports_size > 0) {
-        import_blob = (char *)malloc((size_t)imports_size);
+        import_blob = (char *)cvm_int_alloc(allocator, (size_t)imports_size);
         if (!import_blob) goto oom;
         if (import_count > 0) {
-            import_names = (char **)calloc(import_count, sizeof(char *));
-            import_fns   = (cvm_syscall_fn *)calloc(import_count, sizeof(cvm_syscall_fn));
-            import_ud    = (void **)calloc(import_count, sizeof(void *));
+            import_names = (char **)cvm_int_calloc(allocator, import_count, sizeof(char *));
+            import_fns   = (cvm_syscall_fn *)cvm_int_calloc(allocator, import_count, sizeof(cvm_syscall_fn));
+            import_ud    = (void **)cvm_int_calloc(allocator, import_count, sizeof(void *));
             if (!import_names || !import_fns || !import_ud) goto oom;
         }
     }
@@ -300,7 +345,14 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
         for (uint32_t i = 0; i < func_count; ++i) {
             uint32_t off = read_u32_le(base + funcs_off + (size_t)i * 4u);
             if (off >= code_count) {
-                free(code); free(heap); free(func_offsets);
+                cvm_int_free(allocator, code);
+                cvm_int_free(allocator, heap);
+                cvm_int_free(allocator, func_offsets);
+                cvm_int_free(allocator, regions);
+                cvm_int_free(allocator, import_blob);
+                cvm_int_free(allocator, import_names);
+                cvm_int_free(allocator, import_fns);
+                cvm_int_free(allocator, import_ud);
                 return CVM_E_BAD_FUNCS;
             }
             func_offsets[i] = off;
@@ -346,31 +398,47 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
     out->_import_blob     = import_blob;
     out->regions          = regions;
     out->region_count     = region_count;
+    /* Stash the allocator so cvm_image_free uses the matching free
+     * for every block we just returned. NULL fields fall through to
+     * stdlib free, which is what the simple cvm_load case wants. */
+    if (allocator) {
+        out->allocator.alloc_fn  = allocator->alloc_fn;
+        out->allocator.free_fn   = allocator->free_fn;
+        out->allocator.user_data = allocator->user_data;
+    }
     auto_bind_builtins(out);
     return CVM_OK;
 
 oom:
-    free(code);
-    free(heap);
-    free(import_blob);
-    free(import_names);
-    free(import_fns);
-    free(import_ud);
-    free(func_offsets);
-    free(regions);
+    cvm_int_free(allocator, code);
+    cvm_int_free(allocator, heap);
+    cvm_int_free(allocator, import_blob);
+    cvm_int_free(allocator, import_names);
+    cvm_int_free(allocator, import_fns);
+    cvm_int_free(allocator, import_ud);
+    cvm_int_free(allocator, func_offsets);
+    cvm_int_free(allocator, regions);
     return CVM_E_NOMEM;
 }
 
 void cvm_image_free(struct cvm_image *img) {
     if (!img) return;
-    free(img->code);
-    free(img->heap);
-    free(img->import_names);
-    free(img->import_fns);
-    free(img->import_userdata);
-    free(img->_import_blob);
-    free(img->func_offsets);
-    free(img->regions);
+    /* Reconstruct the allocator handle the load path used. The
+     * cvm_int_free helper takes the same struct shape; a NULL
+     * function pointer falls through to stdlib free. */
+    cvm_allocator_t a = {
+        img->allocator.alloc_fn,
+        img->allocator.free_fn,
+        img->allocator.user_data,
+    };
+    cvm_int_free(&a, img->code);
+    cvm_int_free(&a, img->heap);
+    cvm_int_free(&a, img->import_names);
+    cvm_int_free(&a, img->import_fns);
+    cvm_int_free(&a, img->import_userdata);
+    cvm_int_free(&a, img->_import_blob);
+    cvm_int_free(&a, img->func_offsets);
+    cvm_int_free(&a, img->regions);
     memset(img, 0, sizeof(*img));
 }
 
