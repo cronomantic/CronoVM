@@ -68,19 +68,64 @@
 ## Next session — pinned items
 
 The previously-pinned "1. translator bug" and "2. cvm_d_div" are
-both DONE. Remaining backlog is small:
+both DONE. The remaining backlog splits into a "before publishing"
+group (do these before tagging anything beyond `v0.1.0-preview`)
+and an "after first feedback" group.
 
-1. **L — Feature flags (`CVM_SEC_REQUIRES`)**. Still
+### Before tagging a non-preview release
+
+1. **GitHub Actions CI**. There's no `.github/workflows/` yet, so
+   the 67/67 ctest run is still local-only. A minimal `ci.yml` with
+   a small matrix (Linux × {Clang, GCC} + Windows × Clang +
+   optionally macOS × Clang) running `cmake --build build && ctest`
+   on every push and PR is enough to catch regressions before they
+   land. Bonus: a separate job that builds with
+   `-DCVM_NO_STDLIB_FALLBACK=ON` to keep the embedded gate from
+   bit-rotting.
+
+2. **Cortex-M cross-compile sanity**. Verify that `src/cvm.c`
+   actually links for `thumbv7m-none-eabi` with
+   `-DCVM_NO_STDLIB_FALLBACK` (no test execution needed — just a
+   successful link to make sure no libc symbol leaks back in). Tiny
+   CMake toolchain file + a CI job is enough. This is the dependency
+   for the larger footprint audit below.
+
+3. **Adversarial-fixture pass**. The session-5 bug-find rate (three
+   latent bugs in one session, all surfaced by the same
+   not-particularly-exotic fixture) suggests the test surface is
+   starting to bite hard but more lurkers exist. Worth adding:
+     - a switch fixture with negative i8 / i16 case constants
+       (covers the `LLVMConstIntGetSExtValue` → ZExt flip in the
+       table form, which is currently untested);
+     - a function near the R252 SSA limit (catches off-by-one in the
+       SSA range now that `CG_MAX_SSA_REG` is 252);
+     - a long, call-heavy loop that stresses spill compaction and
+       branch relaxation simultaneously.
+
+4. **Translator bitcode-parser fuzzing**. The `.bc` input is
+   user-supplied at translation time and the parser is the most
+   plausible attack surface. A small libFuzzer harness that feeds
+   random / mutated bitcode into `cvm_translate_buffer` would shake
+   out crashes before users hit them. Doesn't need to be exhaustive
+   — even a few CPU-hours of corpus is high-value at this stage.
+
+5. **`CHANGELOG.md`**. Currently only `git log` exists. For an
+   external audience, a per-tag changelog (entries grouped by
+   feature / fix / breaking) makes upgrades much easier. The
+   in-flight session_5 work — translator triple-fix, cvm_d_div, the
+   NO_STDLIB_FALLBACK gate — is exactly the kind of change a
+   downstream user wants to see surfaced.
+
+### After first feedback
+
+1. **Feature flags (`CVM_SEC_REQUIRES`)**. Still
    defer-until-needed. Surface when a host API needs versioning
    (e.g. `renderer.software@1` vs `renderer.gpu@1`).
 
-2. **Embedded-target footprint audit**. Needs a cross-compile
-   toolchain (Cortex-M GCC) that doesn't exist in this tree yet.
-   Once it does: build `src/cvm.c` for thumbv7m-none-eabi, measure
-   .text under `-Os`, decide whether to gate optional opcodes
-   behind `#ifdef CVM_ENABLE_*`. Note: the `CVM_NO_STDLIB_FALLBACK`
-   gate (below) is now in place, so a thumbv7m build won't pull in
-   libc malloc/free unless the host explicitly wants it.
+2. **Embedded-target footprint audit**. Builds on the Cortex-M
+   cross-compile sanity item above. Once the thumbv7m build links:
+   measure `.text` under `-Os`, decide whether to gate optional
+   opcodes behind `#ifdef CVM_ENABLE_*`.
 
 3. **Round-to-nearest in `cvm_d_div`** (optional). Currently
    truncates (round-toward-zero). Within 1 ULP of IEEE, sufficient
