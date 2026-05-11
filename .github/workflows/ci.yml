@@ -5,6 +5,14 @@ on:
     branches: [main]
   pull_request:
 
+# Opt into Node.js 24 for JavaScript actions ahead of the June 2026
+# default flip. Avoids the deprecation warning that actions/checkout@v4
+# and msys2/setup-msys2@v2 emit while they still ship Node 20 manifests.
+# When upstream actions advertise v5+ on Node 24, this flag becomes a
+# no-op and can be removed.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   linux:
     runs-on: ubuntu-latest
