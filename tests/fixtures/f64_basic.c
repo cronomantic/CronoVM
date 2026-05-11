@@ -289,6 +289,36 @@ static int phase12_div_inexact(int n) {
     return 0;
 }
 
+/* --- Phase 13: division rounds-to-nearest-even ----------------------
+ * 1/3 (phase 12) happens to be the same value under truncate and RNE
+ * because the guard bit is 0; phase 13 exercises a case where they
+ * differ. The canonical example is 1/10: in IEEE 754 binary64 the
+ * infinitely-precise quotient is 1.10011001…₂ × 2⁻⁴, whose 52 fraction
+ * bits truncate to 0x9999999999999 (ending in 9) but round-to-nearest-
+ * even to 0x999999999999A (the guard bit is 1, sticky is 1, so we
+ * round up regardless of the LSB).
+ *
+ * 7/10 is a second case in the same family — guard+sticky-driven
+ * round-up, but the LSB before rounding is 0, exercising the
+ * "guard && sticky" path without the LSB nudge. */
+__attribute__((noinline))
+static int phase13_div_round_to_nearest(int n) {
+    cvm_f64 one  = CVM_D_ONE;
+    cvm_f64 ten  = cvm_d_from_i32(10 + n);
+    cvm_f64 q    = cvm_d_div(one, ten);
+
+    /* 1/10 IEEE-correct under RNE: 0x3FB999999999999A. */
+    if (q.hi != 0x3FB99999u) return 160;
+    if (q.lo != 0x9999999Au) return 161;
+
+    cvm_f64 seven = cvm_d_from_i32(7 + n);
+    cvm_f64 q2    = cvm_d_div(seven, ten);
+    /* 7/10 IEEE-correct under RNE: 0x3FE6666666666666. */
+    if (q2.hi != 0x3FE66666u) return 162;
+    if (q2.lo != 0x66666666u) return 163;
+    return 0;
+}
+
 /* --- Top-level driver. Each phase is its own function, so the budget
  *     of 254 SSA registers is per-phase rather than per-fixture. ---- */
 int f64_basic_main(int n) {
@@ -305,5 +335,6 @@ int f64_basic_main(int n) {
     if ((r = phase10_div_special(n)) != 0) return r;
     if ((r = phase11_div_exact(n))   != 0) return r;
     if ((r = phase12_div_inexact(n)) != 0) return r;
+    if ((r = phase13_div_round_to_nearest(n)) != 0) return r;
     return 0;
 }

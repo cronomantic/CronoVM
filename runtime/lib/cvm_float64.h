@@ -17,25 +17,20 @@
  *     semantics — eq / lt return 0 if either operand is NaN; ne returns 1.
  *   * Conversions: f32 ↔ f64, i32 → f64, u32 → f64, f64 → i32 (saturating),
  *     f64 → u32 (saturating).
- *   * Arithmetic: add, sub, mul, neg.
- *   * Division: NOT YET IMPLEMENTED — `cvm_d_div` returns NaN. A working
- *     restoring long-division on 53-bit mantissas was prototyped but
- *     surfaced a separate translator bug where calls in a many-function
- *     module returned values that observably differ when consumed by
- *     `if (!cvm_d_lt(...))` vs returned directly. The division code
- *     itself produces correct mantissa bits (`div(1, 3)` → 0x3FD55555);
- *     the bug is upstream in the translator's call/spill or
- *     icmp/select lowering and needs its own session to root-cause.
- *     Filed as a follow-up in `docs/NEXT.md`. Until then, this is the
- *     div stub from v1.
+ *   * Arithmetic: add, sub, mul, neg, div.
  *
  * ---- Trade-offs ----
  *
- *   * **Truncate rounding** (round-toward-zero), not round-to-nearest-even.
- *     Results are within 1 ULP of the IEEE-correct value but NOT bit-exact.
- *     Sufficient for game math (physics integration, scaling, accumulation)
- *     where precision matters more than reproducibility against hardware
- *     IEEE 754 implementations on the host.
+ *   * **Rounding mode is per-op.** `cvm_d_div` rounds to nearest even
+ *     (the IEEE 754 default) — bit-exact against hardware for ratios
+ *     that fit in 53 bits. `cvm_d_add` / `cvm_d_sub` / `cvm_d_mul`
+ *     still truncate (round-toward-zero) — within 1 ULP of IEEE, not
+ *     bit-exact. Mixed because the div hot loop already needed extra
+ *     state to handle the guard bit while the add/sub/mul paths
+ *     would each grow noticeably for full IEEE rounding. Game math
+ *     (physics integration, scaling, accumulation) tolerates the
+ *     1-ULP slack; division is the operation where bit-exactness
+ *     mattered most for the fixtures we care about.
  *   * **Flush-to-zero subnormals**: numbers in (0, 2^-1022) are treated as
  *     zero on input AND output. Standard for game-grade math; saves
  *     significant complexity in the alignment shifts and renormalisation
@@ -537,13 +532,17 @@ static cvm_f64 cvm_d_div(cvm_f64 a, cvm_f64 b) {
         exp_adjust = -1;
     }
     /* Now a_m ∈ [b_m, 2*b_m). Restoring long division with R ∈ [0, b_m)
-     * (R never overflows). 53 iterations produce a 53-bit quotient with
-     * the leading 1 at bit 52. Truncate rounding — no round-to-nearest. */
+     * (R never overflows). 53 iterations produce a 54-bit quotient: bit
+     * 53 is the leading 1 from the pre-loop seed, bits 52..1 form the
+     * 53-bit IEEE significand candidate (after shift-right by 1), and
+     * bit 0 is the guard bit G for round-to-nearest-even. The final
+     * non-zero remainder (if any) supplies the sticky bit S — would-be
+     * quotient bits below G that we never materialised. */
     uint32_t r_lo = a_m_lo - b_m_lo;
     uint32_t r_hi = a_m_hi - b_m_hi - (a_m_lo < b_m_lo ? 1u : 0u);
     uint32_t q_lo = 1u;
     uint32_t q_hi = 0u;
-    for (int i = 0; i < 52; ++i) {
+    for (int i = 0; i < 53; ++i) {
         /* R << 1 */
         r_hi = (r_hi << 1) | (r_lo >> 31);
         r_lo = r_lo << 1;
@@ -564,6 +563,39 @@ static cvm_f64 cvm_d_div(cvm_f64 a, cvm_f64 b) {
 
     int32_t r_exp_signed = (int32_t)CVM_D_EXP(a) - (int32_t)CVM_D_EXP(b)
                          + 1023 + exp_adjust;
+
+    /* IEEE 754 round-to-nearest-even.
+     *   G = q bit 0          (the extra bit we just computed)
+     *   S = (R != 0)          (any would-be bits below G are nonzero)
+     *   LSB = significand bit 0 (q bit 1, becomes bit 0 after >>1)
+     *
+     * Round up iff  G && (S || LSB).
+     * Round-half-to-even: when G=1 and S=0, we tie-break toward an
+     * even LSB — round up only when current LSB is 1. */
+    uint32_t guard  = q_lo & 1u;
+    uint32_t sticky = (r_lo | r_hi) ? 1u : 0u;
+
+    /* Drop the guard bit; significand now occupies bits 52..0 with
+     * leading 1 at bit 52, as the packer expects. */
+    q_lo = (q_lo >> 1) | (q_hi << 31);
+    q_hi = q_hi >> 1;
+
+    uint32_t lsb = q_lo & 1u;
+    if (guard && (sticky || lsb)) {
+        uint32_t new_lo = q_lo + 1u;
+        uint32_t carry  = (new_lo == 0u) ? 1u : 0u;
+        q_lo = new_lo;
+        q_hi = q_hi + carry;
+        /* Significand overflow: 0x1F_FFFF:FFFFFFFF + 1 = 0x20_0000:0
+         * means the leading 1 climbed from bit 52 to bit 53. Shift
+         * right once and bump the exponent; the bit we drop is always
+         * 0 here because we just incremented an all-ones significand. */
+        if (q_hi & 0x200000u) {
+            q_lo = (q_lo >> 1) | ((q_hi & 1u) << 31);
+            q_hi = q_hi >> 1;
+            r_exp_signed += 1;
+        }
+    }
 
     if (r_exp_signed >= 0x7FF) return r_sign ? CVM_D_NEG_INF : CVM_D_INF;
     if (r_exp_signed <= 0)     return r_sign ? CVM_D_NEG_ZERO : CVM_D_ZERO;

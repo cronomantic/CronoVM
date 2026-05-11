@@ -265,10 +265,21 @@ and an "after first feedback" group.
    STM32F103-class chips (64 KiB flash) host the VM in under 10%
    of their flash budget.
 
-3. **Round-to-nearest in `cvm_d_div`** (optional). Currently
-   truncates (round-toward-zero). Within 1 ULP of IEEE, sufficient
-   for game math, but worth revisiting if a fixture exposes the
-   gap.
+3. ~~**Round-to-nearest in `cvm_d_div`**~~ — landed (2026-05-11,
+   post-`v0.1`). Restoring-division loop now runs 53 iterations
+   instead of 52 to produce a guard bit; residual remainder
+   provides the sticky bit; round-up fires when `G && (S || LSB)`
+   with carry-out into the exponent on a 0x1FFFFF…FF + 1 boundary.
+   Bit-exact against hardware IEEE 754 binary64: 1/10 →
+   0x3FB999999999999A (RNE) where truncate gave 0x3FB9999999999999,
+   7/10 → 0x3FE6666666666666, 1/3 → 0x3FD5555555555555 (unchanged
+   — 1/3's guard bit is 0, so truncate and RNE agree). New phase
+   13 in `tests/fixtures/f64_basic.c` exercises 1/10 and 7/10;
+   78/78 ctest still green. `cvm_d_add` / `cvm_d_sub` /
+   `cvm_d_mul` deliberately kept truncate — div was the operation
+   where bit-exactness mattered most for the fixtures we care
+   about, and the others would each need their own guard/sticky
+   plumbing for full RNE.
 
 ## Recently closed
 

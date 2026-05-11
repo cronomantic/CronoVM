@@ -8,6 +8,21 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ## [Unreleased]
 
+### Changed
+
+- **`cvm_d_div` rounds to nearest-even.** Previously truncated
+  (round-toward-zero, within 1 ULP of IEEE). Now bit-exact against
+  hardware IEEE 754 binary64 for ratios that fit in 53 bits.
+  Implementation: the restoring-division loop runs one extra
+  iteration to produce a guard bit; the residual remainder
+  supplies the sticky bit; round-up fires when `G && (S || LSB)`
+  with carry-out into the exponent on a 0x1FFFFF…FF + 1 boundary.
+  `cvm_d_add` / `cvm_d_sub` / `cvm_d_mul` still truncate — div is
+  the operation where bit-exactness mattered most for the fixtures
+  we care about, and the others would each need their own
+  guard/sticky plumbing for full RNE. Documented in the header's
+  trade-offs section.
+
 ### Notes
 
 - **Embedded footprint measured.** Cross-built `libcvm.a` for
