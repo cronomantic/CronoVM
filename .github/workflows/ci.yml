@@ -24,17 +24,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # llvm-dev pulls headers + libs for the translator's LLVM-C
-      # bindings; clang is needed at fixture-build time even on the GCC
-      # row, because tools/translator/CMakeLists.txt resolves a separate
-      # clang binary for `--target=i386-elf -emit-llvm`. The translator's
-      # C++ shim (llvm_c_compat.cpp) papers over the LLVMGetSwitchCaseValue
-      # API skew, so the system's default LLVM is enough — no
-      # apt.llvm.org dance.
-      - name: Install LLVM + toolchain
+      # Ubuntu 24.04 ships clang-18 by default. clang-18 -O1 emits
+      # ~10% more IR instructions per function than clang-21+, and
+      # cvm_float64.h's cvm_d_add doesn't fit in the translator's
+      # 245-slot SSA register budget under that inflation
+      # (`ran out of registers` error). Bumping to clang-21 from
+      # apt.llvm.org gives IR shape comparable to the maintainer's
+      # local LLVM 22 and clears the limit.
+      #
+      # The translator's C++ shim (llvm_c_compat.cpp) papers over
+      # LLVMGetSwitchCaseValue's late arrival in upstream llvm-c, so
+      # the LLVM-C header version doesn't matter; we pick clang-21
+      # purely for IR-shape compatibility.
+      - name: Install LLVM 21 + toolchain
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang llvm llvm-dev cmake ninja-build
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 21 all
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-21 100
+          sudo update-alternatives --install /usr/bin/llvm-config llvm-config /usr/bin/llvm-config-21 100
+          sudo apt-get install -y cmake ninja-build
 
       - name: Configure
         run: cmake -B build -G Ninja -DCMAKE_C_COMPILER=${{ matrix.cc }}
@@ -51,10 +60,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install LLVM + toolchain
+      - name: Install LLVM 21 + toolchain
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang llvm llvm-dev cmake ninja-build
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 21 all
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-21 100
+          sudo update-alternatives --install /usr/bin/llvm-config llvm-config /usr/bin/llvm-config-21 100
+          sudo apt-get install -y cmake ninja-build
 
       # The embedded "no libc allocator" gate. Built defines
       # CVM_NO_STDLIB_FALLBACK across the whole tree, so libcvm's
