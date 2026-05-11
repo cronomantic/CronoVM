@@ -8,6 +8,22 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ## [Unreleased]
 
+### Added
+
+- **thumbv6m-none-eabi cross-compile sanity build.** New
+  `cmake/toolchains/thumbv6m-none-eabi.cmake` targets Cortex-M0 /
+  M0+ / RP2040 (`-mcpu=cortex-m0 -mthumb -mfloat-abi=soft`).
+  Same allowlist as thumbv7m; M0 additionally pulls in
+  `__aeabi_uidiv*`, `__aeabi_lmul`, and `__gnu_thumb1_case_uhi`
+  (libgcc helper for Thumb-1 switch-jump-table dispatch — M0 has
+  no efficient table-dispatch instruction). Added a
+  `__gnu_thumb1_*` wildcard to the allowlist to cover the latter
+  family. Footprint on Cortex-M0 (`-Os`,
+  `-DCVM_NO_STDLIB_FALLBACK`): **6125 bytes** (`.text` 4404, plus
+  the same rodata/strings as M3) — +224 B vs M3, +3.8 %. CI job
+  `linux-cortex-m-sanity` now matrices over `{thumbv7m,
+  thumbv6m}`.
+
 ### Changed
 
 - **`cvm_d_div` rounds to nearest-even.** Previously truncated

@@ -281,6 +281,28 @@ and an "after first feedback" group.
    about, and the others would each need their own guard/sticky
    plumbing for full RNE.
 
+4. ~~**thumbv6m-none-eabi (M0/M0+/RP2040) toolchain**~~ — landed
+   (2026-05-11, post-`v0.1`).
+   `cmake/toolchains/thumbv6m-none-eabi.cmake` swaps
+   `-mcpu=cortex-m3` for `-mcpu=cortex-m0` (lowest-common-
+   denominator ARMv6-M). Forward-compatible with M0+, RP2040's
+   pair of M0+ cores, and any other thumbv6m chip. Allowlist
+   gained a `__gnu_thumb1_*` wildcard for the libgcc Thumb-1
+   switch-jump-table dispatch helper M0 needs — M0 has no
+   efficient table-dispatch instruction, so GCC routes through
+   `__gnu_thumb1_case_uhi` (and the related `_uqi`/`_sqi`/`_shi`/
+   `_si` variants the wildcard pre-emptively covers).
+   Footprint on Cortex-M0 (`-Os`, NO_STDLIB_FALLBACK):
+   **6125 B total** — `.text` 4404 (+224 vs M3, +5.4 %), same
+   1144 B rodata + 577 B strings as M3 (the dispatch table is
+   CPU-independent). 25 undefined symbols (vs 19 on M3), all
+   in the existing allowlist (M0 additionally pulls in
+   `__aeabi_uidiv`/`__aeabi_idiv`/`__aeabi_uidivmod`/
+   `__aeabi_idivmod`/`__aeabi_lmul` under the `__aeabi_*`
+   wildcard, and `__gnu_thumb1_case_uhi` under the new
+   `__gnu_thumb1_*` one). CI job `linux-cortex-m-sanity` now
+   matrices over `{thumbv7m, thumbv6m}`.
+
 ## Recently closed
 
 - ~~**Block-local SSA register reuse in the translator**~~ — landed.

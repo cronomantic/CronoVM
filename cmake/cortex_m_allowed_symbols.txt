@@ -44,6 +44,16 @@ sqrtf
 # changing set across compiler versions. ---
 __aeabi_*
 
+# --- GCC libgcc Thumb-1 helpers. Cortex-M0-class chips (ARMv6-M /
+# thumbv6m) lack the efficient jump-table dispatch the M3+ ISA
+# provides, so GCC emits calls to `__gnu_thumb1_case_*` helpers that
+# read smaller-than-word table entries at runtime. Five flavours
+# exist (`sqi`/`uqi`/`shi`/`uhi`/`si`); only `uhi` is observed in
+# libcvm.a today, but the prefix covers all of them. GCC-specific
+# but legitimately part of the compiler runtime ABI, like
+# `__aeabi_*`. ---
+__gnu_thumb1_*
+
 # --- compiler-rt builtins (also legitimate compiler-runtime ABI;
 # included in case a future user swaps the toolchain for clang+lld+
 # compiler-rt instead of GCC+libgcc). ---
