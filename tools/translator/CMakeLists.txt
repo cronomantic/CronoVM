@@ -75,9 +75,17 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
              switch_table switch_neg_table reject_double)
     set(_src ${_fixture_dir}/${name}.c)
     set(_bc  ${_fixture_out}/${name}.bc)
+    # -ffreestanding turns off __STDC_HOSTED__, so clang's bundled
+    # <stdint.h> stops chaining via #include_next into the system's
+    # arch-specific glibc headers. Without it, `--target=i386-elf` on
+    # Ubuntu reaches /usr/include/stdint.h, which needs
+    # /usr/include/i386-linux-gnu/bits/libc-header-start.h — not
+    # installed without libc6-dev-i386. We are bare-metal anyway, so
+    # freestanding is the right semantic too.
     add_custom_command(
         OUTPUT  ${_bc}
-        COMMAND ${CVM_FIXTURE_CC} --target=i386-elf -emit-llvm -O1
+        COMMAND ${CVM_FIXTURE_CC} --target=i386-elf -ffreestanding
+                                    -emit-llvm -O1
                                     -I${CVM_SOURCE_ROOT}/runtime/lib
                                     -c ${_src} -o ${_bc}
         DEPENDS ${_src}
