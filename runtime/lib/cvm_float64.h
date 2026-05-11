@@ -490,6 +490,57 @@ static cvm_f64 cvm_d_mul(cvm_f64 a, cvm_f64 b) {
                       out_lo);
 }
 
+/* Apply IEEE 754 round-to-nearest-even to a 54-bit divider quotient.
+ *
+ * Inputs are the post-loop state of `cvm_d_div` (below). On entry
+ * `*q_hi:*q_lo` holds the 54-bit quotient with leading 1 at bit 53,
+ * bits 52..1 the significand fraction, bit 0 the guard bit. `r_lo`
+ * and `r_hi` carry the residual remainder — used only to derive the
+ * sticky bit. On return `*q_hi:*q_lo` is the post-rounded 53-bit
+ * significand (leading 1 at bit 52, fraction in bits 51..0) and
+ * `*r_exp_signed` may have incremented by one if rounding overflowed.
+ *
+ * Split out of cvm_d_div as a noinline helper for SSA-pressure
+ * reasons — clang's IR for the merged function fits LLVM 22 but
+ * crosses the translator's 245-slot pre-allocator ceiling under
+ * LLVM 18's inflated IR shape. The CALL+spill across this helper
+ * lets the loop-locals (a_m_*, b_m_*, r_*) go dead before the
+ * rounding-locals (guard, sticky, lsb, new_lo, carry) come live. */
+__attribute__((noinline))
+static void cvm_d_div_round_rne(uint32_t *q_hi, uint32_t *q_lo,
+                                int32_t *r_exp_signed,
+                                uint32_t r_lo, uint32_t r_hi)
+{
+    uint32_t qh = *q_hi;
+    uint32_t ql = *q_lo;
+
+    uint32_t guard  = ql & 1u;
+    uint32_t sticky = (r_lo | r_hi) ? 1u : 0u;
+
+    /* Drop guard bit. Significand now leads at bit 52. */
+    ql = (ql >> 1) | (qh << 31);
+    qh = qh >> 1;
+
+    uint32_t lsb = ql & 1u;
+    if (guard && (sticky || lsb)) {
+        uint32_t new_lo = ql + 1u;
+        uint32_t carry  = (new_lo == 0u) ? 1u : 0u;
+        ql = new_lo;
+        qh = qh + carry;
+        /* Significand overflow into bit 53: shift right and bump
+         * exponent. The bit shifted out is always 0 (we just
+         * incremented an all-ones significand). */
+        if (qh & 0x200000u) {
+            ql = (ql >> 1) | ((qh & 1u) << 31);
+            qh = qh >> 1;
+            *r_exp_signed = *r_exp_signed + 1;
+        }
+    }
+
+    *q_hi = qh;
+    *q_lo = ql;
+}
+
 /* --- Division: restoring long-division on 53-bit mantissas ----------- */
 __attribute__((noinline))
 static cvm_f64 cvm_d_div(cvm_f64 a, cvm_f64 b) {
@@ -564,38 +615,13 @@ static cvm_f64 cvm_d_div(cvm_f64 a, cvm_f64 b) {
     int32_t r_exp_signed = (int32_t)CVM_D_EXP(a) - (int32_t)CVM_D_EXP(b)
                          + 1023 + exp_adjust;
 
-    /* IEEE 754 round-to-nearest-even.
-     *   G = q bit 0          (the extra bit we just computed)
-     *   S = (R != 0)          (any would-be bits below G are nonzero)
-     *   LSB = significand bit 0 (q bit 1, becomes bit 0 after >>1)
-     *
-     * Round up iff  G && (S || LSB).
-     * Round-half-to-even: when G=1 and S=0, we tie-break toward an
-     * even LSB — round up only when current LSB is 1. */
-    uint32_t guard  = q_lo & 1u;
-    uint32_t sticky = (r_lo | r_hi) ? 1u : 0u;
-
-    /* Drop the guard bit; significand now occupies bits 52..0 with
-     * leading 1 at bit 52, as the packer expects. */
-    q_lo = (q_lo >> 1) | (q_hi << 31);
-    q_hi = q_hi >> 1;
-
-    uint32_t lsb = q_lo & 1u;
-    if (guard && (sticky || lsb)) {
-        uint32_t new_lo = q_lo + 1u;
-        uint32_t carry  = (new_lo == 0u) ? 1u : 0u;
-        q_lo = new_lo;
-        q_hi = q_hi + carry;
-        /* Significand overflow: 0x1F_FFFF:FFFFFFFF + 1 = 0x20_0000:0
-         * means the leading 1 climbed from bit 52 to bit 53. Shift
-         * right once and bump the exponent; the bit we drop is always
-         * 0 here because we just incremented an all-ones significand. */
-        if (q_hi & 0x200000u) {
-            q_lo = (q_lo >> 1) | ((q_hi & 1u) << 31);
-            q_hi = q_hi >> 1;
-            r_exp_signed += 1;
-        }
-    }
+    /* Hand the post-loop state off to the rounding helper. The CALL
+     * lets the loop locals (a_m_*, b_m_*) and r_lo/r_hi go dead
+     * after the helper returns — they're spilled across the call
+     * via the standard liveness path but don't need permanent regs
+     * any more, which keeps cvm_d_div under the translator's 245-
+     * slot pre-allocator ceiling on LLVM 18's slightly inflated IR. */
+    cvm_d_div_round_rne(&q_hi, &q_lo, &r_exp_signed, r_lo, r_hi);
 
     if (r_exp_signed >= 0x7FF) return r_sign ? CVM_D_NEG_INF : CVM_D_INF;
     if (r_exp_signed <= 0)     return r_sign ? CVM_D_NEG_ZERO : CVM_D_ZERO;
