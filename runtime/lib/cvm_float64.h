@@ -311,7 +311,16 @@ static uint32_t cvm_d_to_u32(cvm_f64 x) {
 /* --- Arithmetic: add / sub ------------------------------------------- */
 /* Align mantissas to the larger exponent, add or subtract, renormalise.
  * Truncate rounding (drop bits below position 0 of the aligned mantissa).
- * FTZ on output. */
+ * FTZ on output.
+ *
+ * Same shape as cvm_d_div below: every 64-bit operation is open-coded
+ * on two `uint32_t` halves, and `cvm_i64_add/sub/cvm_u64_shr/shl` are
+ * NOT called from this body. Going through the struct helpers was
+ * portable enough under clang 22 but inflates the SSA register count
+ * by ~10% under clang 18-21 — `cvm_d_add` would then bust the
+ * translator's 245-slot SSA register budget. Scalarising drops the
+ * function back into the budget and makes the IR shape stable across
+ * clang versions. */
 __attribute__((noinline))
 static cvm_f64 cvm_d_add(cvm_f64 a, cvm_f64 b) {
     if (cvm_d_isnan(a) || cvm_d_isnan(b)) return CVM_D_NAN;
@@ -337,48 +346,65 @@ static cvm_f64 cvm_d_add(cvm_f64 a, cvm_f64 b) {
 
     uint32_t a_exp = CVM_D_EXP(a);
     uint32_t b_exp = CVM_D_EXP(b);
-    cvm_i64 a_m, b_m;
-    a_m.lo = a.lo;  a_m.hi = CVM_D_MHI(a) | 0x100000u;     /* implicit 1 */
-    b_m.lo = b.lo;  b_m.hi = CVM_D_MHI(b) | 0x100000u;
+    uint32_t a_m_lo = a.lo;
+    uint32_t a_m_hi = CVM_D_MHI(a) | 0x100000u;         /* implicit 1 */
+    uint32_t b_m_lo = b.lo;
+    uint32_t b_m_hi = CVM_D_MHI(b) | 0x100000u;
 
-    /* Align b to a's exponent (a is the larger). */
+    /* Align b to a's exponent (a is the larger). Inline 64-bit right
+     * shift over the two halves. */
     uint32_t exp_diff = a_exp - b_exp;
-    if (exp_diff >= 64u) return a;                         /* b lost in the noise */
-    b_m = cvm_u64_shr(b_m, exp_diff);
+    if (exp_diff >= 64u) return a;                       /* b lost in the noise */
+    if (exp_diff >= 32u) {
+        b_m_lo = b_m_hi >> (exp_diff - 32u);
+        b_m_hi = 0u;
+    } else if (exp_diff > 0u) {
+        b_m_lo = (b_m_lo >> exp_diff) | (b_m_hi << (32u - exp_diff));
+        b_m_hi = b_m_hi >> exp_diff;
+    }
 
-    cvm_i64 r_m;
+    uint32_t r_lo, r_hi;
     uint32_t r_exp = a_exp;
     if (eff_sub) {
-        r_m = cvm_i64_sub(a_m, b_m);
-        if (r_m.lo == 0u && r_m.hi == 0u) return CVM_D_ZERO;
-        /* Renormalise: leading 1 may be below position 52 after subtraction.
-         * Find it (somewhere in bits 0..52 of r_m) and shift left to bit 52. */
+        /* r = a_m - b_m (two halves with borrow). */
+        r_lo = a_m_lo - b_m_lo;
+        r_hi = a_m_hi - b_m_hi - (a_m_lo < b_m_lo ? 1u : 0u);
+        if (r_lo == 0u && r_hi == 0u) return CVM_D_ZERO;
+        /* Renormalise: leading 1 lives somewhere in bits 0..52. Find
+         * it and shift left so it lands at bit 52. After subtraction
+         * of two 53-bit normalised values, leading is <= 52, so the
+         * shift is non-negative. */
         int leading;
-        if (r_m.hi != 0u) leading = 32 + cvm__top_bit_u32(r_m.hi);
-        else              leading =      cvm__top_bit_u32(r_m.lo);
+        if (r_hi != 0u) leading = 32 + cvm__top_bit_u32(r_hi);
+        else            leading =      cvm__top_bit_u32(r_lo);
         int shl = 52 - leading;
         if (shl > 0) {
-            r_m = cvm_u64_shl(r_m, (uint32_t)shl);
+            uint32_t n = (uint32_t)shl;
+            if (n >= 32u) {
+                r_hi = r_lo << (n - 32u);
+                r_lo = 0u;
+            } else {
+                r_hi = (r_hi << n) | (r_lo >> (32u - n));
+                r_lo = r_lo << n;
+            }
             int32_t r_exp_signed = (int32_t)r_exp - shl;
             if (r_exp_signed <= 0) return r_sign ? CVM_D_NEG_ZERO : CVM_D_ZERO;
             r_exp = (uint32_t)r_exp_signed;
-        } else if (shl < 0) {
-            r_m = cvm_u64_shr(r_m, (uint32_t)(-shl));
-            int32_t r_exp_signed = (int32_t)r_exp + (-shl);
-            if (r_exp_signed >= 0x7FF) return r_sign ? CVM_D_NEG_INF : CVM_D_INF;
-            r_exp = (uint32_t)r_exp_signed;
         }
     } else {
-        r_m = cvm_i64_add(a_m, b_m);
-        /* Possible overflow into bit 53. Shift right and bump exp. */
-        if (r_m.hi & 0x200000u) {
-            r_m = cvm_u64_shr(r_m, 1u);
+        /* r = a_m + b_m (two halves with carry). */
+        r_lo = a_m_lo + b_m_lo;
+        r_hi = a_m_hi + b_m_hi + (r_lo < a_m_lo ? 1u : 0u);
+        /* Possible overflow into bit 53. Right-shift by 1 and bump exp. */
+        if (r_hi & 0x200000u) {
+            r_lo = (r_lo >> 1) | (r_hi << 31);
+            r_hi = r_hi >> 1;
             r_exp++;
             if (r_exp >= 0x7FFu) return r_sign ? CVM_D_NEG_INF : CVM_D_INF;
         }
     }
 
-    return cvm_d_pack(r_sign, r_exp, r_m.hi & 0xFFFFFu, r_m.lo);
+    return cvm_d_pack(r_sign, r_exp, r_hi & 0xFFFFFu, r_lo);
 }
 
 static inline cvm_f64 cvm_d_sub(cvm_f64 a, cvm_f64 b) {
