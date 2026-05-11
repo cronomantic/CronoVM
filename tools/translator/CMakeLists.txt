@@ -26,6 +26,18 @@ list(TRANSFORM LLVM_LIBS REPLACE "^-l" "")
 
 message(STATUS "Found LLVM ${LLVM_VERSION} (${LLVM_CONFIG_EXE})")
 
+# LLVMGetSwitchCaseValue lives in llvm-c/Core.h since LLVM 19 — earlier
+# releases (e.g. Ubuntu 24.04's default LLVM 18.1) only expose successor
+# blocks through the C ABI, and case constants are unreachable from
+# pure C. cvm_translator's LLVMSwitch lowering needs them, so fail fast
+# with a clear message instead of letting the compile error rain down.
+if(LLVM_VERSION VERSION_LESS 19)
+    message(FATAL_ERROR
+        "CronoVM's translator requires LLVM >= 19 "
+        "(LLVMGetSwitchCaseValue missing in older releases). "
+        "Found LLVM ${LLVM_VERSION} at ${LLVM_CONFIG_EXE}.")
+endif()
+
 add_executable(cvm-translate translator.c)
 target_include_directories(cvm-translate PRIVATE ${CVM_SOURCE_ROOT}/include)
 target_include_directories(cvm-translate SYSTEM PRIVATE ${LLVM_INCDIR})

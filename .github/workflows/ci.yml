@@ -16,14 +16,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # llvm-dev pulls headers + libs for the translator's LLVM-C
-      # bindings; clang is needed at fixture-build time even on the GCC
-      # row, because tools/translator/CMakeLists.txt resolves a separate
-      # clang binary for `--target=i386-elf -emit-llvm`.
-      - name: Install LLVM + toolchain
+      # CronoVM's translator needs LLVM >= 19 (LLVMGetSwitchCaseValue
+      # was added in 19; Ubuntu 24.04's default llvm-dev is 18.1, too
+      # old). apt.llvm.org's llvm.sh installs the upstream packages
+      # cleanly. `all` pulls clang-19 + llvm-19 + llvm-19-dev.
+      # update-alternatives points unversioned `clang` and `llvm-config`
+      # at the new install so the rest of the workflow doesn't need to
+      # know the version.
+      - name: Install LLVM 19 + toolchain
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang llvm llvm-dev cmake ninja-build
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 19 all
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-19 100
+          sudo update-alternatives --install /usr/bin/llvm-config llvm-config /usr/bin/llvm-config-19 100
+          sudo apt-get install -y cmake ninja-build
 
       - name: Configure
         run: cmake -B build -G Ninja -DCMAKE_C_COMPILER=${{ matrix.cc }}
@@ -40,10 +47,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install LLVM + toolchain
+      - name: Install LLVM 19 + toolchain
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang llvm llvm-dev cmake ninja-build
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 19 all
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-19 100
+          sudo update-alternatives --install /usr/bin/llvm-config llvm-config /usr/bin/llvm-config-19 100
+          sudo apt-get install -y cmake ninja-build
 
       # The embedded "no libc allocator" gate. Built defines
       # CVM_NO_STDLIB_FALLBACK across the whole tree, so libcvm's
@@ -51,11 +62,17 @@ jobs:
       # We can't run the full suite (e2e_add etc. use the default
       # allocator path), but e2e_allocator exercises the hook end-to-end
       # — that's the test that validates the gate works.
+      #
+      # `>-` folds same-indent lines with a space and strips the final
+      # newline. The previous `>` form with extra indentation on the
+      # continuation lines broke because YAML folded scalars preserve
+      # *increased* indentation as literal newlines (each -D became its
+      # own line and the shell tried to exec it).
       - name: Configure (CVM_NO_STDLIB_FALLBACK)
-        run: >
+        run: >-
           cmake -B build -G Ninja
-                -DCMAKE_C_COMPILER=clang
-                -DCMAKE_C_FLAGS=-DCVM_NO_STDLIB_FALLBACK
+          -DCMAKE_C_COMPILER=clang
+          -DCMAKE_C_FLAGS=-DCVM_NO_STDLIB_FALLBACK
 
       - name: Build
         run: cmake --build build
@@ -79,7 +96,8 @@ jobs:
 
       # The local dev environment is MSYS2 UCRT64; match it on CI so
       # llvm-config / clang behave identically to what the maintainer
-      # tests against.
+      # tests against. The UCRT64 mingw-w64-ucrt-x86_64-llvm package is
+      # well past the LLVM 19 minimum.
       - uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
@@ -108,7 +126,8 @@ jobs:
       # Apple Clang ships without llvm-config (it's part of an internal
       # toolchain). Brew's LLVM keg gets the standalone tools, including
       # llvm-config and a clang that supports --target=i386-elf for
-      # fixture compilation.
+      # fixture compilation. Brew's `llvm` formula tracks upstream, so
+      # it's well past the LLVM 19 minimum.
       - name: Install LLVM via brew
         run: |
           brew update

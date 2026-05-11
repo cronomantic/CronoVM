@@ -1980,8 +1980,12 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                  * `LLVMGetCondition` is only valid for `LLVMBranchInst`;
                  * on a switch it returns NULL. The condition is at
                  * operand 0. Case constants are only reachable via
-                 * `LLVMGetSwitchCaseValue` — the generic operand list
-                 * exposes successor blocks but not the constants. */
+                 * `LLVMGetSwitchCaseValue` — the LLVM-C operand list
+                 * exposes successor blocks (cond + default + case_bbs)
+                 * but hides the constants. `LLVMGetSwitchCaseValue` was
+                 * added in LLVM 19; configure-time check in
+                 * tools/translator/CMakeLists.txt errors out on older
+                 * LLVM. */
                 LLVMValueRef       cond_v     = LLVMGetOperand(i, 0);
                 LLVMBasicBlockRef  default_bb = LLVMGetSwitchDefaultDest(i);
                 uint8_t            cond_reg   = cg_reg_for(cg, cond_v);

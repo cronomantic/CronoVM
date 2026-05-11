@@ -22,6 +22,15 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 add_library(cvm STATIC src/cvm.c)
+
+# cvm.c calls sqrtf() (FSQRT opcode). GCC on Linux does not link libm
+# implicitly. On Windows the C runtime covers math; on Unix-likes the
+# `-lm` switch is the portable spelling (libm.so / libSystem stub).
+# PUBLIC because consumers (test_e2e, examples/embedder/host, etc.)
+# link libcvm.a statically and inherit its undefined references.
+if(UNIX)
+    target_link_libraries(cvm PUBLIC m)
+endif()
 # PUBLIC include path uses CVM_SOURCE_ROOT for the build interface so
 # consumers that pull this in via add_subdirectory() see `cvm.h`
 # regardless of where their own CMAKE_CURRENT_SOURCE_DIR points.
