@@ -26,23 +26,20 @@ list(TRANSFORM LLVM_LIBS REPLACE "^-l" "")
 
 message(STATUS "Found LLVM ${LLVM_VERSION} (${LLVM_CONFIG_EXE})")
 
-# LLVMGetSwitchCaseValue lives in llvm-c/Core.h since LLVM 19 — earlier
-# releases (e.g. Ubuntu 24.04's default LLVM 18.1) only expose successor
-# blocks through the C ABI, and case constants are unreachable from
-# pure C. cvm_translator's LLVMSwitch lowering needs them, so fail fast
-# with a clear message instead of letting the compile error rain down.
-if(LLVM_VERSION VERSION_LESS 19)
-    message(FATAL_ERROR
-        "CronoVM's translator requires LLVM >= 19 "
-        "(LLVMGetSwitchCaseValue missing in older releases). "
-        "Found LLVM ${LLVM_VERSION} at ${LLVM_CONFIG_EXE}.")
-endif()
+# C++ is needed only for llvm_c_compat.cpp — a thin shim around the
+# LLVM C++ API for SwitchInst case-value retrieval. The LLVM-C wrapper
+# (`LLVMGetSwitchCaseValue`) was only added very recently in upstream
+# llvm-c/Core.h (LLVM 20+); older but otherwise-fine toolchains
+# (Ubuntu 24.04's llvm-19, llvm-18) lack the symbol but still ship
+# the C++ headers, so the shim gets us back to portable territory.
+enable_language(CXX)
 
-add_executable(cvm-translate translator.c)
+add_executable(cvm-translate translator.c llvm_c_compat.cpp)
 target_include_directories(cvm-translate PRIVATE ${CVM_SOURCE_ROOT}/include)
 target_include_directories(cvm-translate SYSTEM PRIVATE ${LLVM_INCDIR})
 target_link_directories(cvm-translate PRIVATE ${LLVM_LIBDIR})
 target_link_libraries(cvm-translate PRIVATE ${LLVM_LIBS})
+target_compile_features(cvm-translate PRIVATE cxx_std_17)
 target_compile_options(cvm-translate PRIVATE
     $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra>
     $<$<C_COMPILER_ID:MSVC>:/W4>

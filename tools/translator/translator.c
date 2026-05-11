@@ -20,6 +20,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Bridge to the LLVM C++ API for SwitchInst case-value retrieval. The
+ * upstream `LLVMGetSwitchCaseValue` wrapper landed in llvm-c/Core.h
+ * very late (LLVM 20+); to support older but otherwise-fine toolchains
+ * (Ubuntu 24.04's llvm-19, llvm-18) we ship our own thin shim in
+ * llvm_c_compat.cpp. See that file for the implementation. */
+extern LLVMValueRef cvm_llvm_get_switch_case_value(LLVMValueRef SI, unsigned i);
+
 static int g_errors = 0;
 
 static void diag_v(const char *func, const char *fmt, ...) {
@@ -1979,13 +1986,14 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                  *
                  * `LLVMGetCondition` is only valid for `LLVMBranchInst`;
                  * on a switch it returns NULL. The condition is at
-                 * operand 0. Case constants are only reachable via
-                 * `LLVMGetSwitchCaseValue` — the LLVM-C operand list
-                 * exposes successor blocks (cond + default + case_bbs)
-                 * but hides the constants. `LLVMGetSwitchCaseValue` was
-                 * added in LLVM 19; configure-time check in
-                 * tools/translator/CMakeLists.txt errors out on older
-                 * LLVM. */
+                 * operand 0. Case constants reach us only through the
+                 * C++ helper SwitchInst::CaseHandle::getCaseValue() —
+                 * the LLVM-C operand list exposes successor blocks
+                 * (cond + default + case_bbs) but hides the constants,
+                 * and the upstream `LLVMGetSwitchCaseValue` wrapper
+                 * landed too late to rely on. Our
+                 * `cvm_llvm_get_switch_case_value` shim bridges to the
+                 * C++ method; see llvm_c_compat.cpp. */
                 LLVMValueRef       cond_v     = LLVMGetOperand(i, 0);
                 LLVMBasicBlockRef  default_bb = LLVMGetSwitchDefaultDest(i);
                 uint8_t            cond_reg   = cg_reg_for(cg, cond_v);
@@ -2026,7 +2034,7 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 if (n_cases >= 4) {
                     int valid = 1;
                     for (unsigned k = 1; k < n_succ; ++k) {
-                        LLVMValueRef cv = LLVMGetSwitchCaseValue(i, k);
+                        LLVMValueRef cv = cvm_llvm_get_switch_case_value(i, k);
                         if (!cv || !LLVMIsAConstantInt(cv)) { valid = 0; break; }
                         uint64_t zv = LLVMConstIntGetZExtValue(cv) & cond_mask;
                         if (zv > (uint64_t)UINT32_MAX) { valid = 0; break; }
@@ -2058,7 +2066,7 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     }
                     for (uint32_t k = 0; k < n_range; ++k) targets[k] = default_bb;
                     for (unsigned k = 1; k < n_succ; ++k) {
-                        LLVMValueRef cv = LLVMGetSwitchCaseValue(i, k);
+                        LLVMValueRef cv = cvm_llvm_get_switch_case_value(i, k);
                         int32_t  v   = (int32_t)(uint32_t)
                                        (LLVMConstIntGetZExtValue(cv) & cond_mask);
                         uint32_t idx = (uint32_t)(v - lo);
@@ -2135,7 +2143,7 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                      * SExt would sign-extend `i8 -1` to 0xFFFFFFFF and
                      * miss the 0xFF cond_reg. */
                     for (unsigned k = 1; k < n_succ; ++k) {
-                        LLVMValueRef      case_val = LLVMGetSwitchCaseValue(i, k);
+                        LLVMValueRef      case_val = cvm_llvm_get_switch_case_value(i, k);
                         LLVMBasicBlockRef case_bb  = LLVMGetSuccessor(i, k);
                         if (!case_val || !LLVMIsAConstantInt(case_val)) {
                             ERR(cg->fn_name,
