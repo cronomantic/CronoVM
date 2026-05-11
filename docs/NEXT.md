@@ -232,10 +232,38 @@ and an "after first feedback" group.
    defer-until-needed. Surface when a host API needs versioning
    (e.g. `renderer.software@1` vs `renderer.gpu@1`).
 
-2. **Embedded-target footprint audit**. Builds on the Cortex-M
-   cross-compile sanity item above. Once the thumbv7m build links:
-   measure `.text` under `-Os`, decide whether to gate optional
-   opcodes behind `#ifdef CVM_ENABLE_*`.
+2. ~~**Embedded-target footprint audit**~~ — landed (2026-05-11,
+   post-`v0.1`). Cross-built `libcvm.a` for `thumbv7m-none-eabi`
+   with `-DCMAKE_BUILD_TYPE=MinSizeRel -DCVM_NO_STDLIB_FALLBACK=ON`
+   (arm-none-eabi-gcc 14.2.1, soft-float). Result:
+
+       .text                 4180 bytes
+       .rodata (jump table)  1024 bytes  (256-entry dispatch)
+       .rodata (other)        120 bytes  (CSWTCH tables)
+       .rodata.str1.1         577 bytes  (error strings + diag)
+       .data, .bss              0
+       ──────────────────────────────────
+       total                 5901 bytes  (5.8 KiB)
+
+   Well under the 16 KiB target — **~64% headroom**. Per-function
+   the top contributors are `cvm_run_args` 1852 B (the threaded
+   dispatch loop covering all 55 opcodes; ~34 B/opcode amortised),
+   `cvm_load_ex` 1686 B (image loader + validator), and the
+   1024 B dispatch jump table.
+
+   19 undefined symbols, all allowlist-approved: 12 `__aeabi_*`
+   soft-float helpers (mandatory on Cortex-M3 with
+   `-mfloat-abi=soft`), `memcpy`/`memset`/`memmove`/`memcmp`/
+   `memchr`/`strcmp`/`strncmp`, and `sqrtf`. Zero libc leakage.
+
+   **Conclusion: optional-opcode gating (`#ifdef CVM_ENABLE_*`)
+   is not worth pursuing.** Removing an opcode saves ~34 bytes of
+   handler code but does NOT shrink the 1024 B dispatch table
+   (still indexed across the full 0–255 opcode space). To recover
+   1 KiB you'd have to remove ~30 opcodes, which would gut the
+   ISA. The footprint is already compact enough that
+   STM32F103-class chips (64 KiB flash) host the VM in under 10%
+   of their flash budget.
 
 3. **Round-to-nearest in `cvm_d_div`** (optional). Currently
    truncates (round-toward-zero). Within 1 ULP of IEEE, sufficient
@@ -808,13 +836,25 @@ entirely, that's a one-line `#ifdef CVM_NO_STDLIB_FALLBACK` guard
 around the fallback bodies of `cvm_int_alloc` / `cvm_int_free`.
 Defer until a target asks.
 
-### Interpreter footprint audit
+### Interpreter footprint audit  *(done 2026-05-11)*
 
-`src/cvm.c` should compile under 16 KiB on Cortex-M with `-Os`.
-Measure when there's a real target; if it grows too much, guard
-optional opcodes behind compile-time `#ifdef CVM_ENABLE_*` flags so
-a minimal build can drop them. Not done yet — needs a cross-compile
-toolchain that doesn't yet exist in this tree.
+Measured against `thumbv7m-none-eabi` (Cortex-M3-class, soft-float)
+at `-Os` with `-DCVM_NO_STDLIB_FALLBACK`: **5901 bytes total** —
+4180 B `.text`, 1024 B dispatch jump table, 577 B error strings,
+120 B `CSWTCH` tables, 0 `.data`, 0 `.bss`. ~34 % of the 16 KiB
+target, ~9 % of a 64 KiB STM32F103 flash.
+
+Per-function the top three are `cvm_run_args` 1852 B, `cvm_load_ex`
+1686 B, and the dispatch jump table 1024 B — together 78 % of
+`.text + .rodata`.
+
+Optional-opcode gating via `#ifdef CVM_ENABLE_*` was the originally
+hypothesised mitigation; the audit retired it. Removing an opcode
+saves ~34 bytes in the handler body but does NOT shrink the 1024 B
+dispatch table (it indexes the full 0–255 opcode space regardless
+of how many slots are live). To recover 1 KiB you'd have to drop
+~30 opcodes — gut the ISA for a marginal win on a budget that
+isn't tight. Keep the full ISA.
 
 ### Default sizes
 

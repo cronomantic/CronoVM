@@ -6,6 +6,22 @@ project adheres to [Semantic Versioning](https://semver.org/) — once
 1.0 is reached. Pre-1.0 releases may break compatibility on any minor
 version bump; breaks are called out explicitly under **Breaking**.
 
+## [Unreleased]
+
+### Notes
+
+- **Embedded footprint measured.** Cross-built `libcvm.a` for
+  `thumbv7m-none-eabi` (Cortex-M3-class, soft-float) with
+  `-Os` + `-DCVM_NO_STDLIB_FALLBACK`: **5901 bytes total** —
+  4180 B `.text`, 1024 B dispatch jump table, 577 B error
+  strings, 120 B switch tables, 0 `.data`, 0 `.bss`.
+  ~9 % of a 64 KiB STM32F103 flash.
+  Compile-time opcode gating (`#ifdef CVM_ENABLE_*`) was on
+  the roadmap but the measurement retired it — removing an
+  opcode saves ~34 B in the handler body but cannot shrink
+  the dispatch table, which indexes the full 0–255 opcode
+  space regardless. The full ISA stays in every build.
+
 ## [0.1.0] — 2026-05-11
 
 First public release. Closes the foundation phase: the VM runs C
@@ -186,7 +202,7 @@ needs them uses the runtime headers below.
 - Five GitHub Actions jobs on push-to-main / pull_request:
   `linux × {clang, gcc}` (full ctest); `linux-no-stdlib-fallback`
   (embedded gate); `linux-cortex-m-sanity` (thumbv7m cross-build
-  + nm allowlist); `windows-ucrt64-clang` (msys2 ucrt64);
+  with nm allowlist); `windows-ucrt64-clang` (msys2 ucrt64);
   `macos-clang` (brew LLVM).
 
 #### Documentation
