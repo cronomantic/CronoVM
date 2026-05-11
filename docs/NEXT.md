@@ -84,11 +84,11 @@ and an "after first feedback" group.
 2. **Adversarial-fixture pass**. The session-5 bug-find rate (three
    latent bugs in one session, all surfaced by the same
    not-particularly-exotic fixture) suggests the test surface is
-   starting to bite hard but more lurkers exist. Remaining items:
-     - a function near the R252 SSA limit (catches off-by-one in the
-       SSA range now that `CG_MAX_SSA_REG` is 252);
-     - a long, call-heavy loop that stresses spill compaction and
-       branch relaxation simultaneously.
+   starting to bite hard. Remaining item: a long, call-heavy loop
+   that stresses spill compaction and branch relaxation
+   simultaneously. (The "function near the R252 SSA limit" sub-item
+   was retired by the block-local reuse landing — the limit no
+   longer bites for any realistic function.)
 
 3. **Translator bitcode-parser fuzzing**. The `.bc` input is
    user-supplied at translation time and the parser is the most
@@ -122,6 +122,34 @@ and an "after first feedback" group.
 
 ## Recently closed
 
+- ~~**Block-local SSA register reuse in the translator**~~ — landed.
+  Pre-allocator used to assign one register per SSA value
+  function-wide, hitting the 245-slot ceiling (R8..R252) on any
+  function with a few hundred SSA values. Worse, the ceiling drifted
+  ~10% across clang versions, so code that fit under clang 22 busted
+  under clang 18-21. Now a value is "block-local" if every use is in
+  the same block as its def and no use is a phi; such values' regs
+  go back to a per-block pool when the lexically-last in-block use
+  passes. Per-block scope (not function-wide) avoids the back-edge
+  hazard where a re-entered block would clobber a cross-block tenant.
+  Cross-block values, phi results, and phi inputs still get
+  permanent regs; the spill-around-call dataflow is untouched (it
+  works on the union of values per bit, conservative but always safe
+  for reuse). Effect on `f64_basic` (LLVM 22): `cvm_d_add` peak
+  pre-alloc reg count drops from ~190+ (near ceiling) to 99/245
+  (40%), `cvm_d_div` from ~167 to 89, `cvm_d_mul` from ~151 to 57.
+  Headroom of ~150 slots even on the heaviest function. CI Linux
+  jobs reverted from `apt.llvm.org` clang-21 install back to the
+  system `llvm-dev` (LLVM 18 on Ubuntu Noble) — the reuse makes the
+  bump unnecessary.
+
+  Subsidiary cleanup: `cvm_d_add` was also scalarised earlier in the
+  CI debug round (every 64-bit op open-coded on two `uint32_t`
+  halves, no `cvm_i64_*`/`cvm_u64_*` calls inside the body — same
+  shape `cvm_d_div` has used since session 4). Kept after the reuse
+  landed because the scalar form is independently good and prevents
+  one specific load-i64 fold that the helper-call form occasionally
+  triggers.
 - ~~**GitHub Actions CI**~~ — landed
   ([.github/workflows/ci.yml](../.github/workflows/ci.yml)). Four jobs
   on push-to-main / pull_request:
