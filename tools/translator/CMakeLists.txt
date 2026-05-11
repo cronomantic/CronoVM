@@ -45,6 +45,74 @@ target_compile_options(cvm-translate PRIVATE
     $<$<C_COMPILER_ID:MSVC>:/W4>
 )
 
+# --- Bitcode-parser fuzz harness (optional) -------------------------------
+# `cvm_fuzz_translate_buffer` (in translator.c) drives a parse + codegen
+# pipeline on an in-memory bitcode blob without writing anything to disk.
+# It is the unit-of-work for the libFuzzer harness in fuzz_translate.c.
+#
+# Two targets, both gated on CVM_BUILD_FUZZER (default OFF):
+#
+#   * cvm-translate-fuzz       — real libFuzzer build, ASAN+UBSAN, only
+#                                offered when the compiler actually
+#                                supports `-fsanitize=fuzzer` (clang on
+#                                Linux/macOS; mingw clang does NOT).
+#   * cvm-translate-fuzz-replay — standalone driver, no instrumentation.
+#                                Replays a corpus directory one file at
+#                                a time. Useful on hosts without libFuzzer
+#                                and as a smoke-test for the harness
+#                                wiring even on libFuzzer-capable hosts.
+#
+# Both link against translator.c built with -DCVM_NO_TRANSLATOR_MAIN so
+# the CLI's `main()` doesn't collide with libFuzzer's (or the replay
+# driver's) own `main()`.
+option(CVM_BUILD_FUZZER "Build translator bitcode-parser fuzz harness" OFF)
+if(CVM_BUILD_FUZZER)
+    include(CheckCSourceCompiles)
+    # Probe in static-library scope so CheckCSourceCompiles doesn't try
+    # to link an executable — the probe code defines LLVMFuzzerTestOneInput
+    # only (no main), and we want to test the compile flag, not the
+    # final-link plumbing.
+    set(_save_target_type ${CMAKE_TRY_COMPILE_TARGET_TYPE})
+    set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+    set(CMAKE_REQUIRED_FLAGS "-fsanitize=fuzzer-no-link")
+    check_c_source_compiles(
+        "int LLVMFuzzerTestOneInput(const unsigned char *d, unsigned long s){(void)d;(void)s;return 0;}"
+        CVM_HAVE_LIBFUZZER)
+    unset(CMAKE_REQUIRED_FLAGS)
+    set(CMAKE_TRY_COMPILE_TARGET_TYPE ${_save_target_type})
+
+    if(CVM_HAVE_LIBFUZZER)
+        add_executable(cvm-translate-fuzz
+            translator.c llvm_c_compat.cpp fuzz_translate.c)
+        target_include_directories(cvm-translate-fuzz PRIVATE ${CVM_SOURCE_ROOT}/include)
+        target_include_directories(cvm-translate-fuzz SYSTEM PRIVATE ${LLVM_INCDIR})
+        target_link_directories(cvm-translate-fuzz PRIVATE ${LLVM_LIBDIR})
+        target_link_libraries(cvm-translate-fuzz PRIVATE ${LLVM_LIBS})
+        target_compile_features(cvm-translate-fuzz PRIVATE cxx_std_17)
+        target_compile_definitions(cvm-translate-fuzz PRIVATE
+            CVM_NO_TRANSLATOR_MAIN)
+        target_compile_options(cvm-translate-fuzz PRIVATE
+            -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer)
+        target_link_options(cvm-translate-fuzz PRIVATE
+            -fsanitize=fuzzer,address,undefined)
+        message(STATUS "Fuzz: libFuzzer harness enabled (cvm-translate-fuzz)")
+    else()
+        message(STATUS "Fuzz: compiler does not support -fsanitize=fuzzer "
+                       "— skipping cvm-translate-fuzz")
+    endif()
+
+    # Standalone replay driver — no sanitizers, works everywhere.
+    add_executable(cvm-translate-fuzz-replay
+        translator.c llvm_c_compat.cpp fuzz_translate.c)
+    target_include_directories(cvm-translate-fuzz-replay PRIVATE ${CVM_SOURCE_ROOT}/include)
+    target_include_directories(cvm-translate-fuzz-replay SYSTEM PRIVATE ${LLVM_INCDIR})
+    target_link_directories(cvm-translate-fuzz-replay PRIVATE ${LLVM_LIBDIR})
+    target_link_libraries(cvm-translate-fuzz-replay PRIVATE ${LLVM_LIBS})
+    target_compile_features(cvm-translate-fuzz-replay PRIVATE cxx_std_17)
+    target_compile_definitions(cvm-translate-fuzz-replay PRIVATE
+        CVM_NO_TRANSLATOR_MAIN CVM_FUZZER_STANDALONE)
+endif()
+
 # --- Fixtures: compile test C sources to bitcode at build time ------------
 # -O1 promotes allocas (mem2reg) which step-5 codegen requires; the
 # validation tests don't care about the level, so we use -O1 everywhere.
@@ -72,7 +140,7 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
              i64_basic f64_basic two_funcs
              fib_recursive many_args alloca_swap fnptr dispatch_table
              narrow_ops mem_intrin long_branch switch_dispatch
-             switch_table switch_neg_table reject_double)
+             switch_table switch_neg_table spill_loop reject_double)
     set(_src ${_fixture_dir}/${name}.c)
     set(_bc  ${_fixture_out}/${name}.bc)
     # -ffreestanding turns off __STDC_HOSTED__, so clang's bundled
@@ -99,13 +167,36 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
 endforeach()
 add_custom_target(translator_fixtures DEPENDS ${_fixture_targets})
 
+# Stage the fixture .bc files as a fuzz seed corpus. Gated on
+# CVM_BUILD_FUZZER (only useful when the fuzz targets exist).
+# libFuzzer consumes seeds with `cvm-translate-fuzz <corpus_dir>`;
+# the replay driver takes the same files as positional argv.
+# Placed after _fixture_targets is populated so the foreach iterates.
+if(CVM_BUILD_FUZZER)
+    set(_corpus_dir ${CMAKE_CURRENT_BINARY_DIR}/fuzz_corpus)
+    set(_corpus_stamps "")
+    foreach(_bc ${_fixture_targets})
+        get_filename_component(_bc_name ${_bc} NAME)
+        set(_dst ${_corpus_dir}/${_bc_name})
+        add_custom_command(
+            OUTPUT  ${_dst}
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${_corpus_dir}
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_bc} ${_dst}
+            DEPENDS ${_bc}
+            VERBATIM)
+        list(APPEND _corpus_stamps ${_dst})
+    endforeach()
+    add_custom_target(cvm-translate-fuzz-corpus DEPENDS ${_corpus_stamps})
+endif()
+
 # Emit each .bin via the translator. Depends on cvm-translate + the .bc.
 set(_emit_targets "")
 foreach(name add pick fib abs max divmod bitops counter sum_global
              mulh float_basic fsqrt i64_basic f64_basic
              two_funcs fib_recursive many_args
              alloca_swap fnptr dispatch_table narrow_ops mem_intrin
-             long_branch switch_dispatch switch_table switch_neg_table)
+             long_branch switch_dispatch switch_table switch_neg_table
+             spill_loop)
     set(_bc  ${_fixture_out}/${name}.bc)
     set(_bin ${_fixture_out}/${name}.bin)
     add_custom_command(
@@ -259,6 +350,16 @@ add_test(NAME e2e_switch_neg_m1    COMMAND test_e2e ${_fixture_out}/switch_neg_t
 add_test(NAME e2e_switch_neg_zero  COMMAND test_e2e ${_fixture_out}/switch_neg_table.bin -1  0 7 3)  # default
 add_test(NAME e2e_switch_neg_m5    COMMAND test_e2e ${_fixture_out}/switch_neg_table.bin -1 -5 7 3)  # default (below lo)
 add_test(NAME e2e_switch_neg_pos   COMMAND test_e2e ${_fixture_out}/switch_neg_table.bin -1  5 7 3)  # default (above hi)
+# spill_loop: adversarial call-heavy loop. 12 noinline calls per iteration
+# with 8 long-lived carriers all live across every call exercises spill
+# compaction (ever_spilled + slot_of[]) at scale, and the resulting body
+# (~1000+ emitted instructions in vm_main) forces branch relaxation on the
+# back-edge BEQ/BNE. Expected returns captured from a working build; both
+# match a `gcc -O1 -fwrapv` reference compile.
+add_test(NAME e2e_spill_loop_0     COMMAND test_e2e ${_fixture_out}/spill_loop.bin            0 0)
+add_test(NAME e2e_spill_loop_1     COMMAND test_e2e ${_fixture_out}/spill_loop.bin   -500660212 1)
+add_test(NAME e2e_spill_loop_4     COMMAND test_e2e ${_fixture_out}/spill_loop.bin  -1450686863 4)
+add_test(NAME e2e_spill_loop_8     COMMAND test_e2e ${_fixture_out}/spill_loop.bin   1380580815 8)
 set_tests_properties(
     e2e_add e2e_pick_true e2e_pick_false e2e_fib_10 e2e_fib_0
     e2e_abs_neg e2e_abs_pos e2e_max_lhs e2e_max_rhs
@@ -278,4 +379,5 @@ set_tests_properties(
     e2e_switch_tab_xor e2e_switch_tab_shr e2e_switch_tab_def
     e2e_switch_neg_m4 e2e_switch_neg_m3 e2e_switch_neg_m2 e2e_switch_neg_m1
     e2e_switch_neg_zero e2e_switch_neg_m5 e2e_switch_neg_pos
+    e2e_spill_loop_0 e2e_spill_loop_1 e2e_spill_loop_4 e2e_spill_loop_8
     PROPERTIES FIXTURES_REQUIRED emitted_bins)

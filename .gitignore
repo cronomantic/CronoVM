@@ -1,6 +1,9 @@
 build/
 build-asan/
+build-wsl-fuzz/
+build-armv7m/
 out/
+Testing/
 *.o
 *.obj
 *.a

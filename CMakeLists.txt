@@ -23,6 +23,14 @@ endif()
 
 add_library(cvm STATIC src/cvm.c)
 
+# When CVM_NO_STDLIB_FALLBACK is set (via -D on the command line),
+# propagate it into the cvm target so the gate in src/cvm.c actually
+# fires. Public because consumers compiling against libcvm.a need to
+# see the same definition to pick the right ABI on cvm_load.
+if(CVM_NO_STDLIB_FALLBACK)
+    target_compile_definitions(cvm PUBLIC CVM_NO_STDLIB_FALLBACK)
+endif()
+
 # cvm.c calls sqrtf() (FSQRT opcode). GCC on Linux does not link libm
 # implicitly. On Windows the C runtime covers math; on Unix-likes the
 # `-lm` switch is the portable spelling (libm.so / libSystem stub).
@@ -52,6 +60,27 @@ target_compile_definitions(cvm PUBLIC
     CVM_VERSION_PATCH=${PROJECT_VERSION_PATCH}
     CVM_VERSION_STRING="${PROJECT_VERSION}"
 )
+
+# --- Cortex-M cross-compile sanity mode -----------------------------------
+# When `cmake/toolchains/thumbv7m-none-eabi.cmake` is in use it sets
+# CVM_EMBEDDED_SANITY_BUILD. In that mode the host-side test
+# executables, cvm-cc / cvm-translate, the embedder/installed-consumer
+# fixtures, and the install rules are all skipped — they all assume a
+# hosted environment (stdio, fork+exec, llvm-config, etc.). What runs
+# instead is a post-build `nm` allowlist check against libcvm.a that
+# fails the build if any libc symbol leaks back in (most importantly
+# malloc/free under CVM_NO_STDLIB_FALLBACK).
+if(CVM_EMBEDDED_SANITY_BUILD)
+    add_custom_command(TARGET cvm POST_BUILD
+        COMMAND ${CMAKE_COMMAND}
+                -DLIBRARY=$<TARGET_FILE:cvm>
+                -DNM=${CMAKE_NM}
+                -DALLOWLIST=${CVM_SOURCE_ROOT}/cmake/cortex_m_allowed_symbols.txt
+                -P ${CVM_SOURCE_ROOT}/cmake/check_cvm_freestanding.cmake
+        COMMENT "Cortex-M sanity: checking libcvm.a undefined symbols against allowlist"
+        VERBATIM)
+    return()
+endif()
 
 enable_testing()
 add_executable(test_vm tests/test_vm.c)

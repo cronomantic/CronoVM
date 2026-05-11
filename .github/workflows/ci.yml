@@ -106,6 +106,39 @@ jobs:
       - name: Test (allocator-hook path only)
         run: ctest --test-dir build --output-on-failure -R e2e_allocator
 
+  linux-cortex-m-sanity:
+    runs-on: ubuntu-latest
+    name: linux-cortex-m-sanity
+    steps:
+      - uses: actions/checkout@v4
+
+      # gcc-arm-none-eabi gives us arm-none-eabi-gcc (Cortex-M3-class
+      # cross compiler) + arm-none-eabi-nm for the allowlist check.
+      # ninja+cmake we already use everywhere else.
+      - name: Install arm-none-eabi toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi cmake ninja-build
+
+      # Cross-configure with the thumbv7m toolchain file and the
+      # CVM_NO_STDLIB_FALLBACK gate. The toolchain sets
+      # CVM_EMBEDDED_SANITY_BUILD=ON, which makes the top-level
+      # CMakeLists skip host-only targets (tests, cvm-cc,
+      # cvm-translate, embedder fixtures, install rules) and wire
+      # a POST_BUILD nm allowlist check onto libcvm.a.
+      - name: Configure (thumbv7m + NO_STDLIB_FALLBACK)
+        run: >-
+          cmake -B build-armv7m -G Ninja
+          -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/thumbv7m-none-eabi.cmake
+          -DCVM_NO_STDLIB_FALLBACK=ON
+
+      # `cmake --build` triggers the POST_BUILD command on libcvm.a,
+      # which runs `nm --undefined-only` and fails the build if any
+      # symbol falls outside cmake/cortex_m_allowed_symbols.txt. No
+      # ctest step — the build itself is the test.
+      - name: Build + nm allowlist check
+        run: cmake --build build-armv7m
+
   windows:
     runs-on: windows-latest
     name: windows-ucrt64-clang

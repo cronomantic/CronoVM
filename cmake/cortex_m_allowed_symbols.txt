@@ -1,0 +1,61 @@
+# Allowlist of undefined symbols permitted to appear in libcvm.a when
+# cross-compiled for thumbv7m-none-eabi (Cortex-M3-class). Used by
+# `cmake/check_cvm_freestanding.cmake` after the cvm static library is
+# built under the Cortex-M sanity toolchain.
+#
+# Rules:
+#   - One symbol pattern per line. Lines starting with `#` are ignored.
+#   - Patterns are exact-match (no globs). Use a trailing `*` to allow
+#     a prefix — the checker treats that suffix as wildcard.
+#   - The list is conservative: only symbols an embedded host can
+#     genuinely be expected to provide (compiler ABI helpers; the
+#     freestanding-mandatory string.h subset; sqrtf for the soft-float
+#     fallback) belong here.
+#
+# What MUST NOT appear here:
+#   - malloc, free, calloc, realloc   — CVM_NO_STDLIB_FALLBACK is meant
+#                                        to eliminate these entirely.
+#   - printf, fprintf, fwrite, etc.   — cvm.c does no I/O.
+#   - exit, abort, assert, errno      — cvm.c uses none of these.
+#   - __stack_chk_fail / __cyg_*      — stack protector / Cygwin compat
+#                                        should never be pulled in.
+
+# --- C standard freestanding subset (memcpy/memset/memmove/memcmp are
+# mandated by C23 freestanding; the others are practically available
+# everywhere) ---
+memcpy
+memset
+memmove
+memcmp
+memchr
+strcmp
+strncmp
+
+# --- Math (sqrtf is the only math.h symbol cvm.c references; FSQRT
+# opcode). On Cortex-M3 with -mfloat-abi=soft this resolves through
+# libgcc's soft-float helpers; on M4F+ a hardware vsqrt instruction
+# can elide it, but the import is still legitimate. ---
+sqrtf
+
+# --- ARM EABI helpers (libgcc-provided). The Procedure Call Standard
+# for ARM defines these as the compiler-runtime ABI; any freestanding
+# host that compiles thumbv7m code expects them to be linked in. We
+# allow the full prefix because the soft-float path drags in a
+# changing set across compiler versions. ---
+__aeabi_*
+
+# --- compiler-rt builtins (also legitimate compiler-runtime ABI;
+# included in case a future user swaps the toolchain for clang+lld+
+# compiler-rt instead of GCC+libgcc). ---
+__udivdi3
+__divdi3
+__udivsi3
+__divsi3
+__umoddi3
+__moddi3
+__umodsi3
+__modsi3
+__muldi3
+__ashldi3
+__ashrdi3
+__lshrdi3

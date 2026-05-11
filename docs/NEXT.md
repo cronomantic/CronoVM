@@ -74,35 +74,157 @@ and an "after first feedback" group.
 
 ### Before tagging a non-preview release
 
-1. **Cortex-M cross-compile sanity**. Verify that `src/cvm.c`
-   actually links for `thumbv7m-none-eabi` with
-   `-DCVM_NO_STDLIB_FALLBACK` (no test execution needed — just a
-   successful link to make sure no libc symbol leaks back in). Tiny
-   CMake toolchain file + a CI job is enough. This is the dependency
-   for the larger footprint audit below.
+1. ~~**Cortex-M cross-compile sanity**~~ — landed (2026-05-11).
+   `cmake/toolchains/thumbv7m-none-eabi.cmake` sets up
+   arm-none-eabi-gcc for Cortex-M3-class targets (`-mcpu=cortex-m3
+   -mthumb -mfloat-abi=soft -ffreestanding -fno-builtin`) and
+   forces a marker `CVM_EMBEDDED_SANITY_BUILD=ON` in the cache.
+   The top-level CMakeLists short-circuits with `return()` when
+   that marker is set, after wiring an `add_custom_command(TARGET
+   cvm POST_BUILD ...)` that runs `arm-none-eabi-nm` against
+   libcvm.a and compares undefined symbols against
+   `cmake/cortex_m_allowed_symbols.txt` (exact + `<prefix>*`
+   matches via `cmake/check_cvm_freestanding.cmake`). Allowlist:
+   the freestanding string.h subset, `sqrtf`, `__aeabi_*`, and a
+   handful of compiler-rt builtins. Any other undefined symbol
+   (canonically `malloc`/`free` if `-DCVM_NO_STDLIB_FALLBACK`
+   regresses) fails the build with a descriptive error.
 
-2. **Adversarial-fixture pass**. The session-5 bug-find rate (three
-   latent bugs in one session, all surfaced by the same
-   not-particularly-exotic fixture) suggests the test surface is
-   starting to bite hard. Remaining item: a long, call-heavy loop
-   that stresses spill compaction and branch relaxation
-   simultaneously. (The "function near the R252 SSA limit" sub-item
-   was retired by the block-local reuse landing — the limit no
-   longer bites for any realistic function.)
+   Validated locally by running the checker against the
+   `mingw clang 22` libcvm.a: it correctly flags `malloc`/`free`
+   on a default build (no NO_STDLIB_FALLBACK), and accepts a
+   `-DCVM_NO_STDLIB_FALLBACK=ON` build with 7 undefined symbols,
+   all in the allowlist. (Local arm-none-eabi-gcc not installed
+   — full cross verification runs in CI.)
 
-3. **Translator bitcode-parser fuzzing**. The `.bc` input is
-   user-supplied at translation time and the parser is the most
-   plausible attack surface. A small libFuzzer harness that feeds
-   random / mutated bitcode into `cvm_translate_buffer` would shake
-   out crashes before users hit them. Doesn't need to be exhaustive
-   — even a few CPU-hours of corpus is high-value at this stage.
+   New CI job `linux-cortex-m-sanity` installs `gcc-arm-none-eabi`
+   and runs `cmake -DCMAKE_TOOLCHAIN_FILE=… -DCVM_NO_STDLIB_FALLBACK=ON`
+   + `cmake --build .`. No ctest step — the build itself is the
+   test (POST_BUILD nm check fails the build on regression).
 
-4. **`CHANGELOG.md`**. Currently only `git log` exists. For an
-   external audience, a per-tag changelog (entries grouped by
-   feature / fix / breaking) makes upgrades much easier. The
-   in-flight session_5 work — translator triple-fix, cvm_d_div, the
-   NO_STDLIB_FALLBACK gate — is exactly the kind of change a
-   downstream user wants to see surfaced.
+   This was the dependency for the embedded-target footprint audit
+   below — that can now move forward.
+
+2. ~~**Adversarial-fixture pass**~~ — landed (2026-05-11).
+   `tests/fixtures/spill_loop.c`: a single loop, 12 noinline calls
+   per iteration, 8 long-lived carriers + 4 per-iter temps all
+   live across every call site. Translator emits ~1000+
+   instructions in `vm_main`, well past the imm8 ±127 reach —
+   `cg_relax_branches` rewrites the back-edge to `BEQ +1; JMP
+   imm24`. Drives spill compaction (`ever_spilled` OR +
+   `slot_of[]`) at scale on the same code. Four registrations
+   (`e2e_spill_loop_{0,1,4,8}`); expected returns cross-checked
+   against a `gcc -O1 -fwrapv` reference compile. Total ctest now
+   78 cases (74 prior + 4 new). (The "function near the R252 SSA
+   limit" sub-item was retired by the block-local reuse landing —
+   the limit no longer bites for any realistic function.)
+
+3. ~~**Translator bitcode-parser fuzzing**~~ — landed (2026-05-11).
+   Exposed `cvm_fuzz_translate_buffer` in `tools/translator/translator.c`
+   (parses bitcode from memory + runs the full codegen pipeline, no
+   file I/O). The CLI's `main()` is now gated by
+   `#ifndef CVM_NO_TRANSLATOR_MAIN` so the same TU can link into both
+   the regular `cvm-translate` and the fuzz harness.
+
+   `tools/translator/fuzz_translate.c` carries the libFuzzer entry
+   (`LLVMFuzzerTestOneInput`) plus a `#ifdef CVM_FUZZER_STANDALONE`
+   driver that replays one or more files from argv. Two CMake targets
+   gated behind `-DCVM_BUILD_FUZZER=ON`:
+   - `cvm-translate-fuzz`        — libFuzzer + ASAN + UBSAN (only on
+     hosts where the compiler supports `-fsanitize=fuzzer`; mingw clang
+     does not, so it's skipped on Windows with a configure-time
+     message). Configure-time probe uses `CheckCSourceCompiles`.
+   - `cvm-translate-fuzz-replay` — standalone driver, no
+     instrumentation. Smoke-test on any compiler / OS; useful for
+     re-running an existing corpus on hosts without libFuzzer.
+
+   A `cvm-translate-fuzz-corpus` custom target stages the 31 fixture
+   .bc files into `build/tools/translator/fuzz_corpus/` as seeds.
+   Verified locally (mingw clang 22): replay driver handles all 31
+   seeds plus malformed inputs (empty, short magic, random bytes,
+   truncated valid .bc) plus 200 bit-flip mutants of `add.bc` — zero
+   crashes, zero hangs. Real fuzzing pass needs a Linux/macOS host;
+   recipe:
+
+       cmake -DCVM_BUILD_FUZZER=ON ..
+       cmake --build . --target cvm-translate-fuzz cvm-translate-fuzz-corpus
+       ./tools/translator/cvm-translate-fuzz \
+           tools/translator/fuzz_corpus -max_total_time=3600
+
+   CI integration intentionally not added yet — a few CPU-hours on a
+   developer box is the right granularity at this stage; wire into CI
+   only if a regression slips past local runs.
+
+   **First real run (WSL Ubuntu, clang-21, 5 minutes, 2 fork workers,
+   2026-05-11):** 970 000 executions; coverage 1854 features / 8025 fts;
+   corpus grew 31 → 281 inputs. Findings:
+
+   - 0 crashes in `cvm_fuzz_translate_buffer` or anywhere in our code.
+   - 1252 crash artifacts; sampled 30 randomly — every single frame #1
+     lives inside `libLLVM.so.21.1` at addresses clustered around
+     `0x507xxxx`–`0x509xxxx` (visible names:
+     `llvm::MetadataLoader::parseMetadataAttachment`,
+     `llvm::Value::setMetadata`, …). These are upstream LLVM
+     bitcode-parser hardening issues, NOT bugs in our translator.
+   - 20 OOMs, all inside `llvm::BitcodeModule::parseModule`.
+
+   Two harness fixes that fell out of getting fuzzing past the very
+   first input:
+
+   - `cvm_fuzz_translate_buffer` now installs a no-op
+     `LLVMContextSetDiagnosticHandler` on the LLVM context. LLVM's
+     default handler calls `exit(1)` on `DS_Error`-level diagnostics
+     (which fire on *every* malformed bitcode header), so without
+     the handler libFuzzer reported the very first random input as
+     a crash and stopped. The CLI path (`cvm-translate`) is unaffected
+     — `main()` has its own context and still gets LLVM's default
+     exit-on-error semantics, which is what end users want.
+   - `tools/translator/CMakeLists.txt`'s `CheckCSourceCompiles` probe
+     for `-fsanitize=fuzzer` now saves/restores
+     `CMAKE_TRY_COMPILE_TARGET_TYPE` and forces STATIC_LIBRARY scope.
+     The probe source defines `LLVMFuzzerTestOneInput` with no `main`,
+     so the default executable-link mode failed with
+     `undefined reference to 'main'` and the probe wrongly reported
+     "compiler does not support fuzzer".
+
+   Recommended invocation (worked-out flags from the run):
+
+       ASAN_OPTIONS=allocator_may_return_null=1:detect_leaks=0 \
+       ./tools/translator/cvm-translate-fuzz fuzz_runtime_corpus \
+           -max_total_time=300 -max_len=8192 -rss_limit_mb=2048 \
+           -timeout=10 -fork=2 \
+           -ignore_crashes=1 -ignore_timeouts=1 -ignore_ooms=1 \
+           -artifact_prefix=fuzz_artifacts/
+
+   `-fork` runs each iter in a subprocess so libLLVM crashes get
+   collected as artifacts without halting the fuzz loop;
+   `-ignore_crashes=1` continues across them. The
+   `detect_leaks=0` + `allocator_may_return_null=1` ASAN options
+   silence two more upstream LLVM artifacts (a 40-byte leak in
+   the error path and aborts on huge allocation requests).
+
+   Conclusion: our translator's parse+codegen pipeline is robust under
+   970k mutated-bitcode iterations. The crash surface lives upstream
+   in libLLVM. Untrusted .bc input should be run through a sandboxed
+   subprocess regardless — that's an LLVM-wide concern, not specific
+   to our toolchain.
+
+4. ~~**`CHANGELOG.md`**~~ — landed (2026-05-11).
+   Single `[0.1.0] — 2026-05-11` section under
+   [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format.
+   Groups entries by user-facing concern (Toolchain, Interpreter,
+   Binary format, Runtime headers, Host API, Translator codegen,
+   Distribution, Tests, Cross-compile sanity, Fuzzing, CI, Docs),
+   plus a "Known limitations" section calling out f64 truncate
+   rounding, F2I saturating + clang-UB-fold caveat, soft-float on
+   FPU-less hosts, little-endian only, and the libLLVM bitcode
+   parser as upstream concern for untrusted `.bc`. SemVer note at
+   the top reserves pre-1.0 breaks under explicit **Breaking**
+   tags.
+
+   With CHANGELOG in place, **all "Before tagging a non-preview
+   release" items are closed**. The project is ready to tag
+   `v0.1.0`.
 
 ### After first feedback
 

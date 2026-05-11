@@ -3257,6 +3257,118 @@ static int parse_region(const char *s, struct cli_region *out) {
 
 #define MAX_CLI_REGIONS 64
 
+/* --- fuzzing entry point -----------------------------------------------
+ *
+ * `cvm_fuzz_translate_buffer` exercises the parse + codegen pipeline
+ * end-to-end on an in-memory bitcode blob, writing nothing to disk.
+ * It is the unit-of-work for the libFuzzer harness in
+ * `tools/translator/fuzz_translate.c`.
+ *
+ * Diagnostics that the CLI path prints to stderr (via the `ERR` macro
+ * and `g_errors`) are intentionally left enabled — libFuzzer captures
+ * stderr and only surfaces it on crash, so we get a useful tail when
+ * something explodes. `g_errors` is reset on entry so iters are
+ * independent.
+ *
+ * The return value is the rc the CLI would have produced; libFuzzer
+ * ignores it (only crashes/ASAN/UBSAN reports matter). Memory is
+ * fully released regardless of which step fails. */
+int cvm_fuzz_translate_buffer(const uint8_t *data, size_t len);
+
+/* LLVM's default LLVMContext diagnostic handler calls `exit(1)` for
+ * DS_Error-level diagnostics, including the ones the bitcode parser
+ * raises on malformed input ("file too small to contain bitcode
+ * header", "Invalid bitcode signature", etc.). libFuzzer sees the
+ * exit() as a crash and stops on the very first malformed input —
+ * which, for random fuzz bytes, is basically every iteration.
+ *
+ * Installing a no-op handler swallows those diagnostics so the C-API
+ * function returns a non-zero status the harness can handle in the
+ * normal way. We don't care about the diagnostic text inside the
+ * fuzz loop; the real signal is "did the translator pipeline crash,
+ * leak, or trip ASAN/UBSAN?" */
+static void cvm_fuzz_diag_handler(LLVMDiagnosticInfoRef di, void *ctx) {
+    (void)di;
+    (void)ctx;
+}
+
+int cvm_fuzz_translate_buffer(const uint8_t *data, size_t len) {
+    g_errors = 0;
+
+    LLVMMemoryBufferRef buf =
+        LLVMCreateMemoryBufferWithMemoryRangeCopy(
+            (const char *)data, len, "fuzz");
+    if (!buf) return 1;
+
+    LLVMContextRef ctx = LLVMContextCreate();
+    LLVMContextSetDiagnosticHandler(ctx, cvm_fuzz_diag_handler, NULL);
+    LLVMModuleRef  mod = NULL;
+    if (LLVMParseBitcodeInContext2(ctx, buf, &mod)) {
+        LLVMDisposeMemoryBuffer(buf);
+        LLVMContextDispose(ctx);
+        /* Not valid bitcode — by far the common case for random input.
+         * Not a bug; tell libFuzzer to keep going. */
+        return 1;
+    }
+    LLVMDisposeMemoryBuffer(buf);
+
+    /* Validation pass mirrors main()'s. Suppressing the per-function
+     * summary print keeps libFuzzer's stderr buffer manageable. */
+    for (LLVMValueRef fn = LLVMGetFirstFunction(mod);
+         fn; fn = LLVMGetNextFunction(fn))
+    {
+        if (LLVMIsDeclaration(fn)) continue;
+        validate_function(fn);
+    }
+
+    int rc = 0;
+    if (g_errors == 0) {
+        struct cg_globals globals = {0};
+        globals.td = LLVMCreateTargetData(LLVMGetDataLayoutStr(mod));
+
+        struct cg cg = {0};
+        cg.globals = &globals;
+
+        for (LLVMValueRef fn = LLVMGetFirstFunction(mod);
+             fn && rc == 0; fn = LLVMGetNextFunction(fn))
+        {
+            if (LLVMIsDeclaration(fn)) continue;
+            if (cg_func_append(&cg, fn) < 0) { rc = 1; break; }
+        }
+        globals.funcs      = cg.funcs;
+        globals.func_count = cg.func_count;
+
+        if (rc == 0 && cg_collect_globals(&globals, mod) != 0) rc = 1;
+
+        for (int k = 0; k < cg.func_count && rc == 0; ++k) {
+            cg.funcs[k].entry_offset = cg.count;
+            if (cg_function(&cg, cg.funcs[k].value, k) != 0) rc = 1;
+        }
+
+        free(cg.code);
+        free(cg.vals);
+        free(cg.regs);
+        free(cg.blocks);
+        free(cg.block_offsets);
+        free(cg.fixups);
+        free(cg.table_fixups);
+        free(cg.imports);
+        free(cg.funcs);
+        free(cg.allocas);
+        free(cg.bb_live_in);
+        free(cg.bb_live_out);
+        free(cg.call_lives);
+        cg_globals_dispose(&globals);
+    }
+
+    LLVMDisposeModule(mod);
+    LLVMContextDispose(ctx);
+
+    if (g_errors > 0) return 1;
+    return rc;
+}
+
+#ifndef CVM_NO_TRANSLATOR_MAIN
 int main(int argc, char **argv) {
     const char *input  = NULL;
     const char *output = NULL;
@@ -3460,3 +3572,4 @@ int main(int argc, char **argv) {
     if (!output) printf("translator: ok\n");
     return 0;
 }
+#endif /* CVM_NO_TRANSLATOR_MAIN */
