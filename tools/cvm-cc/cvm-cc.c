@@ -24,6 +24,15 @@
  *       cvm-cc is run from `<prefix>/bin/`.
  */
 
+/* strdup() is POSIX, not C standard. Without this, glibc's <string.h>
+ * hides the declaration under -std=c11 and GCC implicitly types the
+ * function as `int(...)` — on 64-bit Linux that truncates returned
+ * heap pointers and the next read crashes. Set the smallest POSIX
+ * level that exposes strdup (POSIX.1-2008). */
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#  define _POSIX_C_SOURCE 200809L
+#endif
+
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
