@@ -36,14 +36,18 @@ jobs:
       # LLVMGetSwitchCaseValue's late arrival in upstream llvm-c, so
       # the LLVM-C header version doesn't matter; we pick clang-21
       # purely for IR-shape compatibility.
-      - name: Install LLVM 21 + toolchain
+      # llvm-dev pulls headers + libs for the translator's LLVM-C
+      # bindings; clang is needed at fixture-build time even on the GCC
+      # row, because tools/translator/CMakeLists.txt resolves a separate
+      # clang binary for `--target=i386-elf -emit-llvm`. The translator's
+      # C++ shim (llvm_c_compat.cpp) papers over LLVMGetSwitchCaseValue's
+      # absence in older LLVM-C headers, and the new block-local SSA
+      # register reuse in the translator keeps even clang-18's inflated
+      # IR within budget — so the system's default LLVM is enough.
+      - name: Install LLVM + toolchain
         run: |
-          wget https://apt.llvm.org/llvm.sh
-          chmod +x llvm.sh
-          sudo ./llvm.sh 21 all
-          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-21 100
-          sudo update-alternatives --install /usr/bin/llvm-config llvm-config /usr/bin/llvm-config-21 100
-          sudo apt-get install -y cmake ninja-build
+          sudo apt-get update
+          sudo apt-get install -y clang llvm llvm-dev cmake ninja-build
 
       - name: Configure
         run: cmake -B build -G Ninja -DCMAKE_C_COMPILER=${{ matrix.cc }}
@@ -60,14 +64,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install LLVM 21 + toolchain
+      # llvm-dev pulls headers + libs for the translator's LLVM-C
+      # bindings; clang is needed at fixture-build time even on the GCC
+      # row, because tools/translator/CMakeLists.txt resolves a separate
+      # clang binary for `--target=i386-elf -emit-llvm`. The translator's
+      # C++ shim (llvm_c_compat.cpp) papers over LLVMGetSwitchCaseValue's
+      # absence in older LLVM-C headers, and the new block-local SSA
+      # register reuse in the translator keeps even clang-18's inflated
+      # IR within budget — so the system's default LLVM is enough.
+      - name: Install LLVM + toolchain
         run: |
-          wget https://apt.llvm.org/llvm.sh
-          chmod +x llvm.sh
-          sudo ./llvm.sh 21 all
-          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-21 100
-          sudo update-alternatives --install /usr/bin/llvm-config llvm-config /usr/bin/llvm-config-21 100
-          sudo apt-get install -y cmake ninja-build
+          sudo apt-get update
+          sudo apt-get install -y clang llvm llvm-dev cmake ninja-build
 
       # The embedded "no libc allocator" gate. Built defines
       # CVM_NO_STDLIB_FALLBACK across the whole tree, so libcvm's

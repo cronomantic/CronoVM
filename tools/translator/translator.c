@@ -716,6 +716,14 @@ struct cg {
     uint8_t           zero_reg;       /* register holding 0, for branch tests */
     LLVMBasicBlockRef cur_block;      /* updated during emit walk */
 
+    /* Block-local SSA register reuse pool (see cg_pre_alloc_function).
+     * Reset at every block boundary in pre-alloc; cleared again at the
+     * end of pre-alloc so the emit phase doesn't accidentally pop a
+     * freed reg and trample on per-block transient materialisation.
+     * Bounded by the spillable range (R8..R252 = 245 entries). */
+    uint8_t           free_list[256];
+    int               free_list_count;
+
     int           had_error;
     const char   *fn_name;
 };
@@ -819,6 +827,13 @@ static void cg_emit(struct cg *cg, uint32_t inst) {
 }
 
 static uint8_t cg_alloc_reg(struct cg *cg) {
+    /* Prefer a previously-freed reg from the block-local pool — see
+     * cg_pre_alloc_function. The pool is empty during emit-phase
+     * transient allocation (cg_reg_for for constants/globals), so
+     * those still bump next_reg as before. */
+    if (cg->free_list_count > 0) {
+        return cg->free_list[--cg->free_list_count];
+    }
     if (cg->next_reg > (int)CG_MAX_SSA_REG) {
         ERR(cg->fn_name, "ran out of registers (R254/R255 are reserved as "
                          "scratch and SP)");
@@ -826,6 +841,14 @@ static uint8_t cg_alloc_reg(struct cg *cg) {
         return 0;
     }
     return (uint8_t)cg->next_reg++;
+}
+
+static void cg_free_reg(struct cg *cg, uint8_t r) {
+    if (cg->free_list_count
+        < (int)(sizeof(cg->free_list) / sizeof(cg->free_list[0])))
+    {
+        cg->free_list[cg->free_list_count++] = r;
+    }
 }
 
 /* Forward decl: defined further down with the prologue/stack helpers. */
@@ -1404,12 +1427,49 @@ static int cg_collect_allocas(struct cg *cg, LLVMValueRef fn) {
     return 0;
 }
 
+/* True if every use of `v` is by a non-phi instruction in the same basic
+ * block as `v`'s def. Such values are truly block-local: their lifetime
+ * starts and ends inside that block, with no cross-edge escape (no phi
+ * input role, no use from another block). Their register is safe to
+ * recycle inside the block once the lexically-last use has passed. */
+static int cg_value_is_block_local(LLVMValueRef v) {
+    if (!LLVMIsAInstruction(v)) return 0;
+    if (LLVMIsAPHINode(v))      return 0;        /* phi result escapes the def block */
+    LLVMBasicBlockRef def_bb = LLVMGetInstructionParent(v);
+    LLVMUseRef u = LLVMGetFirstUse(v);
+    if (!u) return 0;                            /* dead — leave it to liveness/codegen */
+    for (; u; u = LLVMGetNextUse(u)) {
+        LLVMValueRef user = LLVMGetUser(u);
+        if (!LLVMIsAInstruction(user))    return 0;
+        if (LLVMIsAPHINode(user))         return 0;
+        if (LLVMGetInstructionParent(user) != def_bb) return 0;
+    }
+    return 1;
+}
+
+/* True if no instruction strictly after `i` (in the same block) uses `v`.
+ * Combined with `cg_value_is_block_local(v)`, this identifies the
+ * lexically-last use of a block-local value — the point where its
+ * register can be recycled. */
+static int cg_is_last_use_in_block(LLVMValueRef i, LLVMValueRef v) {
+    for (LLVMValueRef j = LLVMGetNextInstruction(i); j;
+         j = LLVMGetNextInstruction(j))
+    {
+        unsigned nops = LLVMGetNumOperands(j);
+        for (unsigned k = 0; k < nops; ++k) {
+            if (LLVMGetOperand(j, k) == v) return 0;
+        }
+    }
+    return 1;
+}
+
 static void cg_pre_alloc_function(struct cg *cg, LLVMValueRef fn) {
     /* R0..R7 are scratch for syscall argument passing. SSA values start at
      * R8 — the function prologue copies params from R0..R(N-1) into their
      * assigned high registers, so the syscall ABI can clobber R0..R7
      * freely without saving anything. */
     cg->next_reg = 8;
+    cg->free_list_count = 0;
 
     unsigned np = LLVMCountParams(fn);
     for (unsigned i = 0; i < np; ++i) {
@@ -1423,18 +1483,66 @@ static void cg_pre_alloc_function(struct cg *cg, LLVMValueRef fn) {
      * is still 0 (the callee just re-set it on entry). */
     cg->zero_reg = (uint8_t)CG_REG_ZERO;
 
+    /* Allocation strategy: each basic block runs an independent free
+     * pool. A value-producing instruction draws from the pool first,
+     * falling back to next_reg++. After processing each instruction,
+     * any of its operands that are (a) defined in this same block,
+     * (b) block-local per `cg_value_is_block_local`, and (c) not used
+     * by any later instruction in this block, get their register
+     * pushed back to the pool.
+     *
+     * Reuse is intentionally per-block, NOT function-wide: a block-
+     * local value's register holds a "dead" payload after its in-block
+     * last use, but if we let a *later* block reuse that register for
+     * a cross-block value, a back-edge re-entering the original block
+     * would have the local re-define the register and clobber the
+     * cross-block value mid-life. Per-block scope avoids that hazard
+     * without paying for full liveness intervals.
+     *
+     * The bit-level spill dataflow (cg_block_def_use et al.) tolerates
+     * reuse natively: a reused register's def/use bits cover the union
+     * of all values that ever lived in it, which is conservative but
+     * always safe for the spill-across-call protocol. */
     for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn);
          bb; bb = LLVMGetNextBasicBlock(bb))
     {
         cg_register_block(cg, bb);
+        cg->free_list_count = 0;          /* fresh pool per block */
+
         for (LLVMValueRef i = LLVMGetFirstInstruction(bb);
              i; i = LLVMGetNextInstruction(i))
         {
             LLVMTypeRef ty = LLVMTypeOf(i);
-            if (LLVMGetTypeKind(ty) == LLVMVoidTypeKind) continue;
-            cg_assign(cg, i, cg_alloc_reg(cg));
+            if (LLVMGetTypeKind(ty) != LLVMVoidTypeKind) {
+                cg_assign(cg, i, cg_alloc_reg(cg));
+            }
+
+            /* After processing `i`, return any operand whose lifetime
+             * ends here (block-local + no later in-block use) to the
+             * pool. Done after the dst alloc — dst doesn't reuse a
+             * register from its own operand at the *same* instruction,
+             * but the next instruction can pick the operand's reg
+             * back up. */
+            unsigned nops = LLVMGetNumOperands(i);
+            for (unsigned k = 0; k < nops; ++k) {
+                LLVMValueRef v = LLVMGetOperand(i, k);
+                if (!v) continue;
+                if (!LLVMIsAInstruction(v)) continue;
+                if (LLVMGetInstructionParent(v) != bb) continue;
+                if (!cg_value_is_block_local(v)) continue;
+                if (!cg_is_last_use_in_block(i, v)) continue;
+                int v_idx = cg_lookup(cg, v);
+                if (v_idx < 0) continue;
+                cg_free_reg(cg, cg->regs[v_idx]);
+            }
         }
     }
+
+    /* The emit phase materialises constants/globals as transient regs
+     * via cg_reg_for → cg_alloc_reg. Clearing the pool here keeps that
+     * path strictly above ssa_reg_high (the pre-alloc high-water mark),
+     * which the spill analysis treats as never-spilled scratch. */
+    cg->free_list_count = 0;
 }
 
 /* --- Liveness analysis --------------------------------------------------- */
