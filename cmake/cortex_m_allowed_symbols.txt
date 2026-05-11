@@ -69,3 +69,28 @@ __muldi3
 __ashldi3
 __ashrdi3
 __lshrdi3
+
+# --- libgcc / compiler-rt soft-float helpers (single-precision).
+# RISC-V soft-float ABI (rv32imc, -mabi=ilp32) uses these canonical
+# names; the ARM EABI variants get renamed to `__aeabi_f*` which
+# the `__aeabi_*` wildcard above covers. Targets without an FPU
+# need all of arith, compare, and int↔float conversion. We list
+# only the SF (single-precision) family — cvm.c does no double
+# math, so DF helpers (__adddf3, __floatdf*, …) shouldn't appear.
+# ---
+__addsf3
+__subsf3
+__mulsf3
+__divsf3
+__negsf2
+__eqsf2
+__nesf2
+__ltsf2
+__lesf2
+__gtsf2
+__gesf2
+__unordsf2
+__floatsisf
+__floatunsisf
+__fixsfsi
+__fixunssfsi

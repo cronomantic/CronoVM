@@ -10,6 +10,29 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **rv32imc cross-compile sanity build.** New
+  `cmake/toolchains/riscv32-none-elf.cmake` targets 32-bit
+  RISC-V with integer multiply + compressed instructions
+  (rv32imc, soft-float ABI ilp32) — the embedded baseline that
+  covers ESP32-C3, CH32V103/203, GD32VF103, BL602, etc. Uses
+  `riscv64-unknown-elf-gcc` (the Ubuntu package targets all
+  RISC-V variants from one binary) with
+  `--specs=picolibc.specs` for headers, since the GCC
+  package on Ubuntu doesn't bundle a libc (unlike
+  `gcc-arm-none-eabi`).
+  Footprint on rv32imc (`-Os`, `-DCVM_NO_STDLIB_FALLBACK`):
+  **7005 bytes total** (`.text` 5198, `.rodata` 1180, strings
+  615) — `.text` is +24 % vs Cortex-M3 because RV32 instructions
+  are mostly 4 B (the C extension shortens common ops to 2 B but
+  not all of them), while Thumb-2 is denser at 2 B for most
+  arithmetic. 20 undefined symbols, all in the existing
+  allowlist. The allowlist gained 16 compiler-rt soft-float
+  helpers (`__addsf3`, `__subsf3`, `__mulsf3`, `__divsf3`,
+  `__negsf2`, six SF compare helpers, four SF↔int conversions);
+  ARM toolchains never saw these because GCC renames them to
+  `__aeabi_f*` under the EABI wildcard. `linux-cortex-m-sanity`
+  CI job now matrices over `{thumbv7m, thumbv6m, rv32imc}`.
+
 - **thumbv6m-none-eabi cross-compile sanity build.** New
   `cmake/toolchains/thumbv6m-none-eabi.cmake` targets Cortex-M0 /
   M0+ / RP2040 (`-mcpu=cortex-m0 -mthumb -mfloat-abi=soft`).

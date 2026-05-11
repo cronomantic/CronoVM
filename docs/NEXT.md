@@ -303,6 +303,32 @@ and an "after first feedback" group.
    `__gnu_thumb1_*` one). CI job `linux-cortex-m-sanity` now
    matrices over `{thumbv7m, thumbv6m}`.
 
+5. ~~**riscv32-none-elf (rv32imc) toolchain**~~ — landed
+   (2026-05-11, post-`v0.1`). Generalises the Cortex-M sanity
+   pattern beyond ARM. `cmake/toolchains/riscv32-none-elf.cmake`
+   targets `-march=rv32imc -mabi=ilp32` (the embedded baseline:
+   ESP32-C3, CH32V103/203, GD32VF103, BL602…). Two packaging
+   wrinkles: `riscv64-unknown-elf-gcc` is the universal RISC-V
+   bare-metal cross compiler (handles rv32 via -march/-mabi),
+   and the Ubuntu package ships the compiler WITHOUT a libc —
+   so the toolchain file adds
+   `--specs=/usr/lib/picolibc/riscv64-unknown-elf/picolibc.specs`
+   for picolibc's `<math.h>` (path is Ubuntu-specific; downstream
+   maintainers on other distros point at their own picolibc).
+   Footprint on rv32imc (`-Os`, NO_STDLIB_FALLBACK):
+   **7005 B total** — `.text` 5198 (+24 % vs M3 because RV32
+   instructions are mostly 4 B even with the C extension; Thumb-2
+   is denser), same-shape rodata + strings. 20 undefined symbols,
+   all allowlisted. The allowlist gained 16 explicit compiler-rt
+   soft-float helper names (`__addsf3`, `__subsf3`, `__mulsf3`,
+   `__divsf3`, `__negsf2`, six SF compare helpers, four SF↔int
+   conversions). ARM toolchains never saw these because GCC
+   renames them to `__aeabi_f*` under the existing wildcard.
+   `linux-cortex-m-sanity` CI job now matrices over
+   `{thumbv7m, thumbv6m, rv32imc}` and installs both
+   `gcc-arm-none-eabi` and
+   `gcc-riscv64-unknown-elf + picolibc-riscv64-unknown-elf`.
+
 ## Recently closed
 
 - ~~**Block-local SSA register reuse in the translator**~~ — landed.

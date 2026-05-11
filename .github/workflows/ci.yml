@@ -112,25 +112,40 @@ jobs:
       fail-fast: false
       matrix:
         # thumbv7m covers Cortex-M3/M4/M7; thumbv6m covers M0/M0+/
-        # RP2040. Different toolchain files but the same allowlist
-        # (cmake/cortex_m_allowed_symbols.txt) governs both — M0
-        # additionally pulls in __aeabi_uidiv*, __aeabi_lmul, and
-        # __gnu_thumb1_case_uhi, all permitted by the existing
-        # __aeabi_* / __gnu_thumb1_* wildcards.
+        # RP2040; riscv32-rv32imc covers most 32-bit RISC-V MCUs
+        # (ESP32-C3, CH32V103/203, GD32VF103, BL602, etc.). All
+        # three share the same allowlist
+        # (cmake/cortex_m_allowed_symbols.txt) — ARM EABI helpers
+        # land under the __aeabi_* wildcard, RISC-V soft-float
+        # helpers under explicit __addsf3/__divsf3/__floatsisf/…
+        # entries, and the Thumb-1 switch-jump helper under
+        # __gnu_thumb1_*.
         target:
           - { name: thumbv7m, toolchain: thumbv7m-none-eabi.cmake, build: build-armv7m }
           - { name: thumbv6m, toolchain: thumbv6m-none-eabi.cmake, build: build-armv6m }
+          - { name: rv32imc,  toolchain: riscv32-none-elf.cmake,   build: build-rv32imc }
     name: linux-cortex-m-sanity-${{ matrix.target.name }}
     steps:
       - uses: actions/checkout@v4
 
-      # gcc-arm-none-eabi gives us arm-none-eabi-gcc (covers both
-      # thumbv6m and thumbv7m via -mcpu= flags) plus arm-none-eabi-nm
-      # for the allowlist check. ninja+cmake we already use everywhere.
-      - name: Install arm-none-eabi toolchain
+      # gcc-arm-none-eabi: arm-none-eabi-gcc covers both thumbv7m
+      # and thumbv6m via -mcpu= flags. Ships newlib headers bundled,
+      # so <math.h> for sqrtf is on the include path automatically.
+      #
+      # gcc-riscv64-unknown-elf: bare-metal RISC-V cross-compiler.
+      # Ubuntu ships the compiler WITHOUT a libc, so we additionally
+      # install picolibc-riscv64-unknown-elf for the picolibc
+      # headers (the riscv32 toolchain file points GCC at picolibc
+      # via --specs=). Both toolchains install in parallel and the
+      # job's matrix entry selects which one runs.
+      - name: Install cross toolchains
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-arm-none-eabi cmake ninja-build
+          sudo apt-get install -y \
+              gcc-arm-none-eabi \
+              gcc-riscv64-unknown-elf \
+              picolibc-riscv64-unknown-elf \
+              cmake ninja-build
 
       # Cross-configure with the target toolchain file and the
       # CVM_NO_STDLIB_FALLBACK gate. The toolchain sets
