@@ -10,6 +10,25 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **`cvm_call` host API** — re-enter the VM at a function registered in
+  the FUNCS table without bouncing through the image's entry point.
+  Driven by Cronopio's frame-callback model (a fantasy console host that
+  needs to invoke a cart-registered `frame()` every 1/60 s without
+  reloading the image each tick). Signature:
+  `int cvm_call(struct cvm_image *img, uint32_t fn_index,
+                 const int32_t *args, uint32_t arg_count,
+                 int32_t *return_value);`
+  Internally factors the previous `cvm_run_args` body into a static
+  `cvm_exec_at(img, start_pc, …)` helper; `cvm_run_args` now forwards
+  to it with `img->entry` as the start PC and `cvm_call` does the same
+  with `FUNCS[fn_index]`. Each call gets a fresh register file; only
+  the heap persists between calls. Error surface piggy-backs on the
+  existing codes — `CVM_E_BAD_FUNCS` (no FUNCS section),
+  `CVM_E_BAD_FUNC_INDEX` (index out of range), `CVM_E_NULL_FUNC_PTR`
+  (index 0). New ctest entry `cvm_call` (`tests/test_cvm_call.c`)
+  exercises both the success and error surface end-to-end on hand-
+  assembled blobs.
+
 - **rv32imc cross-compile sanity build.** New
   `cmake/toolchains/riscv32-none-elf.cmake` targets 32-bit
   RISC-V with integer multiply + compressed instructions

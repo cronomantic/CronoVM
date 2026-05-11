@@ -586,6 +586,11 @@ static inline uint32_t cvm_f32_to_u32_sat(float f) {
 #  endif
 #endif
 
+static int cvm_exec_at(struct cvm_image *img,
+                       uint32_t          start_pc,
+                       const int32_t    *args, uint32_t arg_count,
+                       int32_t          *return_value);
+
 int cvm_run(struct cvm_image *img, int32_t *return_value) {
     return cvm_run_args(img, NULL, 0, return_value);
 }
@@ -594,8 +599,32 @@ int cvm_run_args(struct cvm_image *img,
                  const int32_t *args, uint32_t arg_count,
                  int32_t *return_value)
 {
+    if (!img) return CVM_E_BAD_PC;
+    return cvm_exec_at(img, img->entry, args, arg_count, return_value);
+}
+
+int cvm_call(struct cvm_image *img,
+             uint32_t fn_index,
+             const int32_t *args, uint32_t arg_count,
+             int32_t *return_value)
+{
+    if (!img || !img->func_offsets) return CVM_E_BAD_FUNCS;
+    if (fn_index == 0)              return CVM_E_NULL_FUNC_PTR;
+    if (fn_index >= img->func_count) return CVM_E_BAD_FUNC_INDEX;
+    uint32_t start_pc = img->func_offsets[fn_index];
+    return cvm_exec_at(img, start_pc, args, arg_count, return_value);
+}
+
+/* Internal: run the interpreter starting at `start_pc`. The public
+ * entry points (cvm_run / cvm_run_args / cvm_call) are thin shims that
+ * pick a start PC and forward here. */
+static int cvm_exec_at(struct cvm_image *img,
+                       uint32_t          start_pc,
+                       const int32_t    *args, uint32_t arg_count,
+                       int32_t          *return_value)
+{
     if (!img || !img->code || img->code_count == 0) return CVM_E_BAD_PC;
-    if (img->entry >= img->code_count)              return CVM_E_BAD_ENTRY;
+    if (start_pc >= img->code_count)                return CVM_E_BAD_ENTRY;
     if (arg_count > CVM_REG_COUNT)                  return CVM_E_BAD_ADDR;
 
     int32_t  R[CVM_REG_COUNT];
@@ -609,7 +638,7 @@ int cvm_run_args(struct cvm_image *img,
     const uint32_t  mem_size     = img->mem_size;
     const uint32_t *func_offsets = img->func_offsets;
     const uint32_t  func_count   = img->func_count;
-    uint32_t        pc           = img->entry;
+    uint32_t        pc           = start_pc;
 
     /* Set up SP at the very top of memory and push the run-completion
      * sentinel as the outermost return PC. RET pops it and halts. Programs

@@ -112,6 +112,14 @@ target_compile_options(test_allocator PRIVATE
     $<$<C_COMPILER_ID:MSVC>:/W4>
 )
 
+add_executable(test_cvm_call tests/test_cvm_call.c)
+target_link_libraries(test_cvm_call PRIVATE cvm)
+target_compile_options(test_cvm_call PRIVATE
+    $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic>
+    $<$<C_COMPILER_ID:MSVC>:/W4>
+)
+add_test(NAME cvm_call COMMAND test_cvm_call)
+
 # --- Optional: translator (requires LLVM dev install with llvm-config) ----
 add_subdirectory(tools/translator)
 

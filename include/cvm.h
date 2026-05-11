@@ -507,6 +507,28 @@ int  cvm_run_args(struct cvm_image *img,
                   const int32_t *args, uint32_t arg_count,
                   int32_t *return_value);
 
+/* ---------------------------------------------------------------------------
+ * Call a function registered in the FUNCS table without re-entering through
+ * the image's entry point. fn_index is 1..func_count-1 (FUNCS[0] is the
+ * reserved null slot); args are seeded into R0..R7 as for cvm_run_args; any
+ * args beyond 8 must already be on the stack at the time of the call. The
+ * VM runs until the called function's RET pops the run-completion sentinel,
+ * and *return_value receives R[0] at that point.
+ *
+ * Each call gets a fresh register file (the only state that persists across
+ * calls is img->heap), so a host driving a per-frame callback can invoke
+ * cvm_call(img, frame_fn, NULL, 0, NULL) every 1/60 s without worrying
+ * about leaked register state.
+ *
+ * Errors: CVM_E_BAD_FUNCS if the image has no FUNCS section,
+ * CVM_E_BAD_FUNC_INDEX if fn_index is out of range, CVM_E_NULL_FUNC_PTR if
+ * fn_index is 0.
+ * ------------------------------------------------------------------------- */
+int  cvm_call(struct cvm_image *img,
+              uint32_t fn_index,
+              const int32_t *args, uint32_t arg_count,
+              int32_t *return_value);
+
 #ifdef __cplusplus
 }
 #endif
