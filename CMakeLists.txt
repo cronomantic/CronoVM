@@ -120,6 +120,16 @@ target_compile_options(test_cvm_call PRIVATE
 )
 add_test(NAME cvm_call COMMAND test_cvm_call)
 
+add_executable(test_fnptr_export tests/test_fnptr_export.c)
+target_link_libraries(test_fnptr_export PRIVATE cvm)
+target_compile_options(test_fnptr_export PRIVATE
+    $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic>
+    $<$<C_COMPILER_ID:MSVC>:/W4>
+)
+# Test registration lives in tools/translator/CMakeLists.txt where the
+# fnptr_export.bin emit rule and the bc_fixtures/emitted_bins fixtures are
+# defined (the translator must exist to produce the .bin).
+
 # --- Optional: translator (requires LLVM dev install with llvm-config) ----
 add_subdirectory(tools/translator)
 

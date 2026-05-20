@@ -648,6 +648,11 @@ struct cg {
     int             func_cap;
 
     int has_calls;          /* did codegen ever emit a CALL? */
+    int funcs_referenced;   /* was any function's address taken as a value?
+                             * Such a pointer is a FUNCS index, so the table
+                             * must be emitted even when no CALL/CALLR exists
+                             * — e.g. a function handed to the host via a
+                             * syscall for the host to invoke with cvm_call. */
 
     /* Per-function scratch — reset by cg_reset_function_state. */
     LLVMValueRef *vals;     /* SSA value -> physical register, parallel arrays */
@@ -973,6 +978,7 @@ static uint8_t cg_reg_for(struct cg *cg, LLVMValueRef v) {
         uint8_t r = cg_alloc_reg(cg);
         if (cg->had_error) return 0;
         cg_emit_load_const32(cg, r, fidx + 1);
+        cg->funcs_referenced = 1;
         return r;
     }
 
@@ -3529,7 +3535,8 @@ int main(int argc, char **argv) {
                           globals.data_bytes, globals.data_size,
                           heap_reserve, stack_size,
                           cg.imports, cg.import_count,
-                          cg.funcs, cg.func_count, cg.has_calls,
+                          cg.funcs, cg.func_count,
+                          cg.has_calls || cg.funcs_referenced,
                           cli_regions, cli_region_count,
                           entry_off) != 0)
             {

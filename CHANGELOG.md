@@ -8,6 +8,22 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ## [Unreleased]
 
+### Fixed
+
+- **FUNCS section now emitted when a function's address is taken even if
+  it is never internally called.** Previously the translator gated FUNCS
+  emission on `has_calls` (did codegen emit a CALL/CALLR?). A binary that
+  hands a function pointer to the host via a syscall — for the host to
+  invoke later through `cvm_call` — got a pointer value (`fidx + 1`) that
+  indexed an absent table, so `cvm_call` trapped with `CVM_E_BAD_FUNCS`.
+  Codegen now sets a `funcs_referenced` flag wherever a function value is
+  materialised as an operand, and FUNCS is emitted when
+  `has_calls || funcs_referenced`. New regression test `e2e_fnptr_export`
+  (`tests/fixtures/fnptr_export.c` + `tests/test_fnptr_export.c`) exercises
+  exactly this: a callback registered through a syscall, never CALLed
+  internally, then invoked by the host via `cvm_call`. This is the usage
+  pattern the Cronopio console relies on for its per-frame callback.
+
 ### Added
 
 - **`cvm_call` host API** — re-enter the VM at a function registered in

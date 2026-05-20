@@ -138,7 +138,8 @@ set(_fixture_targets "")
 foreach(name add pick fib abs max divmod bitops counter sum_global
              alloc_sum free_list regions mulh float_basic fsqrt
              i64_basic f64_basic two_funcs
-             fib_recursive many_args alloca_swap fnptr dispatch_table
+             fib_recursive many_args alloca_swap fnptr fnptr_export
+             dispatch_table
              narrow_ops mem_intrin long_branch switch_dispatch
              switch_table switch_neg_table spill_loop reject_double)
     set(_src ${_fixture_dir}/${name}.c)
@@ -194,7 +195,7 @@ set(_emit_targets "")
 foreach(name add pick fib abs max divmod bitops counter sum_global
              mulh float_basic fsqrt i64_basic f64_basic
              two_funcs fib_recursive many_args
-             alloca_swap fnptr dispatch_table narrow_ops mem_intrin
+             alloca_swap fnptr fnptr_export dispatch_table narrow_ops mem_intrin
              long_branch switch_dispatch switch_table switch_neg_table
              spill_loop)
     set(_bc  ${_fixture_out}/${name}.bc)
@@ -301,6 +302,11 @@ add_test(NAME e2e_many_args   COMMAND test_e2e ${_fixture_out}/many_args.bin    
 add_test(NAME e2e_alloca_swap COMMAND test_e2e ${_fixture_out}/alloca_swap.bin   3  4 7)
 add_test(NAME e2e_fnptr_add        COMMAND test_e2e ${_fixture_out}/fnptr.bin           11 1 10)
 add_test(NAME e2e_fnptr_sub        COMMAND test_e2e ${_fixture_out}/fnptr.bin            9 0 10)
+# fnptr_export: a function whose address is taken and handed to the host via
+# a syscall, but never internally CALLed. Guards the FUNCS-emission fix —
+# the host must be able to cvm_call the registered index. Uses its own
+# harness (test_fnptr_export) rather than test_e2e.
+add_test(NAME e2e_fnptr_export     COMMAND test_fnptr_export ${_fixture_out}/fnptr_export.bin)
 add_test(NAME e2e_dispatch_add     COMMAND test_e2e ${_fixture_out}/dispatch_table.bin  10 0 7 3)
 add_test(NAME e2e_dispatch_sub     COMMAND test_e2e ${_fixture_out}/dispatch_table.bin   4 1 7 3)
 add_test(NAME e2e_dispatch_mul     COMMAND test_e2e ${_fixture_out}/dispatch_table.bin  21 2 7 3)
@@ -367,7 +373,7 @@ set_tests_properties(
     e2e_free_list e2e_regions e2e_allocator e2e_mulh e2e_float_basic
     e2e_fsqrt e2e_i64_basic e2e_f64_basic
     e2e_two_funcs e2e_fib_rec_10 e2e_fib_rec_1 e2e_fib_rec_0
-    e2e_many_args e2e_alloca_swap e2e_fnptr_add e2e_fnptr_sub
+    e2e_many_args e2e_alloca_swap e2e_fnptr_add e2e_fnptr_sub e2e_fnptr_export
     e2e_dispatch_add e2e_dispatch_sub e2e_dispatch_mul
     e2e_narrow_ops e2e_mem_intrin
     e2e_long_branch_zero e2e_long_branch_path
