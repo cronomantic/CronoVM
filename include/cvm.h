@@ -69,6 +69,13 @@ enum cvm_section_type {
                                   * flags. Loader carves space inside
                                   * mem_size and exposes offsets via
                                   * cvm_image_get_region / cvm_sys_get_region. */
+    CVM_SEC_ROM           = 10,  /* read-only cartridge data baked into the
+                                  * .bin (e.g. a game WAD). Payload bytes are
+                                  * copied into the heap after DATA/BSS/REGIONS;
+                                  * the program reads them as a pointer and
+                                  * discovers base/size via cvm_sys_rom_base /
+                                  * cvm_sys_rom_size. Read-only by convention
+                                  * (the VM enforces only heap bounds). */
 };
 
 enum cvm_region_dir {
@@ -387,6 +394,13 @@ struct cvm_image {
      * binary doesn't declare any. Use cvm_image_get_region for lookups. */
     struct cvm_region *regions;
     uint32_t           region_count;
+
+    /* Read-only cartridge ROM, parsed from CVM_SEC_ROM. rom_size is 0 when
+     * the binary carries no ROM. When present, the bytes live at
+     * heap + rom_offset; the host can read or pre-fill them there, and the
+     * program discovers the same offset via cvm_sys_rom_base. */
+    uint32_t  rom_offset;
+    uint32_t  rom_size;
 
     /* Allocator captured at cvm_load_ex time; used by cvm_image_free
      * to release the image's owned memory. Both function pointers

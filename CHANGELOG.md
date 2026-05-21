@@ -8,6 +8,21 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ## [Unreleased]
 
+### Added
+
+- **`CVM_SEC_ROM` (section type 10) — read-only cartridge data.** A binary
+  can bake an arbitrary byte blob (e.g. a game WAD) into the `.bin`; the
+  loader copies it into the heap (layout `DATA | BSS | REGIONS | ROM |
+  RESERVE`, before RESERVE so `cvm_sys_heap_start` is unchanged) and
+  exposes its offset/size on `cvm_image` (`rom_offset`/`rom_size`) and to
+  the program via two new auto-bound built-in syscalls `cvm_sys_rom_base`
+  / `cvm_sys_rom_size`. Read-only by convention (the VM enforces only heap
+  bounds). The translator/`cvm-cc` gain a `--rom=FILE` flag that appends
+  the file's bytes as the section. Motivated by Cronopio needing to ship a
+  multi-MB WAD without compiling a giant C array. New ctest `rom`
+  (`tests/test_rom.c`) covers load, byte-exact heap placement, the built-in
+  syscalls, and the no-ROM case.
+
 ### Fixed
 
 - **FUNCS section now emitted when a function's address is taken even if

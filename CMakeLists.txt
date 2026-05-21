@@ -120,6 +120,14 @@ target_compile_options(test_cvm_call PRIVATE
 )
 add_test(NAME cvm_call COMMAND test_cvm_call)
 
+add_executable(test_rom tests/test_rom.c)
+target_link_libraries(test_rom PRIVATE cvm)
+target_compile_options(test_rom PRIVATE
+    $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic>
+    $<$<C_COMPILER_ID:MSVC>:/W4>
+)
+add_test(NAME rom COMMAND test_rom)
+
 add_executable(test_fnptr_export tests/test_fnptr_export.c)
 target_link_libraries(test_fnptr_export PRIVATE cvm)
 target_compile_options(test_fnptr_export PRIVATE

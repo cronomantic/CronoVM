@@ -3026,6 +3026,7 @@ static int write_bin(const char *path,
                      const struct cg_func *funcs, int func_count,
                      int emit_funcs,
                      const struct cli_region *regions, int region_count,
+                     const uint8_t *rom, uint32_t rom_size,
                      uint32_t entry)
 {
     FILE *f = fopen(path, "wb");
@@ -3092,7 +3093,8 @@ static int write_bin(const char *path,
                            + (heap_reserve_size  > 0 ? 1u : 0u)
                            + (stack_reserve_size > 0 ? 1u : 0u)
                            + (funcs_size         > 0 ? 1u : 0u)
-                           + (regions_size       > 0 ? 1u : 0u);
+                           + (regions_size       > 0 ? 1u : 0u)
+                           + (rom_size           > 0 ? 1u : 0u);
     uint32_t table_off = 24;
     uint32_t code_off  = table_off + section_count * 16;
     uint32_t code_size = code_count * 4u;
@@ -3104,6 +3106,9 @@ static int write_bin(const char *path,
     uint32_t regions_off = regions_size > 0
                          ? code_off + code_size + data_size + imports_size
                                     + funcs_size : 0;
+    uint32_t rom_off     = rom_size > 0
+                         ? code_off + code_size + data_size + imports_size
+                                    + funcs_size + regions_size : 0;
 
     uint8_t hdr[24] = {0};
     hdr[0] = 'C'; hdr[1] = 'V'; hdr[2] = 'M'; hdr[3] = '1';
@@ -3169,6 +3174,14 @@ static int write_bin(const char *path,
         put_u32_le(sec + 12, 0u);
         fwrite(sec, sizeof(sec), 1, f);
     }
+    if (rom_size > 0) {
+        memset(sec, 0, sizeof(sec));
+        put_u32_le(sec + 0,  CVM_SEC_ROM);
+        put_u32_le(sec + 4,  rom_off);
+        put_u32_le(sec + 8,  rom_size);
+        put_u32_le(sec + 12, 0u);
+        fwrite(sec, sizeof(sec), 1, f);
+    }
 
     for (uint32_t i = 0; i < code_count; ++i) {
         uint8_t b[4];
@@ -3180,6 +3193,7 @@ static int write_bin(const char *path,
     if (imports_size > 0) fwrite(imports_buf, 1, imports_size, f);
     if (funcs_size > 0)   fwrite(funcs_buf, 1, funcs_size, f);
     if (regions_size > 0) fwrite(regions_buf, 1, regions_size, f);
+    if (rom_size > 0)     fwrite(rom, 1, rom_size, f);
     free(imports_buf);
     free(funcs_buf);
     free(regions_buf);
@@ -3207,7 +3221,10 @@ static void usage(void) {
             "  --region=NAME:SIZE[:DIR]\n"
             "                       Declare a host-shared region named NAME (max 15\n"
             "                       chars) of SIZE bytes. DIR is r, w, or rw\n"
-            "                       (default rw). Repeatable.\n");
+            "                       (default rw). Repeatable.\n"
+            "  --rom=FILE           Bake FILE's bytes into the .bin as read-only\n"
+            "                       cartridge ROM (e.g. a game WAD). The program\n"
+            "                       reads it via cvm_sys_rom_base/cvm_sys_rom_size.\n");
 }
 
 static int parse_size(const char *s, uint32_t *out) {
@@ -3381,6 +3398,7 @@ int main(int argc, char **argv) {
     uint32_t    heap_reserve = 0;
     uint32_t    stack_reserve = 0;
     int         stack_reserve_set = 0;
+    const char *rom_path = NULL;
     struct cli_region cli_regions[MAX_CLI_REGIONS];
     int         cli_region_count = 0;
 
@@ -3422,6 +3440,8 @@ int main(int argc, char **argv) {
                 }
             }
             cli_region_count++;
+        } else if (strncmp(argv[i], "--rom=", 6) == 0) {
+            rom_path = argv[i] + 6;
         } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
             fprintf(stderr, "translator: unknown option '%s'\n", argv[i]);
             return 2;
@@ -3529,6 +3549,36 @@ int main(int argc, char **argv) {
                             ? stack_reserve
                             : CVM_DEFAULT_STACK_RESERVE;
 
+        /* Slurp the optional cartridge-ROM file. Lives in a separate buffer
+         * appended to the .bin as a CVM_SEC_ROM section. */
+        uint8_t *rom_buf = NULL;
+        uint32_t rom_size = 0;
+        if (rc == 0 && rom_path) {
+            FILE *rf = fopen(rom_path, "rb");
+            if (!rf) {
+                fprintf(stderr, "translator: cannot read --rom file '%s': %s\n",
+                        rom_path, strerror(errno));
+                rc = 1;
+            } else {
+                fseek(rf, 0, SEEK_END);
+                long n = ftell(rf);
+                rewind(rf);
+                if (n < 0 || (unsigned long)n > 0xFFFFFFFFu) {
+                    fprintf(stderr, "translator: --rom file '%s' too large\n", rom_path);
+                    rc = 1;
+                } else if (n > 0) {
+                    rom_buf = (uint8_t *)malloc((size_t)n);
+                    if (!rom_buf || fread(rom_buf, 1, (size_t)n, rf) != (size_t)n) {
+                        fprintf(stderr, "translator: failed reading --rom file '%s'\n", rom_path);
+                        rc = 1;
+                    } else {
+                        rom_size = (uint32_t)n;
+                    }
+                }
+                fclose(rf);
+            }
+        }
+
         if (rc == 0) {
             uint32_t entry_off = cg.funcs[main_idx].entry_offset;
             if (write_bin(output, cg.code, cg.count,
@@ -3538,18 +3588,20 @@ int main(int argc, char **argv) {
                           cg.funcs, cg.func_count,
                           cg.has_calls || cg.funcs_referenced,
                           cli_regions, cli_region_count,
+                          rom_buf, rom_size,
                           entry_off) != 0)
             {
                 rc = 1;
             } else {
                 printf("translator: wrote %s (%u instructions, %u data bytes, "
                        "%d imports, %d funcs, %u heap-reserve, "
-                       "%u stack-reserve, %d regions)\n",
+                       "%u stack-reserve, %d regions, %u rom-bytes)\n",
                        output, cg.count, globals.data_size,
                        cg.import_count, cg.func_count,
-                       heap_reserve, stack_size, cli_region_count);
+                       heap_reserve, stack_size, cli_region_count, rom_size);
             }
         }
+        free(rom_buf);
         free(cg.code);
         free(cg.vals);
         free(cg.regs);

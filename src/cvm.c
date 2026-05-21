@@ -17,7 +17,7 @@
 
 #define CVM_HEADER_SIZE   24u
 #define CVM_SECTION_SIZE  16u
-#define CVM_MAX_SEC_TYPE  9u
+#define CVM_MAX_SEC_TYPE  10u
 #define CVM_REGION_ENTRY_SIZE 28u   /* name[16] + size + direction + flags */
 
 static uint32_t read_u32_le(const uint8_t *p) {
@@ -123,6 +123,25 @@ static int builtin_sys_get_region(struct cvm_image *img,
     return 0;
 }
 
+/* cvm_sys_rom_base() — heap offset of the read-only cartridge ROM, or 0 if
+ * the binary carries none. cvm_sys_rom_size() — its length in bytes (0 when
+ * absent). A program tests size first, then treats base as a pointer. */
+static int builtin_sys_rom_base(struct cvm_image *img,
+                                int32_t *regs, void *ud)
+{
+    (void)ud;
+    regs[0] = (int32_t)img->rom_offset;
+    return 0;
+}
+
+static int builtin_sys_rom_size(struct cvm_image *img,
+                                int32_t *regs, void *ud)
+{
+    (void)ud;
+    regs[0] = (int32_t)img->rom_size;
+    return 0;
+}
+
 static const struct {
     const char    *name;
     cvm_syscall_fn fn;
@@ -130,6 +149,8 @@ static const struct {
     { "cvm_sys_heap_start", builtin_sys_heap_start },
     { "cvm_sys_heap_size",  builtin_sys_heap_size  },
     { "cvm_sys_get_region", builtin_sys_get_region },
+    { "cvm_sys_rom_base",   builtin_sys_rom_base   },
+    { "cvm_sys_rom_size",   builtin_sys_rom_size   },
 };
 
 static void auto_bind_builtins(struct cvm_image *img) {
@@ -184,6 +205,7 @@ int cvm_load_ex(const void *bytes, size_t len, struct cvm_image *out,
     uint32_t imports_off = 0, imports_size = 0;
     uint32_t funcs_off = 0, funcs_size = 0;
     uint32_t regions_off = 0, regions_size = 0;
+    uint32_t rom_off = 0, rom_size = 0;
     int      has_code = 0;
 
     for (uint32_t i = 0; i < section_count; ++i) {
@@ -242,6 +264,10 @@ int cvm_load_ex(const void *bytes, size_t len, struct cvm_image *out,
             regions_off  = file_off;
             regions_size = size;
             break;
+        case CVM_SEC_ROM:
+            rom_off  = file_off;
+            rom_size = size;
+            break;
         case CVM_SEC_DEBUG:
         default:
             break;
@@ -290,9 +316,14 @@ int cvm_load_ex(const void *bytes, size_t len, struct cvm_image *out,
         }
     }
 
+    /* Layout inside the heap: DATA | BSS | REGIONS | ROM | RESERVE.
+     * ROM sits before RESERVE so cvm_sys_heap_start (heap_size - reserve_size)
+     * still points at the free region. */
+    uint32_t rom_offset = data_size + bss_size + (uint32_t)region_total;
     uint64_t heap_total = (uint64_t)data_size
                         + (uint64_t)bss_size
                         + region_total
+                        + (uint64_t)rom_size
                         + (uint64_t)reserve_size;
     if (heap_total > 0xFFFFFFFFu) return CVM_E_BAD_SECTION;
 
@@ -361,6 +392,10 @@ int cvm_load_ex(const void *bytes, size_t len, struct cvm_image *out,
     if (mem_total > data_size)
         memset(heap + data_size, 0, (size_t)mem_total - (size_t)data_size);
 
+    /* Copy the read-only ROM blob into its slot (after the zero-fill above,
+     * which would otherwise wipe it). */
+    if (rom_size) memcpy(heap + rom_offset, base + rom_off, rom_size);
+
     if (func_count > 0) {
         for (uint32_t i = 0; i < func_count; ++i) {
             uint32_t off = read_u32_le(base + funcs_off + (size_t)i * 4u);
@@ -418,6 +453,8 @@ int cvm_load_ex(const void *bytes, size_t len, struct cvm_image *out,
     out->_import_blob     = import_blob;
     out->regions          = regions;
     out->region_count     = region_count;
+    out->rom_offset       = rom_size ? rom_offset : 0;
+    out->rom_size         = rom_size;
     /* Stash the allocator so cvm_image_free uses the matching free
      * for every block we just returned. NULL fields fall through to
      * stdlib free, which is what the simple cvm_load case wants. */

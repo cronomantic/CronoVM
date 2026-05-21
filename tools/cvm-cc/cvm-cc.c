@@ -74,6 +74,7 @@ struct cli {
 
     const char *heap_reserve;   /* --heap-reserve=, raw string */
     const char *stack_reserve;  /* --stack-reserve=, raw string */
+    const char *rom;            /* --rom=, raw string (pass-through) */
     const char *regions[MAX_REGIONS];
     int         region_count;
     const char *include_dirs[MAX_INCLUDE_DIRS];
@@ -99,6 +100,7 @@ static void usage(FILE *f) {
         "  --stack-reserve=N[K|M]     stack region for CALL/RET (default 16K\n"
         "                             when the binary uses any CALL)\n"
         "  --region=NAME:SIZE[:DIR]   host-shared region; DIR is r/w/rw\n"
+        "  --rom=FILE                 bake FILE as read-only cartridge ROM\n"
         "                             (default rw); repeatable up to %d\n"
         "\n"
         "Pass-through to clang:\n"
@@ -275,6 +277,8 @@ static int parse_argv(int argc, char **argv, struct cli *cli) {
             cli->heap_reserve = a;
         } else if (strncmp(a, "--stack-reserve=", 16) == 0) {
             cli->stack_reserve = a;
+        } else if (strncmp(a, "--rom=", 6) == 0) {
+            cli->rom = a;
         } else if (strncmp(a, "--region=", 9) == 0) {
             if (cli->region_count >= MAX_REGIONS) {
                 fprintf(stderr, "cvm-cc: too many --region (max %d)\n",
@@ -396,6 +400,7 @@ int main(int argc, char **argv) {
     targv[n++] = (char *)cli.output;
     if (cli.heap_reserve)  targv[n++] = (char *)cli.heap_reserve;
     if (cli.stack_reserve) targv[n++] = (char *)cli.stack_reserve;
+    if (cli.rom)           targv[n++] = (char *)cli.rom;
     for (int k = 0; k < cli.region_count; ++k)
         targv[n++] = (char *)cli.regions[k];
     targv[n] = NULL;
