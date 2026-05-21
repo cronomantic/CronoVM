@@ -25,6 +25,13 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **Constant `store i64` split into two word stores.** clang lowers
+  struct/array zero-init and small copies with 8-byte `store i64` chunks
+  even on a 32-bit target (e.g. zeroing a vec4). The VM has no 64-bit
+  register, but a *constant* i64 store splits cleanly into `STW` at addr
+  and addr+4; a dynamic i64 store (which the type subset can't produce) is
+  rejected. New ctest `e2e_struct_init` (`tests/fixtures/struct_init.c`).
+
 - **`float` loads/stores and `llvm.fmuladd.f32` lowering.** Storing or
   loading an `f32` to memory (a float in a global/struct/array) was rejected
   ("store: unsupported value type") even though f32 shares the 32-bit

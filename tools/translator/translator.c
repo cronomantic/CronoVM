@@ -2430,6 +2430,38 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 LLVMValueRef val_v = LLVMGetOperand(i, 0);
                 LLVMTypeRef  vty   = LLVMTypeOf(val_v);
                 LLVMTypeKind vk    = LLVMGetTypeKind(vty);
+
+                /* clang lowers struct/array zero-init and small copies with
+                 * 8-byte `store i64` chunks even on a 32-bit target. The VM
+                 * has no 64-bit register, but a *constant* i64 store (the
+                 * zero-init case) splits cleanly into two 32-bit word stores
+                 * at addr and addr+4. A dynamic i64 store can't arise — the
+                 * type subset rejects i64 SSA values. */
+                if (vk == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(vty) == 64) {
+                    if (!LLVMIsAConstantInt(val_v)) {
+                        ERR(cg->fn_name, "store: dynamic i64 value unsupported "
+                                         "on a 32-bit VM");
+                        cg->had_error = 1;
+                        break;
+                    }
+                    unsigned long long cv = LLVMConstIntGetZExtValue(val_v);
+                    uint8_t addr = cg_reg_for(cg, LLVMGetOperand(i, 1));
+                    uint8_t lo   = cg_alloc_reg(cg);
+                    if (cg->had_error) break;
+                    cg_emit_load_const32(cg, lo, (int32_t)(cv & 0xFFFFFFFFu));
+                    cg_emit(cg, enc_r(CVM_OP_STW, 0, addr, lo));
+                    /* high word at addr + 4 */
+                    cg_movi_scratch(cg, 4);
+                    uint8_t a4 = cg_alloc_reg(cg);
+                    if (cg->had_error) break;
+                    cg_emit(cg, enc_r(CVM_OP_ADD, a4, addr, (uint8_t)CG_REG_SCRATCH));
+                    uint8_t hi = cg_alloc_reg(cg);
+                    if (cg->had_error) break;
+                    cg_emit_load_const32(cg, hi, (int32_t)(cv >> 32));
+                    cg_emit(cg, enc_r(CVM_OP_STW, 0, a4, hi));
+                    break;
+                }
+
                 uint8_t opc = 0;
                 if (vk == LLVMPointerTypeKind || vk == LLVMFloatTypeKind) {
                     /* f32 is a 32-bit word in the register file — store as STW. */
