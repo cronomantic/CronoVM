@@ -1,0 +1,134 @@
+/* Regression fixture for transient-register recycling.
+ *
+ * Many constant-addressed stores to a global array in one function:
+ * each is a ConstantExpr GEP (transient address reg) plus a value.
+ * Before the per-instruction reset of next_reg, these transient
+ * registers accumulated monotonically and a function this size
+ * exhausted the register file ("ran out of registers"). The values
+ * depend on n so clang can't fold the stores to a memcpy. */
+
+int rp[128];
+
+int vm_main(int n) {
+    rp[0] = n + 0;
+    rp[1] = n + 1;
+    rp[2] = n + 2;
+    rp[3] = n + 3;
+    rp[4] = n + 4;
+    rp[5] = n + 5;
+    rp[6] = n + 6;
+    rp[7] = n + 7;
+    rp[8] = n + 8;
+    rp[9] = n + 9;
+    rp[10] = n + 10;
+    rp[11] = n + 11;
+    rp[12] = n + 12;
+    rp[13] = n + 13;
+    rp[14] = n + 14;
+    rp[15] = n + 15;
+    rp[16] = n + 16;
+    rp[17] = n + 17;
+    rp[18] = n + 18;
+    rp[19] = n + 19;
+    rp[20] = n + 20;
+    rp[21] = n + 21;
+    rp[22] = n + 22;
+    rp[23] = n + 23;
+    rp[24] = n + 24;
+    rp[25] = n + 25;
+    rp[26] = n + 26;
+    rp[27] = n + 27;
+    rp[28] = n + 28;
+    rp[29] = n + 29;
+    rp[30] = n + 30;
+    rp[31] = n + 31;
+    rp[32] = n + 32;
+    rp[33] = n + 33;
+    rp[34] = n + 34;
+    rp[35] = n + 35;
+    rp[36] = n + 36;
+    rp[37] = n + 37;
+    rp[38] = n + 38;
+    rp[39] = n + 39;
+    rp[40] = n + 40;
+    rp[41] = n + 41;
+    rp[42] = n + 42;
+    rp[43] = n + 43;
+    rp[44] = n + 44;
+    rp[45] = n + 45;
+    rp[46] = n + 46;
+    rp[47] = n + 47;
+    rp[48] = n + 48;
+    rp[49] = n + 49;
+    rp[50] = n + 50;
+    rp[51] = n + 51;
+    rp[52] = n + 52;
+    rp[53] = n + 53;
+    rp[54] = n + 54;
+    rp[55] = n + 55;
+    rp[56] = n + 56;
+    rp[57] = n + 57;
+    rp[58] = n + 58;
+    rp[59] = n + 59;
+    rp[60] = n + 60;
+    rp[61] = n + 61;
+    rp[62] = n + 62;
+    rp[63] = n + 63;
+    rp[64] = n + 64;
+    rp[65] = n + 65;
+    rp[66] = n + 66;
+    rp[67] = n + 67;
+    rp[68] = n + 68;
+    rp[69] = n + 69;
+    rp[70] = n + 70;
+    rp[71] = n + 71;
+    rp[72] = n + 72;
+    rp[73] = n + 73;
+    rp[74] = n + 74;
+    rp[75] = n + 75;
+    rp[76] = n + 76;
+    rp[77] = n + 77;
+    rp[78] = n + 78;
+    rp[79] = n + 79;
+    rp[80] = n + 80;
+    rp[81] = n + 81;
+    rp[82] = n + 82;
+    rp[83] = n + 83;
+    rp[84] = n + 84;
+    rp[85] = n + 85;
+    rp[86] = n + 86;
+    rp[87] = n + 87;
+    rp[88] = n + 88;
+    rp[89] = n + 89;
+    rp[90] = n + 90;
+    rp[91] = n + 91;
+    rp[92] = n + 92;
+    rp[93] = n + 93;
+    rp[94] = n + 94;
+    rp[95] = n + 95;
+    rp[96] = n + 96;
+    rp[97] = n + 97;
+    rp[98] = n + 98;
+    rp[99] = n + 99;
+    rp[100] = n + 100;
+    rp[101] = n + 101;
+    rp[102] = n + 102;
+    rp[103] = n + 103;
+    rp[104] = n + 104;
+    rp[105] = n + 105;
+    rp[106] = n + 106;
+    rp[107] = n + 107;
+    rp[108] = n + 108;
+    rp[109] = n + 109;
+    rp[110] = n + 110;
+    rp[111] = n + 111;
+    rp[112] = n + 112;
+    rp[113] = n + 113;
+    rp[114] = n + 114;
+    rp[115] = n + 115;
+    rp[116] = n + 116;
+    rp[117] = n + 117;
+    rp[118] = n + 118;
+    rp[119] = n + 119;
+    return rp[0] + rp[60] + rp[119];
+}

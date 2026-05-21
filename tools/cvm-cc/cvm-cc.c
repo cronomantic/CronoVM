@@ -362,6 +362,12 @@ int main(int argc, char **argv) {
         int   n = 0;
         cargv[n++] = (char *)clang;
         cargv[n++] = (char *)"--target=i386-elf";
+        /* Freestanding: carts run on the VM, not a hosted OS. Besides the
+         * correct semantics (no __STDC_HOSTED__, clang's own <stdint.h> etc.),
+         * it keeps clang emitting the i32-length mem intrinsics the VM expects
+         * rather than the i64 variants it picks in hosted mode. Matches how
+         * the test fixtures are compiled. */
+        cargv[n++] = (char *)"-ffreestanding";
         cargv[n++] = (char *)"-emit-llvm";
         cargv[n++] = optflag;
         cargv[n++] = rtinc;

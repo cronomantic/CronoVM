@@ -25,6 +25,29 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Fixed
 
+- **Transient registers are now recycled per instruction — fixes spurious
+  "ran out of registers" in constant-heavy functions.** `cg_reg_for`
+  materialises constants, globals and constant-expressions into registers
+  above `ssa_reg_high` and never caches them across instructions, but
+  `next_reg` was only reset per function, so it grew monotonically through
+  emission. A function issuing many calls with immediate arguments (e.g. a
+  console frame that fires dozens of graphics syscalls) exhausted the 245-
+  register file even though no two of those scratch values were ever live
+  at once. Codegen now resets `next_reg` to `ssa_reg_high` at the start of
+  each instruction; an instruction's SSA *result* always lands in a
+  pre-allocated register (< `ssa_reg_high`), so the scratch above it is dead
+  once the instruction finishes. New ctest `e2e_reg_pressure`
+  (`tests/fixtures/reg_pressure.c`, 120 constant-addressed global stores).
+
+- **`llvm.memset/​memcpy/​memmove.*.i64` accepted.** clang emits the i64-length
+  variant (not just i32) depending on flags — e.g. zeroing a large static or
+  filling a struct in hosted mode. The VM is 32-bit (a length over 4 GiB is
+  impossible), so the translator now takes a constant i64 length that fits in
+  32 bits; only a dynamic i64 length (which the type subset can't produce) is
+  rejected. `cvm-cc` additionally now passes `-ffreestanding`, matching the
+  fixture build and keeping clang on the i32-length intrinsics in the first
+  place.
+
 - **Constant-expression GEP/cast operands now lower correctly.** clang -O1
   emits a `ConstantExpr` getelementptr as the pointer operand whenever code
   touches a global at a fixed offset (`store v, ptr getelementptr(@g, k)`)

@@ -1953,6 +1953,19 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
              i && !cg->had_error; i = LLVMGetNextInstruction(i))
         {
             LLVMOpcode op = LLVMGetInstructionOpcode(i);
+
+            /* Recycle the transient scratch region (R[ssa_reg_high..]) at the
+             * start of every instruction. cg_reg_for materialises constants,
+             * globals and constant-expressions into fresh registers above
+             * ssa_reg_high and never caches them across instructions, and an
+             * instruction's SSA *result* always lands in a pre-allocated
+             * register (< ssa_reg_high). So those scratch registers are dead
+             * once the instruction that produced them finishes — reusing them
+             * each instruction keeps next_reg from growing monotonically and
+             * exhausting the file in constant-heavy functions (e.g. a frame
+             * that issues many syscalls with immediate arguments). */
+            cg->next_reg = cg->ssa_reg_high;
+
             switch (op) {
             case LLVMPHI:
                 /* phis are eliminated by emit_phi_moves on predecessor edges. */
@@ -2853,17 +2866,41 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                             cg->had_error = 1;
                             break;
                         }
-                        /* Length must be i32 — i64 would mean ptr-size = 64,
-                         * which the type-subset check rejects elsewhere. */
-                        LLVMTypeRef lty = LLVMTypeOf(LLVMGetOperand(i, 2));
-                        if (LLVMGetTypeKind(lty) != LLVMIntegerTypeKind ||
-                            LLVMGetIntTypeWidth(lty) != 32)
-                        {
+                        /* Length is normally i32. clang also emits the i64
+                         * variant (llvm.memset.p0.i64 etc.) — common for
+                         * zeroing a large static or filling a struct, and it
+                         * fires depending on flags like -ffreestanding. The
+                         * VM is 32-bit, so a length over 4 GiB is impossible;
+                         * accept i64 when it's a constant that fits in 32 bits
+                         * (cg_reg_for then materialises it as a 32-bit
+                         * immediate). A dynamic i64 length can't arise — the
+                         * type subset rejects i64 SSA values upstream. */
+                        LLVMValueRef len_v = LLVMGetOperand(i, 2);
+                        LLVMTypeRef  lty   = LLVMTypeOf(len_v);
+                        unsigned     lw    =
+                            (LLVMGetTypeKind(lty) == LLVMIntegerTypeKind)
+                                ? LLVMGetIntTypeWidth(lty) : 0;
+                        if (lw != 32 && lw != 64) {
                             ERR(cg->fn_name,
-                                "intrinsic '%s': length operand must be i32",
+                                "intrinsic '%s': length operand must be i32 or i64",
                                 name);
                             cg->had_error = 1;
                             break;
+                        }
+                        if (lw == 64) {
+                            if (!LLVMIsAConstantInt(len_v)) {
+                                ERR(cg->fn_name,
+                                    "intrinsic '%s': dynamic i64 length unsupported "
+                                    "on a 32-bit VM", name);
+                                cg->had_error = 1;
+                                break;
+                            }
+                            if (LLVMConstIntGetZExtValue(len_v) > 0xFFFFFFFFull) {
+                                ERR(cg->fn_name,
+                                    "intrinsic '%s': length exceeds 32 bits", name);
+                                cg->had_error = 1;
+                                break;
+                            }
                         }
                         uint8_t dst = cg_reg_for(cg, LLVMGetOperand(i, 0));
                         uint8_t mid = cg_reg_for(cg, LLVMGetOperand(i, 1));
