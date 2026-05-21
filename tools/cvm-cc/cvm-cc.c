@@ -1,16 +1,22 @@
-/* cvm-cc — single-command driver around `clang | cvm-translate`.
+/* cvm-cc — single-command driver around `clang | llvm-link | cvm-translate`.
  *
- * Hides the two-step `.c → .bc → .bin` pipeline behind one invocation:
+ * Hides the `.c → .bc → .bin` pipeline behind one invocation, for one or
+ * many inputs (no linker on the VM side, so multi-file ports link here):
  *
  *     cvm-cc user.c -o game.bin --heap-reserve=4M --region=fb:64K:w
+ *     cvm-cc r_draw.c r_main.c i_video.c ... -o doom.bin
  *
  * Pipeline shape:
- *     1. If input is .c: invoke clang with `--target=i386-elf
- *        -emit-llvm -O<level>` plus the runtime include path,
- *        emitting an intermediate `<output>.tmp.bc`.
- *     2. Invoke cvm-translate on that .bc (or directly on the user's
- *        .bc if they passed one), with all pass-through flags.
- *     3. Delete the intermediate unless --keep-bc was given.
+ *     1. Compile each .c with clang `--target=i386-elf -ffreestanding
+ *        -emit-llvm -O<level>` plus the runtime include path, each to an
+ *        intermediate `<output>.<i>.tmp.bc`. (.bc inputs skip this.)
+ *     2. If there is more than one bitcode module, llvm-link them into one
+ *        `<output>.linked.bc`. A single module skips the link step. This is
+ *        real C linkage: file-local statics are uniqued per module, only
+ *        true extern duplicates error.
+ *     3. Invoke cvm-translate on the (linked) module with all pass-through
+ *        flags.
+ *     4. Delete the intermediates unless --keep-bc was given.
  *
  * Tool discovery:
  *     - clang: --clang= flag, then PATH.
@@ -63,12 +69,15 @@
 
 #define MAX_REGIONS         64
 #define MAX_INCLUDE_DIRS    32
+#define MAX_INPUTS         256   /* a multi-file port (e.g. Crispy) is ~100+ TUs */
 
 struct cli {
-    const char *input;          /* .c or .bc, required positional */
+    const char *inputs[MAX_INPUTS]; /* .c and/or .bc, >=1 positional */
+    int         input_count;
     const char *output;         /* -o, required */
     const char *opt_level;      /* -O<n>, default "1" */
     const char *clang_path;     /* --clang= */
+    const char *llvm_link_path; /* --llvm-link= */
     const char *translate_path; /* --translate= */
     const char *runtime_dir;    /* --runtime-dir= */
 
@@ -86,11 +95,13 @@ struct cli {
 
 static void usage(FILE *f) {
     fprintf(f,
-        "Usage: cvm-cc <input.c|input.bc> -o <output.bin> [options]\n"
+        "Usage: cvm-cc <input.c|input.bc>... -o <output.bin> [options]\n"
         "\n"
-        "Driver around clang + cvm-translate. The .c case runs clang with\n"
-        "--target=i386-elf -emit-llvm -O<level> and pipes the bitcode\n"
-        "through cvm-translate. .bc input skips clang.\n"
+        "Driver around clang + llvm-link + cvm-translate. Each .c is compiled\n"
+        "with clang --target=i386-elf -emit-llvm -O<level> to bitcode; .bc\n"
+        "inputs skip clang. Multiple inputs are llvm-link'd into one module\n"
+        "(true multi-file linking — file-local statics don't collide), then\n"
+        "translated. A single input skips the link step.\n"
         "\n"
         "Required:\n"
         "  -o <file>                  output .bin path\n"
@@ -109,6 +120,7 @@ static void usage(FILE *f) {
         "\n"
         "Tool discovery overrides:\n"
         "  --clang=PATH               override clang binary\n"
+        "  --llvm-link=PATH           override llvm-link binary\n"
         "  --translate=PATH           override cvm-translate binary\n"
         "  --runtime-dir=PATH         override the runtime/lib include dir\n"
         "                             (built-in default: %s)\n"
@@ -250,6 +262,19 @@ static char *find_translator(const struct cli *cli, const char *argv0) {
     return strdup(exename);
 }
 
+/* Locate llvm-link. It ships with the same LLVM as clang, so by default we
+ * resolve it from PATH ("llvm-link") just like clang ("clang") — keep the two
+ * from the same toolchain or the bitcode versions won't match. --llvm-link=
+ * overrides. Caller owns the returned string. */
+static char *find_llvm_link(const struct cli *cli) {
+    if (cli->llvm_link_path) return strdup(cli->llvm_link_path);
+#if defined(_WIN32)
+    return strdup("llvm-link.exe");
+#else
+    return strdup("llvm-link");
+#endif
+}
+
 static int parse_argv(int argc, char **argv, struct cli *cli) {
     cli->opt_level   = "1";
     /* runtime_dir resolved in main() after parse_argv: either user's
@@ -288,6 +313,8 @@ static int parse_argv(int argc, char **argv, struct cli *cli) {
             cli->regions[cli->region_count++] = a;
         } else if (strncmp(a, "--clang=", 8) == 0) {
             cli->clang_path = a + 8;
+        } else if (strncmp(a, "--llvm-link=", 12) == 0) {
+            cli->llvm_link_path = a + 12;
         } else if (strncmp(a, "--translate=", 12) == 0) {
             cli->translate_path = a + 12;
         } else if (strncmp(a, "--runtime-dir=", 14) == 0) {
@@ -300,17 +327,51 @@ static int parse_argv(int argc, char **argv, struct cli *cli) {
             fprintf(stderr, "cvm-cc: unknown option '%s'\n", a);
             usage(stderr);
             return 2;
-        } else if (cli->input) {
-            fprintf(stderr, "cvm-cc: only one input file is supported "
-                            "(got '%s' and '%s')\n", cli->input, a);
+        } else if (cli->input_count >= MAX_INPUTS) {
+            fprintf(stderr, "cvm-cc: too many input files (max %d)\n", MAX_INPUTS);
             return 2;
         } else {
-            cli->input = a;
+            cli->inputs[cli->input_count++] = a;
         }
     }
-    if (!cli->input)  { fprintf(stderr, "cvm-cc: missing input file\n"); usage(stderr); return 2; }
+    if (cli->input_count == 0) { fprintf(stderr, "cvm-cc: missing input file\n"); usage(stderr); return 2; }
     if (!cli->output) { fprintf(stderr, "cvm-cc: missing -o <output>\n"); usage(stderr); return 2; }
     return 0;
+}
+
+/* Compile one .c to bitcode at `bc_out` via clang. Returns the child exit
+ * status (0 on success). The clang flags match the test fixtures: i386-elf
+ * freestanding (no hosted libc, and clang emits the i32-length mem intrinsics
+ * the VM expects, not the i64 ones it picks in hosted mode) + -emit-llvm. */
+static int compile_c_to_bc(const struct cli *cli, const char *clang,
+                           const char *input, const char *bc_out) {
+    char optflag[8];
+    snprintf(optflag, sizeof optflag, "-O%s", cli->opt_level);
+    char rtinc[1024];
+    snprintf(rtinc, sizeof rtinc, "-I%s", cli->runtime_dir);
+
+    char *cargv[16 + 2 * MAX_INCLUDE_DIRS];
+    int   n = 0;
+    cargv[n++] = (char *)clang;
+    cargv[n++] = (char *)"--target=i386-elf";
+    cargv[n++] = (char *)"-ffreestanding";
+    cargv[n++] = (char *)"-emit-llvm";
+    cargv[n++] = optflag;
+    cargv[n++] = rtinc;
+    for (int k = 0; k < cli->include_count; ++k) {
+        cargv[n++] = (char *)"-I";
+        cargv[n++] = (char *)cli->include_dirs[k];
+    }
+    cargv[n++] = (char *)"-c";
+    cargv[n++] = (char *)input;
+    cargv[n++] = (char *)"-o";
+    cargv[n++] = (char *)bc_out;
+    cargv[n] = NULL;
+
+    int crc = run_cmd(cli, cargv);
+    if (crc != 0)
+        fprintf(stderr, "cvm-cc: clang failed on %s (exit %d)\n", input, crc);
+    return crc;
 }
 
 int main(int argc, char **argv) {
@@ -326,100 +387,112 @@ int main(int argc, char **argv) {
         cli.runtime_dir = installed ? installed : CVM_RUNTIME_DIR;
     }
 
-    int   input_is_c = has_suffix(cli.input, ".c");
-    int   input_is_bc = has_suffix(cli.input, ".bc");
-    if (!input_is_c && !input_is_bc) {
-        fprintf(stderr, "cvm-cc: input must end in .c or .bc (got '%s')\n",
-                cli.input);
-        return 2;
-    }
-
-    /* Intermediate .bc path. Predictable name next to the output keeps
-     * temp-dir logic out of this tool; --keep-bc surfaces it for
-     * inspection during debugging. */
-    char *bc_path = NULL;
-    int   bc_owned = 0;
-    if (input_is_c) {
-        size_t outlen = strlen(cli.output);
-        bc_path = (char *)malloc(outlen + 8);
-        if (!bc_path) { perror("malloc"); return 1; }
-        memcpy(bc_path, cli.output, outlen);
-        memcpy(bc_path + outlen, ".tmp.bc", 8);
-        bc_owned = 1;
-    } else {
-        bc_path = (char *)cli.input;
-    }
-
-    /* Step 1: clang (only for .c input). */
-    if (input_is_c) {
-        const char *clang = cli.clang_path ? cli.clang_path : "clang";
-        char optflag[8];
-        snprintf(optflag, sizeof optflag, "-O%s", cli.opt_level);
-        char rtinc[1024];
-        snprintf(rtinc, sizeof rtinc, "-I%s", cli.runtime_dir);
-
-        char *cargv[64];
-        int   n = 0;
-        cargv[n++] = (char *)clang;
-        cargv[n++] = (char *)"--target=i386-elf";
-        /* Freestanding: carts run on the VM, not a hosted OS. Besides the
-         * correct semantics (no __STDC_HOSTED__, clang's own <stdint.h> etc.),
-         * it keeps clang emitting the i32-length mem intrinsics the VM expects
-         * rather than the i64 variants it picks in hosted mode. Matches how
-         * the test fixtures are compiled. */
-        cargv[n++] = (char *)"-ffreestanding";
-        cargv[n++] = (char *)"-emit-llvm";
-        cargv[n++] = optflag;
-        cargv[n++] = rtinc;
-        for (int k = 0; k < cli.include_count; ++k) {
-            cargv[n++] = (char *)"-I";
-            cargv[n++] = (char *)cli.include_dirs[k];
-        }
-        cargv[n++] = (char *)"-c";
-        cargv[n++] = (char *)cli.input;
-        cargv[n++] = (char *)"-o";
-        cargv[n++] = bc_path;
-        cargv[n] = NULL;
-
-        int crc = run_cmd(&cli, cargv);
-        if (crc != 0) {
-            fprintf(stderr, "cvm-cc: clang failed (exit %d)\n", crc);
-            if (bc_owned && !cli.keep_bc) remove(bc_path);
-            if (bc_owned) free(bc_path);
-            return crc < 0 ? 1 : crc;
+    for (int i = 0; i < cli.input_count; ++i) {
+        if (!has_suffix(cli.inputs[i], ".c") && !has_suffix(cli.inputs[i], ".bc")) {
+            fprintf(stderr, "cvm-cc: input must end in .c or .bc (got '%s')\n",
+                    cli.inputs[i]);
+            return 2;
         }
     }
 
-    /* Step 2: cvm-translate. */
-    char *translator = find_translator(&cli, argv[0]);
-    if (!translator) {
-        if (bc_owned && !cli.keep_bc) remove(bc_path);
-        if (bc_owned) free(bc_path);
-        return 1;
+    /* Per-input bitcode. A .c is compiled to an owned temp .bc next to the
+     * output (predictable name keeps temp-dir logic out of this tool); a .bc
+     * input is used in place (not owned). --keep-bc surfaces the temps. */
+    char  *bc_paths[MAX_INPUTS];
+    int    bc_owned[MAX_INPUTS];
+    int    bc_count = 0;
+    int    fail = 0;
+    const char *clang = cli.clang_path ? cli.clang_path : "clang";
+    size_t outlen = strlen(cli.output);
+
+    for (int i = 0; i < cli.input_count && !fail; ++i) {
+        const char *in = cli.inputs[i];
+        if (has_suffix(in, ".bc")) {
+            bc_paths[bc_count] = (char *)in;
+            bc_owned[bc_count] = 0;
+            ++bc_count;
+            continue;
+        }
+        char *bc = (char *)malloc(outlen + 24);
+        if (!bc) { perror("malloc"); fail = 1; break; }
+        snprintf(bc, outlen + 24, "%s.%d.tmp.bc", cli.output, i);
+        if (compile_c_to_bc(&cli, clang, in, bc) != 0) { free(bc); fail = 1; break; }
+        bc_paths[bc_count] = bc;
+        bc_owned[bc_count] = 1;
+        ++bc_count;
     }
 
-    char *targv[16 + MAX_REGIONS];
-    int   n = 0;
-    targv[n++] = translator;
-    targv[n++] = bc_path;
-    targv[n++] = (char *)"-o";
-    targv[n++] = (char *)cli.output;
-    if (cli.heap_reserve)  targv[n++] = (char *)cli.heap_reserve;
-    if (cli.stack_reserve) targv[n++] = (char *)cli.stack_reserve;
-    if (cli.rom)           targv[n++] = (char *)cli.rom;
-    for (int k = 0; k < cli.region_count; ++k)
-        targv[n++] = (char *)cli.regions[k];
-    targv[n] = NULL;
-
-    int trc = run_cmd(&cli, targv);
-    free(translator);
-
-    if (bc_owned && !cli.keep_bc) remove(bc_path);
-    if (bc_owned) free(bc_path);
-
-    if (trc != 0) {
-        fprintf(stderr, "cvm-cc: cvm-translate failed (exit %d)\n", trc);
-        return trc < 0 ? 1 : trc;
+    /* The module to translate: a single input is used as-is; multiple inputs
+     * are llvm-link'd into one module first. llvm-link gives real multi-file
+     * linkage — file-local statics are uniqued, only true extern duplicates
+     * (ODR violations) error, exactly like a C linker. */
+    char       *linked = NULL;   /* owned llvm-link output, when we link */
+    const char *module = NULL;
+    if (!fail) {
+        if (bc_count == 1) {
+            module = bc_paths[0];
+        } else {
+            linked = (char *)malloc(outlen + 16);
+            if (!linked) { perror("malloc"); fail = 1; }
+            else {
+                snprintf(linked, outlen + 16, "%s.linked.bc", cli.output);
+                char *ll = find_llvm_link(&cli);
+                char *largv[MAX_INPUTS + 8];
+                int   n = 0;
+                largv[n++] = ll;
+                for (int i = 0; i < bc_count; ++i) largv[n++] = bc_paths[i];
+                largv[n++] = (char *)"-o";
+                largv[n++] = linked;
+                largv[n] = NULL;
+                int lrc = run_cmd(&cli, largv);
+                free(ll);
+                if (lrc != 0) {
+                    fprintf(stderr, "cvm-cc: llvm-link failed (exit %d)\n", lrc);
+                    fail = 1;
+                } else {
+                    module = linked;
+                }
+            }
+        }
     }
-    return 0;
+
+    /* cvm-translate the (possibly linked) module. */
+    int trc = 0;
+    if (!fail) {
+        char *translator = find_translator(&cli, argv[0]);
+        if (!translator) {
+            fail = 1;
+        } else {
+            char *targv[16 + MAX_REGIONS];
+            int   n = 0;
+            targv[n++] = translator;
+            targv[n++] = (char *)module;
+            targv[n++] = (char *)"-o";
+            targv[n++] = (char *)cli.output;
+            if (cli.heap_reserve)  targv[n++] = (char *)cli.heap_reserve;
+            if (cli.stack_reserve) targv[n++] = (char *)cli.stack_reserve;
+            if (cli.rom)           targv[n++] = (char *)cli.rom;
+            for (int k = 0; k < cli.region_count; ++k)
+                targv[n++] = (char *)cli.regions[k];
+            targv[n] = NULL;
+
+            trc = run_cmd(&cli, targv);
+            free(translator);
+            if (trc != 0)
+                fprintf(stderr, "cvm-cc: cvm-translate failed (exit %d)\n", trc);
+        }
+    }
+
+    /* Clean up intermediates unless the user asked to keep them. */
+    if (!cli.keep_bc) {
+        for (int i = 0; i < bc_count; ++i)
+            if (bc_owned[i]) remove(bc_paths[i]);
+        if (linked) remove(linked);
+    }
+    for (int i = 0; i < bc_count; ++i)
+        if (bc_owned[i]) free(bc_paths[i]);
+    free(linked);
+
+    if (fail) return 1;
+    return trc < 0 ? 1 : trc;
 }

@@ -47,4 +47,31 @@ if(TARGET cvm-translate)
              COMMAND test_e2e ${_cvmcc_bin} 12 7 5)
     set_tests_properties(e2e_cvm_cc_add
                          PROPERTIES FIXTURES_REQUIRED cvm_cc_bins)
+
+    # Multi-file round trip: cvm-cc compiles two .c files and llvm-links them
+    # into one module. The fixtures define same-named file-local statics that
+    # must stay distinct — proves true per-TU linkage (no amalgamation). The
+    # entry vm_main(x,y) = 2x + y + 101, so vm_main(7,5) = 120.
+    set(_cvmcc_multi ${CMAKE_CURRENT_BINARY_DIR}/cvm_cc_multi.bin)
+    add_custom_command(
+        OUTPUT  ${_cvmcc_multi}
+        COMMAND $<TARGET_FILE:cvm-cc>
+                ${_fixture_dir}/multi_link_main.c
+                ${_fixture_dir}/multi_link_helper.c
+                -o ${_cvmcc_multi}
+        DEPENDS cvm-cc cvm-translate
+                ${_fixture_dir}/multi_link_main.c
+                ${_fixture_dir}/multi_link_helper.c
+        VERBATIM
+    )
+    add_custom_target(cvm_cc_multi_round_trip DEPENDS ${_cvmcc_multi})
+    add_test(NAME cvm_cc_compile_multi
+             COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+                                      --target cvm_cc_multi_round_trip)
+    set_tests_properties(cvm_cc_compile_multi
+                         PROPERTIES FIXTURES_SETUP cvm_cc_bins)
+    add_test(NAME e2e_cvm_cc_multi
+             COMMAND test_e2e ${_cvmcc_multi} 120 7 5)
+    set_tests_properties(e2e_cvm_cc_multi
+                         PROPERTIES FIXTURES_REQUIRED cvm_cc_bins)
 endif()
