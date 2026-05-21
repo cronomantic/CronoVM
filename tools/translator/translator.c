@@ -880,6 +880,38 @@ static uint8_t cg_assign(struct cg *cg, LLVMValueRef v, uint8_t r) {
     return r;
 }
 
+/* Static byte offset of a constant-expression GEP. Every index of a
+ * ConstantExpr GEP is a compile-time constant, so the whole offset folds.
+ * Mirrors the index-walk in the LLVMGetElementPtr instruction handler.
+ * Returns 0 on success (offset in *out), nonzero on an unsupported shape. */
+static int cg_const_gep_offset(struct cg *cg, LLVMValueRef gep, long long *out) {
+    LLVMTypeRef cur_ty = LLVMGetGEPSourceElementType(gep);
+    if (!cur_ty) return 1;
+    long long off = 0;
+    unsigned  nidx = LLVMGetNumIndices(gep);
+    for (unsigned k = 0; k < nidx; ++k) {
+        LLVMValueRef idx_v = LLVMGetOperand(gep, k + 1);
+        if (!LLVMIsAConstantInt(idx_v)) return 1;
+        if (k == 0) {
+            long long ci = LLVMConstIntGetSExtValue(idx_v);
+            off += ci * (long long)LLVMABISizeOfType(cg->globals->td, cur_ty);
+        } else if (LLVMGetTypeKind(cur_ty) == LLVMArrayTypeKind) {
+            LLVMTypeRef et = LLVMGetElementType(cur_ty);
+            long long ci = LLVMConstIntGetSExtValue(idx_v);
+            off += ci * (long long)LLVMABISizeOfType(cg->globals->td, et);
+            cur_ty = et;
+        } else if (LLVMGetTypeKind(cur_ty) == LLVMStructTypeKind) {
+            unsigned fi = (unsigned)LLVMConstIntGetZExtValue(idx_v);
+            off += (long long)LLVMOffsetOfElement(cg->globals->td, cur_ty, fi);
+            cur_ty = LLVMStructGetTypeAtIndex(cur_ty, fi);
+        } else {
+            return 1;
+        }
+    }
+    *out = off;
+    return 0;
+}
+
 /* Look up the physical register holding `v`. For constants, materialise a
  * fresh register at the call site each time — this is wasteful in registers
  * but always correct across multi-block control flow (a cached constant from
@@ -980,6 +1012,45 @@ static uint8_t cg_reg_for(struct cg *cg, LLVMValueRef v) {
         cg_emit_load_const32(cg, r, fidx + 1);
         cg->funcs_referenced = 1;
         return r;
+    }
+
+    /* Constant expressions that address globals: a constant GEP
+     * (`&global[k]`, `&struct.field`) or a pointer cast of one. clang -O1
+     * emits these for stores/calls touching a global at a fixed offset.
+     * GEP folds to base + static offset; bitcast/int<->ptr just reinterpret
+     * the same 32-bit address, so we hand back the operand's register. */
+    if (LLVMIsAConstantExpr(v)) {
+        LLVMOpcode op = LLVMGetConstOpcode(v);
+        if (op == LLVMBitCast || op == LLVMAddrSpaceCast ||
+            op == LLVMIntToPtr || op == LLVMPtrToInt) {
+            return cg_reg_for(cg, LLVMGetOperand(v, 0));
+        }
+        if (op == LLVMGetElementPtr) {
+            long long off = 0;
+            if (cg_const_gep_offset(cg, v, &off) != 0) {
+                ERR(cg->fn_name, "unsupported constant GEP expression");
+                cg->had_error = 1;
+                return 0;
+            }
+            uint8_t base = cg_reg_for(cg, LLVMGetOperand(v, 0));
+            if (cg->had_error) return 0;
+            if (off == 0) return base;
+            if (off < INT32_MIN || off > INT32_MAX) {
+                ERR(cg->fn_name, "constant GEP offset %lld is wider than i32", off);
+                cg->had_error = 1;
+                return 0;
+            }
+            uint8_t off_r = cg_alloc_reg(cg);
+            if (cg->had_error) return 0;
+            cg_emit_load_const32(cg, off_r, (int32_t)off);
+            uint8_t sum_r = cg_alloc_reg(cg);
+            if (cg->had_error) return 0;
+            cg_emit(cg, enc_r(CVM_OP_ADD, sum_r, base, off_r));
+            return sum_r;
+        }
+        ERR(cg->fn_name, "unsupported constant expression (opcode %d)", (int)op);
+        cg->had_error = 1;
+        return 0;
     }
 
     ERR(cg->fn_name,

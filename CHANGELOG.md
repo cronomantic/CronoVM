@@ -25,6 +25,20 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Fixed
 
+- **Constant-expression GEP/cast operands now lower correctly.** clang -O1
+  emits a `ConstantExpr` getelementptr as the pointer operand whenever code
+  touches a global at a fixed offset (`store v, ptr getelementptr(@g, k)`)
+  — common for any function that writes more than one element of a global
+  array, or reads/writes a struct field. `cg_reg_for` had no case for
+  constant expressions and bailed with "operand has no register assigned",
+  rejecting otherwise-valid carts (it surfaced in a Cronopio cart that
+  initialised a colormap array). Now constant GEPs fold to base + static
+  offset (via the new `cg_const_gep_offset`, mirroring the GEP-instruction
+  index walk) and `bitcast`/`addrspacecast`/`int<->ptr` constant casts
+  reinterpret the operand's register. New ctest `e2e_const_gep`
+  (`tests/fixtures/const_gep.c`) stores to fixed indices of an external
+  global and returns 2*n+3.
+
 - **FUNCS section now emitted when a function's address is taken even if
   it is never internally called.** Previously the translator gated FUNCS
   emission on `has_calls` (did codegen emit a CALL/CALLR?). A binary that

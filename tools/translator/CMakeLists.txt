@@ -139,7 +139,7 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
              alloc_sum free_list regions mulh float_basic fsqrt
              i64_basic f64_basic two_funcs
              fib_recursive many_args alloca_swap fnptr fnptr_export
-             dispatch_table
+             dispatch_table const_gep
              narrow_ops mem_intrin long_branch switch_dispatch
              switch_table switch_neg_table spill_loop reject_double)
     set(_src ${_fixture_dir}/${name}.c)
@@ -195,7 +195,7 @@ set(_emit_targets "")
 foreach(name add pick fib abs max divmod bitops counter sum_global
              mulh float_basic fsqrt i64_basic f64_basic
              two_funcs fib_recursive many_args
-             alloca_swap fnptr fnptr_export dispatch_table narrow_ops mem_intrin
+             alloca_swap fnptr fnptr_export dispatch_table const_gep narrow_ops mem_intrin
              long_branch switch_dispatch switch_table switch_neg_table
              spill_loop)
     set(_bc  ${_fixture_out}/${name}.bc)
@@ -307,6 +307,10 @@ add_test(NAME e2e_fnptr_sub        COMMAND test_e2e ${_fixture_out}/fnptr.bin   
 # the host must be able to cvm_call the registered index. Uses its own
 # harness (test_fnptr_export) rather than test_e2e.
 add_test(NAME e2e_fnptr_export     COMMAND test_fnptr_export ${_fixture_out}/fnptr_export.bin)
+# const_gep: stores to fixed indices of an external global array, which clang
+# lowers to ConstantExpr getelementptr pointer operands. Guards cg_reg_for's
+# constant-GEP handling. vm_main(n) returns 2*n + 3.
+add_test(NAME e2e_const_gep        COMMAND test_e2e ${_fixture_out}/const_gep.bin 23 10)
 add_test(NAME e2e_dispatch_add     COMMAND test_e2e ${_fixture_out}/dispatch_table.bin  10 0 7 3)
 add_test(NAME e2e_dispatch_sub     COMMAND test_e2e ${_fixture_out}/dispatch_table.bin   4 1 7 3)
 add_test(NAME e2e_dispatch_mul     COMMAND test_e2e ${_fixture_out}/dispatch_table.bin  21 2 7 3)
@@ -374,6 +378,7 @@ set_tests_properties(
     e2e_fsqrt e2e_i64_basic e2e_f64_basic
     e2e_two_funcs e2e_fib_rec_10 e2e_fib_rec_1 e2e_fib_rec_0
     e2e_many_args e2e_alloca_swap e2e_fnptr_add e2e_fnptr_sub e2e_fnptr_export
+    e2e_const_gep
     e2e_dispatch_add e2e_dispatch_sub e2e_dispatch_mul
     e2e_narrow_ops e2e_mem_intrin
     e2e_long_branch_zero e2e_long_branch_path
