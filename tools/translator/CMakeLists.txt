@@ -141,7 +141,7 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
              fib_recursive many_args alloca_swap fnptr fnptr_export
              dispatch_table const_gep reg_pressure float_mem struct_init reg_reuse
              narrow_ops mem_intrin long_branch switch_dispatch
-             switch_table switch_neg_table spill_loop vararg globptr lower_intrin reject_double
+             switch_table switch_neg_table spill_loop vararg globptr lower_intrin fsh_narrow unreachable reject_double
              spill_many spill_crossblock spill_call)
     set(_src ${_fixture_dir}/${name}.c)
     set(_bc  ${_fixture_out}/${name}.bc)
@@ -199,7 +199,7 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
              alloca_swap fnptr fnptr_export dispatch_table const_gep reg_pressure float_mem struct_init reg_reuse
              narrow_ops mem_intrin
              long_branch switch_dispatch switch_table switch_neg_table
-             spill_loop vararg globptr lower_intrin
+             spill_loop vararg globptr lower_intrin fsh_narrow unreachable
              spill_many spill_crossblock spill_call)
     set(_bc  ${_fixture_out}/${name}.bc)
     set(_bin ${_fixture_out}/${name}.bin)
@@ -395,6 +395,8 @@ add_test(NAME e2e_vararg           COMMAND test_e2e ${_fixture_out}/vararg.bin  
 add_test(NAME e2e_globptr          COMMAND test_e2e ${_fixture_out}/globptr.bin             91 1 0)
 # Intrinsic lowerings: fcmp-unordered + narrow min/max + ctlz.
 add_test(NAME e2e_lower_intrin     COMMAND test_e2e ${_fixture_out}/lower_intrin.bin       1036 7 5)
+add_test(NAME e2e_fsh_narrow       COMMAND test_e2e ${_fixture_out}/fsh_narrow.bin       80130 10)
+add_test(NAME e2e_unreachable      COMMAND test_e2e ${_fixture_out}/unreachable.bin         14 7)
 # Register-pressure spilling. spill_many: 300 simultaneously-live values in a
 # straight-line function (~81 value-spills). spill_crossblock: hundreds of
 # loop-carried values live across a branch/merge (spilled PHIs). spill_call:
@@ -434,7 +436,7 @@ set_tests_properties(
     e2e_switch_neg_m4 e2e_switch_neg_m3 e2e_switch_neg_m2 e2e_switch_neg_m1
     e2e_switch_neg_zero e2e_switch_neg_m5 e2e_switch_neg_pos
     e2e_spill_loop_0 e2e_spill_loop_1 e2e_spill_loop_4 e2e_spill_loop_8
-    e2e_vararg e2e_globptr e2e_lower_intrin
+    e2e_vararg e2e_globptr e2e_lower_intrin e2e_fsh_narrow e2e_unreachable
     e2e_spill_many_0 e2e_spill_many_3 e2e_spill_many_7
     e2e_spill_xblock_0 e2e_spill_xblock_1 e2e_spill_xblock_3 e2e_spill_xblock_5
     e2e_spill_call_0 e2e_spill_call_1 e2e_spill_call_2 e2e_spill_call_4

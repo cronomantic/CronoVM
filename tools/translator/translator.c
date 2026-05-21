@@ -2743,6 +2743,17 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 break;
             }
 
+            case LLVMUnreachable:
+                /* LLVM guarantees control never reaches here — it follows a
+                 * `noreturn` call (I_Error, abort, __assert_fail, exit) or a
+                 * fully-covered switch with no default. clang -O1 emits a
+                 * bare `unreachable` terminator. There is no fall-through to
+                 * protect, but emit a HALT as a defensive backstop: if a
+                 * mistranslated predecessor ever does reach it, the VM stops
+                 * cleanly instead of executing whatever bytes follow. */
+                cg_emit(cg, enc_r(CVM_OP_HALT, 0, 0, 0));
+                break;
+
             case LLVMAlloca:
                 /* No code here: the alloca pointer was materialised in the
                  * prologue. cg_collect_allocas validated that the alloca is
@@ -3137,15 +3148,22 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                  * end overrides dst with the correct identity value (a or
                  * b) when c2==0. Used by the soft-i64 / soft-double
                  * runtime headers for their multi-precision shifts. */
-                if (strcmp(name, "llvm.fshl.i32") == 0 ||
-                    strcmp(name, "llvm.fshr.i32") == 0)
+                if (strncmp(name, "llvm.fshl.i", 11) == 0 ||
+                    strncmp(name, "llvm.fshr.i", 11) == 0)
                 {
-                    /* "llvm.fshl.i32" vs "llvm.fshr.i32" differ at index 8
-                     * (the 'l' / 'r'); index 6 is 's' in both. */
+                    /* "llvm.fshl.iN" vs "llvm.fshr.iN" differ at index 8
+                     * (the 'l' / 'r'); index 6 is 's' in both. The bit
+                     * width N follows the trailing 'i'. */
                     int is_fshr = (name[8] == 'r');
+                    int fbits   = atoi(name + 11);
                     if (LLVMGetNumArgOperands(i) != 3) {
                         ERR(cg->fn_name, "%s expects 3 args, got %u", name,
                             LLVMGetNumArgOperands(i));
+                        cg->had_error = 1;
+                        break;
+                    }
+                    if (fbits <= 0 || fbits > 32) {
+                        ERR(cg->fn_name, "%s width %d unsupported", name, fbits);
                         cg->had_error = 1;
                         break;
                     }
@@ -3156,25 +3174,56 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     uint8_t a_sh = cg_alloc_reg(cg);
                     uint8_t b_sh = cg_alloc_reg(cg);
                     uint8_t inv  = cg_alloc_reg(cg);
-                    uint8_t c2   = cg_alloc_reg(cg);
                     if (cg->had_error) break;
 
-                    /* Forward-shift first (a<<c for fshl, b>>c for fshr). */
-                    if (is_fshr) cg_emit(cg, enc_r(CVM_OP_SHR, b_sh, b, c));
-                    else         cg_emit(cg, enc_r(CVM_OP_SHL, a_sh, a, c));
-                    /* inv = 32 - c. Materialise 32 in scratch, then SUB. */
-                    cg_movi_scratch(cg, 32);
+                    /* Shift amount is reduced modulo the funnel width N.
+                     * For N==32 the VM's SHL/SHR already mask to low 5 bits;
+                     * for narrow N we explicitly AND with (N-1) (N is a
+                     * power of two for every width clang emits: i8/i16). */
+                    uint8_t s = c;
+                    if (fbits < 32) {
+                        s = cg_alloc_reg(cg);
+                        if (cg->had_error) break;
+                        cg_movi_scratch(cg, fbits - 1);
+                        cg_emit(cg, enc_r(CVM_OP_AND, s, c,
+                                          (uint8_t)CG_REG_SCRATCH));
+                    }
+
+                    /* Forward-shift first (a<<s for fshl, b>>s for fshr). */
+                    if (is_fshr) cg_emit(cg, enc_r(CVM_OP_SHR, b_sh, b, s));
+                    else         cg_emit(cg, enc_r(CVM_OP_SHL, a_sh, a, s));
+                    /* inv = N - s. Materialise N in scratch, then SUB. */
+                    cg_movi_scratch(cg, fbits);
                     cg_emit(cg, enc_r(CVM_OP_SUB, inv,
-                                      (uint8_t)CG_REG_SCRATCH, c));
-                    /* Inverse shift on the other operand. */
-                    if (is_fshr) cg_emit(cg, enc_r(CVM_OP_SHL, a_sh, a, inv));
-                    else         cg_emit(cg, enc_r(CVM_OP_SHR, b_sh, b, inv));
+                                      (uint8_t)CG_REG_SCRATCH, s));
+                    /* Inverse shift on the other operand. For narrow widths
+                     * b must be confined to its low N bits first so the
+                     * right-shift doesn't pull in stale high garbage. */
+                    if (is_fshr) {
+                        cg_emit(cg, enc_r(CVM_OP_SHL, a_sh, a, inv));
+                    } else {
+                        if (fbits < 32) {
+                            cg_movi_scratch(cg,
+                                (int32_t)(((uint32_t)1 << fbits) - 1u));
+                            cg_emit(cg, enc_r(CVM_OP_AND, b_sh, b,
+                                              (uint8_t)CG_REG_SCRATCH));
+                            cg_emit(cg, enc_r(CVM_OP_SHR, b_sh, b_sh, inv));
+                        } else {
+                            cg_emit(cg, enc_r(CVM_OP_SHR, b_sh, b, inv));
+                        }
+                    }
                     cg_emit(cg, enc_r(CVM_OP_OR, dst, a_sh, b_sh));
-                    /* Fixup for c2==0. */
-                    cg_movi_scratch(cg, 31);
-                    cg_emit(cg, enc_r(CVM_OP_AND, c2, c,
-                                      (uint8_t)CG_REG_SCRATCH));
-                    cg_emit(cg, enc_br(CVM_OP_BNE, c2, cg->zero_reg, 1));
+                    /* Narrow result: confine to low N bits. */
+                    if (fbits < 32) {
+                        cg_movi_scratch(cg,
+                            (int32_t)(((uint32_t)1 << fbits) - 1u));
+                        cg_emit(cg, enc_r(CVM_OP_AND, dst, dst,
+                                          (uint8_t)CG_REG_SCRATCH));
+                    }
+                    /* Fixup for s==0: result is the identity operand
+                     * (a for fshl, b for fshr) because the inverse shift by
+                     * N would be a full-width shift the VM can't express. */
+                    cg_emit(cg, enc_br(CVM_OP_BNE, s, cg->zero_reg, 1));
                     cg_emit(cg, enc_r(CVM_OP_MOV, dst,
                                       is_fshr ? b : a, 0));
                     break;
