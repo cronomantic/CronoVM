@@ -141,7 +141,8 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
              fib_recursive many_args alloca_swap fnptr fnptr_export
              dispatch_table const_gep reg_pressure float_mem struct_init reg_reuse
              narrow_ops mem_intrin long_branch switch_dispatch
-             switch_table switch_neg_table spill_loop vararg globptr reject_double)
+             switch_table switch_neg_table spill_loop vararg globptr reject_double
+             spill_many spill_crossblock spill_call)
     set(_src ${_fixture_dir}/${name}.c)
     set(_bc  ${_fixture_out}/${name}.bc)
     # -ffreestanding turns off __STDC_HOSTED__, so clang's bundled
@@ -198,7 +199,8 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
              alloca_swap fnptr fnptr_export dispatch_table const_gep reg_pressure float_mem struct_init reg_reuse
              narrow_ops mem_intrin
              long_branch switch_dispatch switch_table switch_neg_table
-             spill_loop vararg globptr)
+             spill_loop vararg globptr
+             spill_many spill_crossblock spill_call)
     set(_bc  ${_fixture_out}/${name}.bc)
     set(_bin ${_fixture_out}/${name}.bin)
     add_custom_command(
@@ -391,6 +393,23 @@ add_test(NAME e2e_spill_loop_8     COMMAND test_e2e ${_fixture_out}/spill_loop.b
 add_test(NAME e2e_vararg           COMMAND test_e2e ${_fixture_out}/vararg.bin             118 7 5)
 # Pointer-relocation global initializers (tables of char*/data-global pointers).
 add_test(NAME e2e_globptr          COMMAND test_e2e ${_fixture_out}/globptr.bin             91 1 0)
+# Register-pressure spilling. spill_many: 300 simultaneously-live values in a
+# straight-line function (~81 value-spills). spill_crossblock: hundreds of
+# loop-carried values live across a branch/merge (spilled PHIs). spill_call:
+# many values live across a CALL (caller-save + value-spill reconciliation)
+# with several spilled args. Each returns an exact i32-wraparound value a
+# spill miscompile would corrupt. See the fixture headers for the formulas.
+add_test(NAME e2e_spill_many_0     COMMAND test_e2e ${_fixture_out}/spill_many.bin            0 0)
+add_test(NAME e2e_spill_many_3     COMMAND test_e2e ${_fixture_out}/spill_many.bin     40905900 3)
+add_test(NAME e2e_spill_many_7     COMMAND test_e2e ${_fixture_out}/spill_many.bin    222709900 7)
+add_test(NAME e2e_spill_xblock_0   COMMAND test_e2e ${_fixture_out}/spill_crossblock.bin       0 0)
+add_test(NAME e2e_spill_xblock_1   COMMAND test_e2e ${_fixture_out}/spill_crossblock.bin 2963220 1)
+add_test(NAME e2e_spill_xblock_3   COMMAND test_e2e ${_fixture_out}/spill_crossblock.bin 26668980 3)
+add_test(NAME e2e_spill_xblock_5   COMMAND test_e2e ${_fixture_out}/spill_crossblock.bin 74080500 5)
+add_test(NAME e2e_spill_call_0     COMMAND test_e2e ${_fixture_out}/spill_call.bin            0 0)
+add_test(NAME e2e_spill_call_1     COMMAND test_e2e ${_fixture_out}/spill_call.bin      2332877 1)
+add_test(NAME e2e_spill_call_2     COMMAND test_e2e ${_fixture_out}/spill_call.bin      9331514 2)
+add_test(NAME e2e_spill_call_4     COMMAND test_e2e ${_fixture_out}/spill_call.bin     37326068 4)
 set_tests_properties(
     e2e_add e2e_pick_true e2e_pick_false e2e_fib_10 e2e_fib_0
     e2e_abs_neg e2e_abs_pos e2e_max_lhs e2e_max_rhs
@@ -414,4 +433,7 @@ set_tests_properties(
     e2e_switch_neg_zero e2e_switch_neg_m5 e2e_switch_neg_pos
     e2e_spill_loop_0 e2e_spill_loop_1 e2e_spill_loop_4 e2e_spill_loop_8
     e2e_vararg e2e_globptr
+    e2e_spill_many_0 e2e_spill_many_3 e2e_spill_many_7
+    e2e_spill_xblock_0 e2e_spill_xblock_1 e2e_spill_xblock_3 e2e_spill_xblock_5
+    e2e_spill_call_0 e2e_spill_call_1 e2e_spill_call_2 e2e_spill_call_4
     PROPERTIES FIXTURES_REQUIRED emitted_bins)

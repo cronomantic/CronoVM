@@ -644,8 +644,41 @@ struct cg_alloca {
                                 * prologue MOVIs it to 0, so on return
                                 * the caller's R253 is still 0 (the
                                 * callee just re-set it on entry). */
-#define CG_MAX_SSA_REG 252u   /* SSA values use R8..R252 (R253=zero,
-                                * R254=scratch, R255=SP) */
+
+/* --- Value spilling ------------------------------------------------------
+ * When a function has more simultaneously-live SSA values than fit in the
+ * register file, the excess values are SPILLED to per-value slots in the
+ * stack frame (the "value-spill area"). The pre-allocator never assigns an
+ * SSA value above CG_MAX_SSA_REG; the range R(CG_MAX_SSA_REG+1)..R252 is a
+ * fixed EMIT SCRATCH WINDOW used during emission for:
+ *   - materialised constants/globals/constant-GEP arithmetic (the existing
+ *     transient mechanism, drawn from `next_reg` reset to ssa_reg_high each
+ *     instruction), AND
+ *   - reloads of spilled operands (cg_reg_for emits LDW into a transient
+ *     drawn from the SAME pool), AND
+ *   - the holding register for a spilled DEF (computed in a transient, then
+ *     STW'd to its slot after the handler runs).
+ * Because no SSA value ever occupies this window (ssa_reg_high <=
+ * CG_MAX_SSA_REG+1), every instruction starts with the full window free, so
+ * reloads and transients never collide with a live SSA value or with each
+ * other — each gets a distinct register from next_reg++. The window (R230..
+ * R252, 23 registers) comfortably exceeds the transient+reload demand of the
+ * heaviest single instruction (the switch jump-table lowering allocates ~9
+ * transients; fshl/fshr reads 3 operands + 4 transients). */
+#define CG_MAX_SSA_REG 229u   /* SSA values use R8..R229. R230..R252 = emit
+                                * scratch window. R253=zero, R254=scratch,
+                                * R255=SP. */
+#define CG_MAX_EMIT_REG 252u  /* highest register cg_alloc_reg may hand out
+                                * for an emit-time transient/reload (the top
+                                * of the emit scratch window). */
+
+/* Sentinel placed in cg->regs[idx] for an SSA value that has been spilled
+ * to a frame slot rather than kept in a register. Distinct from any real
+ * SSA register (R8..R229) and from R0..R7 (which never hold a long-lived
+ * SSA value — SSA homes start at R8). */
+#define CG_REG_SPILLED 0u
+/* Sentinel slot index meaning "value is NOT spilled" in cg->val_slot[]. */
+#define CG_NO_SLOT     0xFFFFu
 
 /* --- Liveness bitset ---------------------------------------------------- */
 /* 256 bits, indexed by (register - 8). Covers any pre-allocated SSA
@@ -715,6 +748,11 @@ struct cg {
     /* Per-function scratch — reset by cg_reset_function_state. */
     LLVMValueRef *vals;     /* SSA value -> physical register, parallel arrays */
     uint8_t      *regs;
+    uint16_t     *val_slot; /* value-spill slot index, or CG_NO_SLOT if the
+                             * value lives in a register (regs[idx] != 0). A
+                             * spilled value has regs[idx]==CG_REG_SPILLED and
+                             * val_slot[idx] = its frame slot. Parallel to
+                             * vals/regs. */
     int           map_count;
     int           map_cap;
     int           next_reg;
@@ -757,7 +795,13 @@ struct cg {
 
     uint32_t          alloca_bytes;   /* total bytes used by alloca area */
     uint32_t          spill_bytes;    /* spill_slot_count * 4 — see below. */
-    uint32_t          frame_bytes;    /* alloca_bytes + spill_bytes */
+    uint32_t          val_spill_bytes;/* value-spill area: val_spill_count * 4.
+                                       * Holds SSA values that didn't fit in
+                                       * registers (the linear allocator spilled
+                                       * them on overflow). */
+    int               val_spill_count;/* number of distinct value-spill slots */
+    uint32_t          frame_bytes;    /* alloca_bytes + spill_bytes
+                                       *               + val_spill_bytes */
     int               ssa_reg_high;   /* next_reg snapshot after pre-alloc.
                                        * Spilling around CALL only covers
                                        * R8..R(ssa_reg_high-1). Constants
@@ -778,6 +822,7 @@ struct cg {
 
     uint8_t           zero_reg;       /* register holding 0, for branch tests */
     LLVMBasicBlockRef cur_block;      /* updated during emit walk */
+    LLVMOpcode        cur_op;         /* opcode of instruction being emitted */
 
     /* Block-local SSA register reuse pool (see cg_pre_alloc_function).
      * Reset at every block boundary in pre-alloc; cleared again at the
@@ -831,6 +876,8 @@ static void cg_reset_function_state(struct cg *cg) {
     cg->alloca_count = 0;
     cg->alloca_bytes = 0;
     cg->spill_bytes = 0;
+    cg->val_spill_bytes = 0;
+    cg->val_spill_count = 0;
     cg->frame_bytes = 0;
     cg->ssa_reg_high = 8;
     cg->zero_reg = 0;
@@ -897,9 +944,22 @@ static uint8_t cg_alloc_reg(struct cg *cg) {
     if (cg->free_list_count > 0) {
         return cg->free_list[--cg->free_list_count];
     }
-    if (cg->next_reg > (int)CG_MAX_SSA_REG) {
-        ERR(cg->fn_name, "ran out of registers (R254/R255 are reserved as "
-                         "scratch and SP)");
+    /* Caps at CG_MAX_EMIT_REG (top of the emit scratch window). During
+     * pre-alloc this only allocates parameters; an SSA-value def goes
+     * through cg_pre_alloc_def, which caps at CG_MAX_SSA_REG and spills on
+     * overflow. During emit it hands out transients/reloads from the
+     * scratch window R(ssa_reg_high)..R252. Overflow here means a single
+     * instruction demanded more scratch than the window holds — a real,
+     * loud error, never silent corruption. */
+    if (cg->next_reg > (int)CG_MAX_EMIT_REG) {
+        ERR(cg->fn_name,
+            "internal: emit scratch window exhausted (next_reg=%d > %u); a "
+            "single instruction needs more transient/reload registers than "
+            "R%u..R%u provides",
+            cg->next_reg, CG_MAX_EMIT_REG,
+            (unsigned)CG_MAX_SSA_REG + 1u, CG_MAX_EMIT_REG);
+        if (getenv("CVM_SPILL_DEBUG"))
+            fprintf(stderr, "[spill] exhaust in op %s\n", opcode_name(cg->cur_op));
         cg->had_error = 1;
         return 0;
     }
@@ -930,10 +990,15 @@ static uint8_t cg_assign(struct cg *cg, LLVMValueRef v, uint8_t r) {
                                            cg->map_cap * sizeof(*cg->vals));
         cg->regs = (uint8_t *)realloc(cg->regs,
                                       cg->map_cap * sizeof(*cg->regs));
-        if (!cg->vals || !cg->regs) { perror("realloc"); exit(1); }
+        cg->val_slot = (uint16_t *)realloc(cg->val_slot,
+                                      cg->map_cap * sizeof(*cg->val_slot));
+        if (!cg->vals || !cg->regs || !cg->val_slot) {
+            perror("realloc"); exit(1);
+        }
     }
     cg->vals[cg->map_count] = v;
     cg->regs[cg->map_count] = r;
+    cg->val_slot[cg->map_count] = CG_NO_SLOT;
     cg->map_count++;
     return r;
 }
@@ -975,9 +1040,34 @@ static int cg_const_gep_offset(const struct cg_globals *g, LLVMValueRef gep, lon
  * but always correct across multi-block control flow (a cached constant from
  * one block may not dominate uses in another). A future pass can hoist
  * shared constants to the function prologue. */
+/* Forward decls for spill helpers used by cg_reg_for and phi lowering. */
+static int32_t cg_val_slot_off(struct cg *cg, uint16_t slot);
+static int cg_stw_sp_off(struct cg *cg, int32_t offset, uint8_t src_reg);
+static int cg_ldw_sp_off(struct cg *cg, uint8_t dst_reg, int32_t offset);
+
+/* Reload a spilled SSA operand into a fresh emit-scratch register and return
+ * it. The register comes from cg_alloc_reg (the per-instruction transient
+ * pool, R(ssa_reg_high)..R252), so every reloaded operand within one
+ * instruction gets a DISTINCT register — they never clobber each other even
+ * when a handler holds several operands live simultaneously (e.g. fshl reads
+ * three operands across a multi-step sequence). cg_addr_sp_plus clobbers
+ * SCRATCH (R254), which is never an SSA value, so the reload is
+ * self-contained. */
+static uint8_t cg_reload_spilled(struct cg *cg, int idx) {
+    uint8_t reload = cg_alloc_reg(cg);
+    if (cg->had_error) return 0;
+    int32_t off = cg_val_slot_off(cg, cg->val_slot[idx]);
+    if (cg_ldw_sp_off(cg, reload, off)) { cg->had_error = 1; return 0; }
+    return reload;
+}
+
 static uint8_t cg_reg_for(struct cg *cg, LLVMValueRef v) {
     int idx = cg_lookup(cg, v);
-    if (idx >= 0) return cg->regs[idx];
+    if (idx >= 0) {
+        if (cg->val_slot[idx] != CG_NO_SLOT)
+            return cg_reload_spilled(cg, idx);
+        return cg->regs[idx];
+    }
 
     if (LLVMIsAConstantInt(v)) {
         long long imm = LLVMConstIntGetSExtValue(v);
@@ -1366,10 +1456,64 @@ static int cg_resolve_fixups(struct cg *cg) {
  * (loop back-edges with rotating state, e.g. a := b; b := a). To preserve
  * parallel semantics we detect any such conflict and round-trip through
  * temporary registers — wasteful, but always correct. */
+/* A phi endpoint's location: a register, or a value-spill frame slot. We
+ * encode a slot as (SLOT_FLAG | slot_index) so register and slot locations
+ * inhabit one comparable namespace for parallel-copy conflict detection
+ * (a slot can never collide with a register, but a slot CAN collide with
+ * another slot when one phi feeds another). */
+#define PHI_SLOT_FLAG 0x10000u
+static int cg_loc_is_slot(unsigned loc) { return (loc & PHI_SLOT_FLAG) != 0; }
+
+/* Resolve a phi destination (the phi result itself) to a location. */
+static unsigned cg_phi_dst_loc(struct cg *cg, int phi_idx) {
+    if (cg->val_slot[phi_idx] != CG_NO_SLOT)
+        return PHI_SLOT_FLAG | cg->val_slot[phi_idx];
+    return cg->regs[phi_idx];
+}
+
+/* Resolve a phi source value to a location WITHOUT clobbering registers when
+ * it's a spilled SSA value (returns a slot loc, no LDW emitted). For
+ * registers/constants/globals it falls through to cg_reg_for, which may emit
+ * a materialising MOVI/MOVHI into a transient — that transient must stay live
+ * until the write phase, which it does (next_reg only grows within this
+ * call). */
+static unsigned cg_phi_src_loc(struct cg *cg, LLVMValueRef src) {
+    int idx = cg_lookup(cg, src);
+    if (idx >= 0 && cg->val_slot[idx] != CG_NO_SLOT)
+        return PHI_SLOT_FLAG | cg->val_slot[idx];
+    return cg_reg_for(cg, src);   /* register (may materialise a constant) */
+}
+
+/* Read a phi source location into register `dst`. */
+static void cg_phi_read_to(struct cg *cg, unsigned src_loc, uint8_t dst) {
+    if (cg_loc_is_slot(src_loc)) {
+        int32_t off = cg_val_slot_off(cg, (uint16_t)(src_loc & 0xFFFFu));
+        if (cg_ldw_sp_off(cg, dst, off)) cg->had_error = 1;
+    } else if ((uint8_t)src_loc != dst) {
+        cg_emit(cg, enc_r(CVM_OP_MOV, dst, (uint8_t)src_loc, 0));
+    }
+}
+
+/* Write register `src` into a phi destination location. */
+static void cg_phi_write_from(struct cg *cg, unsigned dst_loc, uint8_t src) {
+    if (cg_loc_is_slot(dst_loc)) {
+        int32_t off = cg_val_slot_off(cg, (uint16_t)(dst_loc & 0xFFFFu));
+        if (cg_stw_sp_off(cg, off, src)) cg->had_error = 1;
+    } else if ((uint8_t)dst_loc != src) {
+        cg_emit(cg, enc_r(CVM_OP_MOV, (uint8_t)dst_loc, src, 0));
+    }
+}
+
 static void cg_emit_phi_moves(struct cg *cg,
                               LLVMBasicBlockRef from, LLVMBasicBlockRef to)
 {
-    struct { uint8_t src; uint8_t dst; } moves[256];
+    /* A large function (e.g. a loop carrying hundreds of values) can have
+     * many phis on one edge; size generously. The no-conflict path emits
+     * each move through at most one transient, so an arbitrary count is
+     * fine. The conflict (rotation) path stages through temps and is
+     * bounded by the emit scratch window — a pathological rotation wider
+     * than the window errors loudly rather than corrupting. */
+    struct { unsigned src; unsigned dst; } moves[1024];
     int nmoves = 0;
 
     for (LLVMValueRef inst = LLVMGetFirstInstruction(to);
@@ -1379,50 +1523,82 @@ static void cg_emit_phi_moves(struct cg *cg,
         unsigned n = LLVMCountIncoming(inst);
         for (unsigned k = 0; k < n; ++k) {
             if (LLVMGetIncomingBlock(inst, k) != from) continue;
-            LLVMValueRef src = LLVMGetIncomingValue(inst, k);
-            uint8_t src_reg = cg_reg_for(cg, src);
             int phi_idx = cg_lookup(cg, inst);
             if (phi_idx < 0) {
                 ERR(cg->fn_name, "internal: phi register not pre-allocated");
                 cg->had_error = 1;
                 return;
             }
-            uint8_t phi_reg = cg->regs[phi_idx];
-            if (src_reg == phi_reg) break;       /* no-op */
+            unsigned dst_loc = cg_phi_dst_loc(cg, phi_idx);
+            unsigned src_loc = cg_phi_src_loc(cg, LLVMGetIncomingValue(inst, k));
+            if (cg->had_error) return;
+            if (src_loc == dst_loc) break;       /* no-op */
             if (nmoves >= (int)(sizeof moves / sizeof moves[0])) {
                 ERR(cg->fn_name,
                     "internal: too many phi moves on a single edge");
                 cg->had_error = 1;
                 return;
             }
-            moves[nmoves].src = src_reg;
-            moves[nmoves].dst = phi_reg;
+            moves[nmoves].src = src_loc;
+            moves[nmoves].dst = dst_loc;
             nmoves++;
             break;
         }
     }
 
-    /* Conflict iff any destination is also a source in the same batch. */
+    /* Conflict iff any destination is also a source in the same batch
+     * (register or slot — see PHI_SLOT_FLAG). */
     int conflict = 0;
     for (int i = 0; i < nmoves && !conflict; ++i)
         for (int j = 0; j < nmoves && !conflict; ++j)
             if (i != j && moves[i].dst == moves[j].src) conflict = 1;
 
     if (!conflict) {
-        for (int i = 0; i < nmoves; ++i)
-            cg_emit(cg, enc_r(CVM_OP_MOV, moves[i].dst, moves[i].src, 0));
+        /* No write feeds a later read: emit each copy directly. A
+         * register destination that is itself a constant-materialised
+         * transient source is impossible (dsts are SSA homes/slots), so
+         * direct emission preserves order. */
+        for (int i = 0; i < nmoves; ++i) {
+            if (!cg_loc_is_slot(moves[i].src)
+                && !cg_loc_is_slot(moves[i].dst)) {
+                cg_phi_write_from(cg, moves[i].dst, (uint8_t)moves[i].src);
+            } else {
+                /* Through one transient: LDW/MOV src -> tmp, then tmp ->
+                 * dst (MOV/STW). Each move is independent (no conflict), and
+                 * the transient is dead the instant the move completes, so we
+                 * snapshot/restore next_reg to RECYCLE one scratch register
+                 * across all moves — otherwise a loop carrying hundreds of
+                 * spilled phis would walk next_reg off the end of the window. */
+                int saved = cg->next_reg;
+                uint8_t tmp = cg_alloc_reg(cg);
+                if (cg->had_error) return;
+                cg_phi_read_to(cg, moves[i].src, tmp);
+                cg_phi_write_from(cg, moves[i].dst, tmp);
+                cg->next_reg = saved;
+            }
+            if (cg->had_error) return;
+        }
         return;
     }
 
-    /* Round-trip through temps: read all sources, then write all destinations. */
-    uint8_t temps[256];
+    /* Conflict: read every source into its own temp, then write every
+     * destination. Reads see pre-edge values, satisfying parallel phi
+     * semantics even for rotations (a:=b; b:=a) and slot-to-slot feeds.
+     * The temps come from the emit scratch window (cg_alloc_reg), which is
+     * bounded; a rotation wider than the window errors loudly there rather
+     * than corrupting. Real code rarely rotates more than a handful of
+     * values on one edge. */
+    uint8_t temps[1024];
     for (int i = 0; i < nmoves; ++i) {
         temps[i] = cg_alloc_reg(cg);
         if (cg->had_error) return;
-        cg_emit(cg, enc_r(CVM_OP_MOV, temps[i], moves[i].src, 0));
+        cg_phi_read_to(cg, moves[i].src, temps[i]);
+        if (cg->had_error) return;
     }
-    for (int i = 0; i < nmoves; ++i)
-        cg_emit(cg, enc_r(CVM_OP_MOV, moves[i].dst, temps[i], 0));
+    for (int i = 0; i < nmoves; ++i) {
+        cg_phi_write_from(cg, moves[i].dst, temps[i]);
+        if (cg->had_error) return;
+    }
 }
 
 static int icmp_to_op(LLVMIntPredicate p, int *swap_out) {
@@ -1503,6 +1679,15 @@ static int cg_ldw_sp_off(struct cg *cg, uint8_t dst_reg, int32_t offset) {
     if (cg_addr_sp_plus(cg, offset)) return 1;
     cg_emit(cg, enc_r(CVM_OP_LDW, dst_reg, (uint8_t)CG_REG_SCRATCH, 0));
     return 0;
+}
+
+/* SP-relative byte offset of value-spill slot `slot`. The value-spill area
+ * sits above the alloca and caller-save spill areas in the frame:
+ *   [ alloca_bytes | spill_bytes (caller-save) | val_spill_bytes ]
+ * so slot k is at alloca_bytes + spill_bytes + k*4. */
+static int32_t cg_val_slot_off(struct cg *cg, uint16_t slot) {
+    return (int32_t)cg->alloca_bytes + (int32_t)cg->spill_bytes
+         + (int32_t)slot * 4;
 }
 
 /* Walk the entry block, register every static-size alloca, and reject any
@@ -1598,6 +1783,31 @@ static int cg_is_last_use_in_block(LLVMValueRef i, LLVMValueRef v) {
     return 1;
 }
 
+/* Allocate a register for a value-producing instruction during pre-alloc.
+ * Prefers the block-local free pool, then next_reg++. On overflow (no
+ * register available in R8..R249), the value is SPILLED: it gets a fresh
+ * value-spill slot, regs[idx] is set to CG_REG_SPILLED, and val_slot[idx]
+ * records the slot. The instruction must already be cg_assign'd (idx valid).
+ * Returns the assigned register, or CG_REG_SPILLED when spilled. */
+static uint8_t cg_pre_alloc_def(struct cg *cg, int idx) {
+    if (cg->free_list_count > 0) {
+        uint8_t r = cg->free_list[--cg->free_list_count];
+        cg->regs[idx] = r;
+        return r;
+    }
+    if (cg->next_reg <= (int)CG_MAX_SSA_REG) {
+        uint8_t r = (uint8_t)cg->next_reg++;
+        cg->regs[idx] = r;
+        return r;
+    }
+    /* Out of registers — spill this value to a frame slot. Each spilled
+     * value gets its own slot (no interval reuse), which is always correct
+     * and keeps the layout trivially non-overlapping. */
+    cg->regs[idx] = (uint8_t)CG_REG_SPILLED;
+    cg->val_slot[idx] = (uint16_t)cg->val_spill_count++;
+    return (uint8_t)CG_REG_SPILLED;
+}
+
 static void cg_pre_alloc_function(struct cg *cg, LLVMValueRef fn) {
     /* R0..R7 are scratch for syscall argument passing. SSA values start at
      * R8 — the function prologue copies params from R0..R(N-1) into their
@@ -1648,10 +1858,15 @@ static void cg_pre_alloc_function(struct cg *cg, LLVMValueRef fn) {
              i; i = LLVMGetNextInstruction(i))
         {
             int dst_reg = -1;
+            int dst_spilled = 0;
             LLVMTypeRef ty = LLVMTypeOf(i);
             if (LLVMGetTypeKind(ty) != LLVMVoidTypeKind) {
-                dst_reg = cg_alloc_reg(cg);
-                cg_assign(cg, i, (uint8_t)dst_reg);
+                cg_assign(cg, i, (uint8_t)CG_REG_SPILLED); /* placeholder */
+                int idx = cg->map_count - 1;
+                dst_reg = cg_pre_alloc_def(cg, idx);
+                if (cg->regs[idx] == (uint8_t)CG_REG_SPILLED
+                    && cg->val_slot[idx] != CG_NO_SLOT)
+                    dst_spilled = 1;
             }
 
             /* After processing `i`, return any operand whose lifetime ends
@@ -1676,7 +1891,9 @@ static void cg_pre_alloc_function(struct cg *cg, LLVMValueRef fn) {
                 if (!cg_is_last_use_in_block(i, v)) continue;
                 int v_idx = cg_lookup(cg, v);
                 if (v_idx < 0) continue;
-                if ((int)cg->regs[v_idx] == dst_reg) continue;   /* dst owns it now */
+                if (cg->val_slot[v_idx] != CG_NO_SLOT) continue; /* spilled: no reg to free */
+                if (cg->regs[v_idx] == (uint8_t)CG_REG_SPILLED) continue;
+                if (!dst_spilled && (int)cg->regs[v_idx] == dst_reg) continue; /* dst owns it now */
                 cg_free_reg(cg, cg->regs[v_idx]);
             }
         }
@@ -1700,6 +1917,9 @@ static int cg_spill_bit_of(struct cg *cg, LLVMValueRef v) {
     if (!LLVMIsAInstruction(v) && !LLVMIsAArgument(v)) return -1;
     int idx = cg_lookup(cg, v);
     if (idx < 0) return -1;
+    /* A value spilled to its own frame slot already lives in memory; it
+     * holds no SSA register and so is never caller-saved across a call. */
+    if (cg->val_slot[idx] != CG_NO_SLOT) return -1;
     uint8_t r = cg->regs[idx];
     if (r < 8u || (int)r >= cg->ssa_reg_high) return -1;
     return (int)r - 8;
@@ -1965,8 +2185,19 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
             cg->slot_of[k] = (uint8_t)cg->spill_slot_count++;
     }
     cg->spill_bytes = (uint32_t)cg->spill_slot_count * 4u;
-    cg->frame_bytes = cg->alloca_bytes + cg->spill_bytes;
+    /* Value-spill area (linear-scan overflow spills) sits on top of the
+     * caller-save spill area. Each spilled value owns one i32 slot. */
+    cg->val_spill_bytes = (uint32_t)cg->val_spill_count * 4u;
+    /* Frame layout, low -> high address:
+     *   [ alloca_bytes | spill_bytes (caller-save) | val_spill_bytes ]
+     * Above SP (in the caller's frame): saved-PC, then stacked args/params
+     * at SP + frame_bytes + 4 + i*4. */
+    cg->frame_bytes = cg->alloca_bytes + cg->spill_bytes + cg->val_spill_bytes;
     cg->funcs[func_idx].frame_size = cg->frame_bytes;
+    if (getenv("CVM_SPILL_DEBUG"))
+        fprintf(stderr, "[spill] %s: ssa_high=%d val_spills=%d caller_save=%d\n",
+                cg->fn_name, cg->ssa_reg_high, cg->val_spill_count,
+                cg->spill_slot_count);
 
     /* Prologue: SUB SP, SP, frame. */
     if (cg_sp_sub(cg, cg->frame_bytes)) return 1;
@@ -2038,6 +2269,30 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
              * exhausting the file in constant-heavy functions (e.g. a frame
              * that issues many syscalls with immediate arguments). */
             cg->next_reg = cg->ssa_reg_high;
+            cg->cur_op = op;
+
+            /* Spilled-DEF setup: if this instruction's result was spilled to
+             * a frame slot, give the handler a transient register to compute
+             * into (drawn FIRST, before any operand reload, so it stays
+             * reserved for the whole instruction). cg->regs[idx] is
+             * temporarily redirected to that register so the existing
+             * `dst = cg->regs[cg_lookup(cg, i)]` idiom in every handler writes
+             * there transparently. After the switch we STW it to the slot and
+             * restore the CG_REG_SPILLED marker. */
+            int   result_idx     = cg_lookup(cg, i);
+            /* PHIs are excluded: a spilled phi's slot is written by the
+             * incoming-edge moves (cg_emit_phi_moves), not by this empty
+             * PHI handler. Running the spilled-DEF store here would clobber
+             * the freshly-resolved phi value with an uninitialised def_reg. */
+            int   result_spilled = (result_idx >= 0
+                                    && op != LLVMPHI
+                                    && cg->val_slot[result_idx] != CG_NO_SLOT);
+            uint8_t def_reg = 0;
+            if (result_spilled) {
+                def_reg = cg_alloc_reg(cg);
+                if (cg->had_error) break;
+                cg->regs[result_idx] = def_reg;   /* handler writes here */
+            }
 
             switch (op) {
             case LLVMPHI:
@@ -2412,8 +2667,17 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     /* Chain form. cond_reg / case constants are taken in
                      * the cond's narrow width (computed above) — using
                      * SExt would sign-extend `i8 -1` to 0xFFFFFFFF and
-                     * miss the 0xFF cond_reg. */
+                     * miss the 0xFF cond_reg.
+                     *
+                     * case_reg/tmp are dead after each case's BNE, so we
+                     * snapshot next_reg here (ABOVE cond_reg, which may be a
+                     * spill-reload transient that must stay live across the
+                     * whole chain) and reset to it each iteration. Otherwise
+                     * a switch with many cases would walk next_reg off the
+                     * end of the emit scratch window. */
+                    int chain_floor = cg->next_reg;
                     for (unsigned k = 1; k < n_succ; ++k) {
+                        cg->next_reg = chain_floor;
                         LLVMValueRef      case_val = cvm_llvm_get_switch_case_value(i, k);
                         LLVMBasicBlockRef case_bb  = LLVMGetSuccessor(i, k);
                         if (!case_val || !LLVMIsAConstantInt(case_val)) {
@@ -2434,6 +2698,7 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                         cg_queue_fixup(cg, cg->count, case_bb, 24, 8);
                         cg_emit(cg, enc_br(CVM_OP_BNE, tmp, cg->zero_reg, 0));
                     }
+                    cg->next_reg = chain_floor;
                     if (cg->had_error) break;
 
                     cg_queue_fixup(cg, cg->count, default_bb, 8, 24);
@@ -3101,10 +3366,7 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 uint8_t callee_reg = 0;
                 int is_indirect = (callee_fn == NULL);
 
-                if (is_indirect) {
-                    callee_reg = cg_reg_for(cg, callee);
-                    if (cg->had_error) break;
-                } else {
+                if (!is_indirect) {
                     callee_idx = cg_func_lookup(cg, callee_fn);
                     if (callee_idx < 0) {
                         ERR(cg->fn_name,
@@ -3132,21 +3394,21 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                                    : (narg < 8 ? narg : 8);
                 unsigned n_stacked = narg - n_in_reg;
 
-                /* Materialise every argument into a register first, before
-                 * any spill/copy. This makes sure constants get MOVI'd into
-                 * their own scratch SSA registers (which we'll then spill
-                 * harmlessly along with everything else). */
-                uint8_t arg_regs[256];
-                if (narg > sizeof arg_regs) {
+                /* Argument lowering is done LAST (after caller-save spill and
+                 * SP adjustment), one argument at a time, so we never need to
+                 * hold many materialised/reloaded args in the emit scratch
+                 * window simultaneously. A spilled SSA argument is loaded
+                 * straight from its frame slot into the destination (R0..R7,
+                 * or a stacked-arg slot), NOT routed through a shared reload
+                 * register — that would overflow the window for a call with
+                 * many spilled args (e.g. DOOM's P_TouchSpecialThing). See
+                 * step 3 below. We only check the arg-count cap here. */
+                if (narg > 256) {
                     ERR(cg->fn_name,
-                        "call has %u args; codegen cap is %zu",
-                        narg, sizeof arg_regs);
+                        "call has %u args; codegen cap is 256", narg);
                     cg->had_error = 1;
                     break;
                 }
-                for (unsigned k = 0; k < narg; ++k)
-                    arg_regs[k] = cg_reg_for(cg, LLVMGetOperand(i, k));
-                if (cg->had_error) break;
 
                 /* 1. Caller-saved spill, narrowed by liveness analysis.
                  *    `cg_compute_call_liveouts` precomputed, for each
@@ -3194,29 +3456,90 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 }
                 if (cg->had_error) break;
 
-                /* 2. Push stacked args (the 9th onward) below the current
-                 *    SP, lowest stacked arg at the lowest address. */
+                /* SP drops by this many bytes for stacked args, so a
+                 * value-spill slot at frame offset `off` is reachable at
+                 * [SP_now + sp_bias + off] during the rest of the sequence.
+                 * (The caller-save spill above ran BEFORE this drop, so it
+                 * used the un-biased offsets — correct.) */
+                int32_t sp_bias = (int32_t)(n_stacked * 4u);
+
+                /* 2. Drop SP for the stacked args, then store each stacked
+                 *    arg (the 9th onward), one at a time. The emit scratch
+                 *    window is recycled per arg (next_reg snapshot/restore)
+                 *    so an arbitrary count never exhausts it. */
                 if (n_stacked > 0) {
                     if (cg_sp_sub(cg, n_stacked * 4u)) break;
+                    int floor = cg->next_reg;
                     for (unsigned k = 0; k < n_stacked; ++k) {
-                        if (cg_stw_sp_off(cg, (int32_t)(k * 4u),
-                                          arg_regs[n_in_reg + k])) break;
+                        cg->next_reg = floor;
+                        LLVMValueRef av = LLVMGetOperand(i, n_in_reg + k);
+                        int aidx = cg_lookup(cg, av);
+                        uint8_t srcr;
+                        if (aidx >= 0 && cg->val_slot[aidx] != CG_NO_SLOT) {
+                            /* spilled: reload from its (SP-biased) slot */
+                            srcr = cg_alloc_reg(cg);
+                            if (cg->had_error) break;
+                            int32_t voff = cg_val_slot_off(cg,
+                                              cg->val_slot[aidx]) + sp_bias;
+                            if (cg_ldw_sp_off(cg, srcr, voff)) break;
+                        } else {
+                            srcr = cg_reg_for(cg, av);   /* reg or constant */
+                            if (cg->had_error) break;
+                        }
+                        if (cg_stw_sp_off(cg, (int32_t)(k * 4u), srcr)) break;
                     }
+                    cg->next_reg = floor;
                     if (cg->had_error) break;
                 }
 
-                /* 3. Move first-8 args into R0..R7. SSA homes are >= R8 so
-                 *    they never alias targets — sequential MOVs are safe. */
-                for (unsigned k = 0; k < n_in_reg; ++k) {
-                    if (arg_regs[k] != k)
-                        cg_emit(cg, enc_r(CVM_OP_MOV,
-                                          (uint8_t)k, arg_regs[k], 0));
+                /* 3. Load first-8 args into R0..R7, one at a time. A spilled
+                 *    arg is LDW'd straight into its R0..R7 home (no shared
+                 *    reload reg); a register arg is MOV'd; a constant is
+                 *    materialised directly into R_k. SSA homes are >= R8 and
+                 *    we never read R0..R7 as a source, so writing R0..R7 in
+                 *    ascending order can't clobber a not-yet-consumed source
+                 *    — sequential lowering is safe. */
+                {
+                    int floor = cg->next_reg;
+                    for (unsigned k = 0; k < n_in_reg; ++k) {
+                        cg->next_reg = floor;
+                        LLVMValueRef av = LLVMGetOperand(i, k);
+                        int aidx = cg_lookup(cg, av);
+                        if (aidx >= 0 && cg->val_slot[aidx] != CG_NO_SLOT) {
+                            int32_t voff = cg_val_slot_off(cg,
+                                              cg->val_slot[aidx]) + sp_bias;
+                            if (cg_ldw_sp_off(cg, (uint8_t)k, voff)) break;
+                        } else {
+                            uint8_t srcr = cg_reg_for(cg, av);
+                            if (cg->had_error) break;
+                            if (srcr != k)
+                                cg_emit(cg, enc_r(CVM_OP_MOV,
+                                                  (uint8_t)k, srcr, 0));
+                        }
+                    }
+                    cg->next_reg = floor;
+                    if (cg->had_error) break;
                 }
 
                 /* 4. CALL or CALLR. User functions occupy FUNCS[1..N]
                  *    (index 0 is reserved as the null-fn-ptr trap), so a
-                 *    direct call uses (callee_idx + 1) as the imm24. */
+                 *    direct call uses (callee_idx + 1) as the imm24. For an
+                 *    indirect call, reload the (possibly spilled) callee
+                 *    index here, just before CALLR, so it doesn't tie up a
+                 *    register across the arg lowering. */
                 if (is_indirect) {
+                    int cidx = cg_lookup(cg, callee);
+                    if (cidx >= 0 && cg->val_slot[cidx] != CG_NO_SLOT) {
+                        /* spilled callee: reload from its SP-biased slot */
+                        callee_reg = cg_alloc_reg(cg);
+                        if (cg->had_error) break;
+                        int32_t voff = cg_val_slot_off(cg,
+                                          cg->val_slot[cidx]) + sp_bias;
+                        if (cg_ldw_sp_off(cg, callee_reg, voff)) break;
+                    } else {
+                        callee_reg = cg_reg_for(cg, callee);
+                        if (cg->had_error) break;
+                    }
                     cg_emit(cg, enc_r(CVM_OP_CALLR, callee_reg, 0, 0));
                 } else {
                     cg_emit(cg, enc_i24(CVM_OP_CALL, callee_idx + 1));
@@ -3260,6 +3583,21 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     "%s: codegen not implemented yet", opcode_name(op));
                 cg->had_error = 1;
                 break;
+            }
+
+            /* Spilled-DEF store: the handler wrote the result into def_reg
+             * (the transient we redirected cg->regs[result_idx] to). Persist
+             * it to the value's frame slot, then restore the spilled marker so
+             * later uses route through cg_reload_spilled. SP is at its normal
+             * frame position here (CALL/alloca sequences restore it before the
+             * instruction ends), so the slot offset is correct. */
+            if (result_spilled && !cg->had_error) {
+                int32_t off = cg_val_slot_off(cg,
+                                              cg->val_slot[result_idx]);
+                if (cg_stw_sp_off(cg, off, def_reg)) cg->had_error = 1;
+                cg->regs[result_idx] = (uint8_t)CG_REG_SPILLED;
+            } else if (result_spilled) {
+                cg->regs[result_idx] = (uint8_t)CG_REG_SPILLED;
             }
         }
     }
@@ -3648,6 +3986,7 @@ int cvm_fuzz_translate_buffer(const uint8_t *data, size_t len) {
         free(cg.code);
         free(cg.vals);
         free(cg.regs);
+        free(cg.val_slot);
         free(cg.blocks);
         free(cg.block_offsets);
         free(cg.fixups);
@@ -3882,6 +4221,7 @@ int main(int argc, char **argv) {
         free(cg.code);
         free(cg.vals);
         free(cg.regs);
+        free(cg.val_slot);
         free(cg.blocks);
         free(cg.block_offsets);
         free(cg.fixups);
