@@ -1920,14 +1920,20 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
      *   addr(stacked_arg_i) = SP_after_prologue + frame + 4 + i*4
      * where the +4 accounts for the saved return PC. */
     unsigned n_params = LLVMCountParams(fn);
+    /* Variadic functions take ALL their named params on the stack (the i386
+     * vararg ABI), so the unnamed args follow them contiguously in memory and
+     * va_start can walk them. Non-variadic functions use the normal ABI:
+     * first 8 params in the calling-convention regs, the 9th onward stacked. */
+    int fn_is_vararg = LLVMIsFunctionVarArg(LLVMGlobalGetValueType(fn));
     for (unsigned p = 0; p < n_params; ++p) {
         LLVMValueRef pv  = LLVMGetParam(fn, p);
         uint8_t      dst = cg->regs[cg_lookup(cg, pv)];
-        if (p < 8) {
+        if (!fn_is_vararg && p < 8) {
             if (dst != p)
                 cg_emit(cg, enc_r(CVM_OP_MOV, dst, (uint8_t)p, 0));
         } else {
-            int32_t off = (int32_t)cg->frame_bytes + 4 + (int32_t)(p - 8) * 4;
+            unsigned slot = fn_is_vararg ? p : (p - 8);
+            int32_t off = (int32_t)cg->frame_bytes + 4 + (int32_t)slot * 4;
             if (cg_ldw_sp_off(cg, dst, off)) return 1;
         }
     }
@@ -2987,6 +2993,39 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     break;
                 }
 
+                /* Variadic support. The i386 va_list is a single pointer to
+                 * the next argument in memory. A variadic callee receives ALL
+                 * its args on the stack (see the prologue and the LLVMCall
+                 * handler), so the unnamed args sit contiguously just past the
+                 * named ones. va_start writes that start address into the
+                 * caller's va_list object; clang lowers va_arg itself to a
+                 * load + pointer bump, so we never see an LLVMVAArg. va_end is
+                 * a no-op; va_copy duplicates the pointer. */
+                if (strncmp(name, "llvm.va_start", 13) == 0) {
+                    uint8_t ap = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                    if (cg->had_error) break;
+                    unsigned n_named = LLVMCountParams(fn);
+                    int32_t off = (int32_t)cg->frame_bytes + 4
+                                + (int32_t)n_named * 4;
+                    if (cg_addr_sp_plus(cg, off)) break;  /* SCRATCH = SP+off */
+                    cg_emit(cg, enc_r(CVM_OP_STW, 0, ap,
+                                      (uint8_t)CG_REG_SCRATCH));
+                    break;
+                }
+                if (strncmp(name, "llvm.va_end", 11) == 0) {
+                    break;   /* no runtime effect */
+                }
+                if (strncmp(name, "llvm.va_copy", 12) == 0) {
+                    uint8_t dst = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                    uint8_t src = cg_reg_for(cg, LLVMGetOperand(i, 1));
+                    if (cg->had_error) break;
+                    uint8_t tmp = cg_alloc_reg(cg);
+                    if (cg->had_error) break;
+                    cg_emit(cg, enc_r(CVM_OP_LDW, tmp, src, 0)); /* tmp=*src */
+                    cg_emit(cg, enc_r(CVM_OP_STW, 0, dst, tmp)); /* *dst=tmp */
+                    break;
+                }
+
                 if (strncmp(name, "llvm.", 5) == 0) {
                     ERR(cg->fn_name,
                         "intrinsic '%s' not yet lowered", name);
@@ -3026,8 +3065,14 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 }
 
                 unsigned narg = LLVMGetNumArgOperands(i);
-                unsigned n_in_reg  = narg < 8 ? narg : 8;
-                unsigned n_stacked = narg > 8 ? narg - 8 : 0;
+                /* A variadic callee takes ALL args on the stack (i386 vararg
+                 * ABI) so its va_start finds them contiguous in memory; a
+                 * normal callee uses the 8-in-regs convention. */
+                LLVMTypeRef call_fty = LLVMGetCalledFunctionType(i);
+                int call_is_vararg = call_fty && LLVMIsFunctionVarArg(call_fty);
+                unsigned n_in_reg  = call_is_vararg ? 0u
+                                   : (narg < 8 ? narg : 8);
+                unsigned n_stacked = narg - n_in_reg;
 
                 /* Materialise every argument into a register first, before
                  * any spill/copy. This makes sure constants get MOVI'd into
@@ -3097,7 +3142,7 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     if (cg_sp_sub(cg, n_stacked * 4u)) break;
                     for (unsigned k = 0; k < n_stacked; ++k) {
                         if (cg_stw_sp_off(cg, (int32_t)(k * 4u),
-                                          arg_regs[8 + k])) break;
+                                          arg_regs[n_in_reg + k])) break;
                     }
                     if (cg->had_error) break;
                 }
