@@ -1589,17 +1589,25 @@ static void cg_pre_alloc_function(struct cg *cg, LLVMValueRef fn) {
         for (LLVMValueRef i = LLVMGetFirstInstruction(bb);
              i; i = LLVMGetNextInstruction(i))
         {
+            int dst_reg = -1;
             LLVMTypeRef ty = LLVMTypeOf(i);
             if (LLVMGetTypeKind(ty) != LLVMVoidTypeKind) {
-                cg_assign(cg, i, cg_alloc_reg(cg));
+                dst_reg = cg_alloc_reg(cg);
+                cg_assign(cg, i, (uint8_t)dst_reg);
             }
 
-            /* After processing `i`, return any operand whose lifetime
-             * ends here (block-local + no later in-block use) to the
-             * pool. Done after the dst alloc — dst doesn't reuse a
-             * register from its own operand at the *same* instruction,
-             * but the next instruction can pick the operand's reg
-             * back up. */
+            /* After processing `i`, return any operand whose lifetime ends
+             * here (block-local + no later in-block use) to the pool, so a
+             * later instruction can recycle it.
+             *
+             * Crucially, skip an operand that shares `i`'s destination
+             * register: cg_alloc_reg draws from the free pool, so `dst` can
+             * legitimately land on the register of an operand that a *prior*
+             * instruction already pooled (`MOV dst, dst` is a harmless
+             * identity). But `dst` is live from here on — re-pooling that
+             * register because the operand's last use was this instruction
+             * would hand it to the next allocation while `dst` still needs
+             * it, corrupting both. */
             unsigned nops = LLVMGetNumOperands(i);
             for (unsigned k = 0; k < nops; ++k) {
                 LLVMValueRef v = LLVMGetOperand(i, k);
@@ -1610,6 +1618,7 @@ static void cg_pre_alloc_function(struct cg *cg, LLVMValueRef fn) {
                 if (!cg_is_last_use_in_block(i, v)) continue;
                 int v_idx = cg_lookup(cg, v);
                 if (v_idx < 0) continue;
+                if ((int)cg->regs[v_idx] == dst_reg) continue;   /* dst owns it now */
                 cg_free_reg(cg, cg->regs[v_idx]);
             }
         }

@@ -139,7 +139,7 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
              alloc_sum free_list regions mulh float_basic fsqrt
              i64_basic f64_basic two_funcs
              fib_recursive many_args alloca_swap fnptr fnptr_export
-             dispatch_table const_gep reg_pressure float_mem struct_init
+             dispatch_table const_gep reg_pressure float_mem struct_init reg_reuse
              narrow_ops mem_intrin long_branch switch_dispatch
              switch_table switch_neg_table spill_loop reject_double)
     set(_src ${_fixture_dir}/${name}.c)
@@ -195,7 +195,7 @@ set(_emit_targets "")
 foreach(name add pick fib abs max divmod bitops counter sum_global
              mulh float_basic fsqrt i64_basic f64_basic
              two_funcs fib_recursive many_args
-             alloca_swap fnptr fnptr_export dispatch_table const_gep reg_pressure float_mem struct_init
+             alloca_swap fnptr fnptr_export dispatch_table const_gep reg_pressure float_mem struct_init reg_reuse
              narrow_ops mem_intrin
              long_branch switch_dispatch switch_table switch_neg_table
              spill_loop)
@@ -323,6 +323,11 @@ add_test(NAME e2e_float_mem        COMMAND test_e2e ${_fixture_out}/float_mem.bi
 # struct_init: struct/array zero-init + copy that clang lowers with `store
 # i64` chunks (mirrors the 3D pipeline's cron_cvert arrays). vm_main(n) = n.
 add_test(NAME e2e_struct_init      COMMAND test_e2e ${_fixture_out}/struct_init.bin 7 7)
+# reg_reuse: nested loop with selects (if/else-if) storing to a live global,
+# the case that exposed the dst-aliases-operand register-recycling bug.
+# vm_main(n) returns out[n]; out[136]=8 (inside r2<49), out[0]=0.
+add_test(NAME e2e_reg_reuse        COMMAND test_e2e ${_fixture_out}/reg_reuse.bin 8 136)
+add_test(NAME e2e_reg_reuse_zero   COMMAND test_e2e ${_fixture_out}/reg_reuse.bin 0 0)
 add_test(NAME e2e_dispatch_add     COMMAND test_e2e ${_fixture_out}/dispatch_table.bin  10 0 7 3)
 add_test(NAME e2e_dispatch_sub     COMMAND test_e2e ${_fixture_out}/dispatch_table.bin   4 1 7 3)
 add_test(NAME e2e_dispatch_mul     COMMAND test_e2e ${_fixture_out}/dispatch_table.bin  21 2 7 3)
@@ -391,6 +396,7 @@ set_tests_properties(
     e2e_two_funcs e2e_fib_rec_10 e2e_fib_rec_1 e2e_fib_rec_0
     e2e_many_args e2e_alloca_swap e2e_fnptr_add e2e_fnptr_sub e2e_fnptr_export
     e2e_const_gep e2e_reg_pressure e2e_float_mem e2e_struct_init
+    e2e_reg_reuse e2e_reg_reuse_zero
     e2e_dispatch_add e2e_dispatch_sub e2e_dispatch_mul
     e2e_narrow_ops e2e_mem_intrin
     e2e_long_branch_zero e2e_long_branch_path
