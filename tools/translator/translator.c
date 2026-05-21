@@ -2400,7 +2400,9 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 LLVMTypeRef  lty = LLVMTypeOf(i);
                 LLVMTypeKind lk  = LLVMGetTypeKind(lty);
                 uint8_t opc = 0;
-                if (lk == LLVMPointerTypeKind) {
+                if (lk == LLVMPointerTypeKind || lk == LLVMFloatTypeKind) {
+                    /* f32 shares the 32-bit register file with i32 (bitcast is
+                     * a no-op), so a float load is just a word load. */
                     opc = CVM_OP_LDW;
                 } else if (lk == LLVMIntegerTypeKind) {
                     unsigned w = LLVMGetIntTypeWidth(lty);
@@ -2411,7 +2413,7 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 if (!opc) {
                     ERR(cg->fn_name,
                         "load: unsupported result type "
-                        "(only i1/i8/i16/i32/ptr supported)");
+                        "(only i1/i8/i16/i32/f32/ptr supported)");
                     cg->had_error = 1;
                     break;
                 }
@@ -2429,7 +2431,8 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 LLVMTypeRef  vty   = LLVMTypeOf(val_v);
                 LLVMTypeKind vk    = LLVMGetTypeKind(vty);
                 uint8_t opc = 0;
-                if (vk == LLVMPointerTypeKind) {
+                if (vk == LLVMPointerTypeKind || vk == LLVMFloatTypeKind) {
+                    /* f32 is a 32-bit word in the register file — store as STW. */
                     opc = CVM_OP_STW;
                 } else if (vk == LLVMIntegerTypeKind) {
                     unsigned w = LLVMGetIntTypeWidth(vty);
@@ -2440,7 +2443,7 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 if (!opc) {
                     ERR(cg->fn_name,
                         "store: unsupported value type "
-                        "(only i1/i8/i16/i32/ptr supported)");
+                        "(only i1/i8/i16/i32/f32/ptr supported)");
                     cg->had_error = 1;
                     break;
                 }
@@ -2673,6 +2676,28 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     cg_emit(cg, enc_r (CVM_OP_MOV, dst, neg, 0));
                     cg_emit(cg, enc_i24(CVM_OP_JMP, 1));
                     cg_emit(cg, enc_r (CVM_OP_MOV, dst, x, 0));
+                    break;
+                }
+
+                /* llvm.fmuladd.f32(a, b, c) = a*b + c. clang emits it for
+                 * float `a*b + c` under the default fp-contract — pervasive
+                 * in matrix/vector maths. The VM has no fused op (and doesn't
+                 * need the extra precision), so lower to FMUL + FADD. */
+                if (strcmp(name, "llvm.fmuladd.f32") == 0) {
+                    if (LLVMGetNumArgOperands(i) != 3) {
+                        ERR(cg->fn_name, "llvm.fmuladd.f32 expects 3 args, got %u",
+                            LLVMGetNumArgOperands(i));
+                        cg->had_error = 1;
+                        break;
+                    }
+                    uint8_t a   = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                    uint8_t b   = cg_reg_for(cg, LLVMGetOperand(i, 1));
+                    uint8_t cc  = cg_reg_for(cg, LLVMGetOperand(i, 2));
+                    uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                    uint8_t tmp = cg_alloc_reg(cg);
+                    if (cg->had_error) break;
+                    cg_emit(cg, enc_r(CVM_OP_FMUL, tmp, a, b));
+                    cg_emit(cg, enc_r(CVM_OP_FADD, dst, tmp, cc));
                     break;
                 }
 

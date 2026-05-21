@@ -23,6 +23,17 @@ version bump; breaks are called out explicitly under **Breaking**.
   (`tests/test_rom.c`) covers load, byte-exact heap placement, the built-in
   syscalls, and the no-ROM case.
 
+### Added
+
+- **`float` loads/stores and `llvm.fmuladd.f32` lowering.** Storing or
+  loading an `f32` to memory (a float in a global/struct/array) was rejected
+  ("store: unsupported value type") even though f32 shares the 32-bit
+  register file — it now lowers to `STW`/`LDW`. And `a*b + c` on floats,
+  which clang folds to `llvm.fmuladd.f32` under the default fp-contract, now
+  lowers to `FMUL` + `FADD`. Together these unblock float vector/matrix maths
+  in memory — the basis of the Cronopio 3D pipeline header. New ctest
+  `e2e_float_mem` (`tests/fixtures/float_mem.c`).
+
 ### Fixed
 
 - **Transient registers are now recycled per instruction — fixes spurious
