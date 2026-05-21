@@ -74,4 +74,30 @@ if(TARGET cvm-translate)
              COMMAND test_e2e ${_cvmcc_multi} 120 7 5)
     set_tests_properties(e2e_cvm_cc_multi
                          PROPERTIES FIXTURES_REQUIRED cvm_cc_bins)
+
+    # Same multi-file build with --lto (opt 'default<O2>' on the linked module,
+    # vectorisation off). Guards that the cross-file optimisation path stays
+    # translator-compatible and correct: vm_main(7,5) must still be 120.
+    set(_cvmcc_lto ${CMAKE_CURRENT_BINARY_DIR}/cvm_cc_lto.bin)
+    add_custom_command(
+        OUTPUT  ${_cvmcc_lto}
+        COMMAND $<TARGET_FILE:cvm-cc> --lto
+                ${_fixture_dir}/multi_link_main.c
+                ${_fixture_dir}/multi_link_helper.c
+                -o ${_cvmcc_lto}
+        DEPENDS cvm-cc cvm-translate
+                ${_fixture_dir}/multi_link_main.c
+                ${_fixture_dir}/multi_link_helper.c
+        VERBATIM
+    )
+    add_custom_target(cvm_cc_lto_round_trip DEPENDS ${_cvmcc_lto})
+    add_test(NAME cvm_cc_compile_lto
+             COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+                                      --target cvm_cc_lto_round_trip)
+    set_tests_properties(cvm_cc_compile_lto
+                         PROPERTIES FIXTURES_SETUP cvm_cc_bins)
+    add_test(NAME e2e_cvm_cc_lto
+             COMMAND test_e2e ${_cvmcc_lto} 120 7 5)
+    set_tests_properties(e2e_cvm_cc_lto
+                         PROPERTIES FIXTURES_REQUIRED cvm_cc_bins)
 endif()

@@ -14,9 +14,12 @@
  *        `<output>.linked.bc`. A single module skips the link step. This is
  *        real C linkage: file-local statics are uniqued per module, only
  *        true extern duplicates error.
- *     3. Invoke cvm-translate on the (linked) module with all pass-through
+ *     3. With --lto, run `opt 'default<O2>'` on the (linked) module so the
+ *        inliner runs across all files (cross-TU inlining). Vectorisation is
+ *        forced off — the VM/translator has no vector types.
+ *     4. Invoke cvm-translate on the resulting module with all pass-through
  *        flags.
- *     4. Delete the intermediates unless --keep-bc was given.
+ *     5. Delete the intermediates unless --keep-bc was given.
  *
  * Tool discovery:
  *     - clang: --clang= flag, then PATH.
@@ -78,6 +81,7 @@ struct cli {
     const char *opt_level;      /* -O<n>, default "1" */
     const char *clang_path;     /* --clang= */
     const char *llvm_link_path; /* --llvm-link= */
+    const char *opt_path;       /* --opt= */
     const char *translate_path; /* --translate= */
     const char *runtime_dir;    /* --runtime-dir= */
 
@@ -89,6 +93,7 @@ struct cli {
     const char *include_dirs[MAX_INCLUDE_DIRS];
     int         include_count;
 
+    int lto;        /* --lto: run opt default<O2> on the (linked) module */
     int keep_bc;
     int verbose;
 };
@@ -118,9 +123,16 @@ static void usage(FILE *f) {
         "  -I <dir>                   extra include dir (repeatable)\n"
         "  -O0|-O1|-O2|-O3|-Os        optimisation level (default -O1)\n"
         "\n"
+        "Link-time optimisation:\n"
+        "  --lto                      run opt 'default<O2>' on the linked module\n"
+        "                             before translating, enabling cross-file\n"
+        "                             inlining. Vectorisation is forced off (the\n"
+        "                             VM has no vector types). Off by default.\n"
+        "\n"
         "Tool discovery overrides:\n"
         "  --clang=PATH               override clang binary\n"
         "  --llvm-link=PATH           override llvm-link binary\n"
+        "  --opt=PATH                 override opt binary (for --lto)\n"
         "  --translate=PATH           override cvm-translate binary\n"
         "  --runtime-dir=PATH         override the runtime/lib include dir\n"
         "                             (built-in default: %s)\n"
@@ -275,6 +287,17 @@ static char *find_llvm_link(const struct cli *cli) {
 #endif
 }
 
+/* Locate opt (the LLVM optimiser, used for --lto). Same toolchain as clang;
+ * default to PATH, --opt= overrides. Caller owns the returned string. */
+static char *find_opt(const struct cli *cli) {
+    if (cli->opt_path) return strdup(cli->opt_path);
+#if defined(_WIN32)
+    return strdup("opt.exe");
+#else
+    return strdup("opt");
+#endif
+}
+
 static int parse_argv(int argc, char **argv, struct cli *cli) {
     cli->opt_level   = "1";
     /* runtime_dir resolved in main() after parse_argv: either user's
@@ -315,10 +338,14 @@ static int parse_argv(int argc, char **argv, struct cli *cli) {
             cli->clang_path = a + 8;
         } else if (strncmp(a, "--llvm-link=", 12) == 0) {
             cli->llvm_link_path = a + 12;
+        } else if (strncmp(a, "--opt=", 6) == 0) {
+            cli->opt_path = a + 6;
         } else if (strncmp(a, "--translate=", 12) == 0) {
             cli->translate_path = a + 12;
         } else if (strncmp(a, "--runtime-dir=", 14) == 0) {
             cli->runtime_dir = a + 14;
+        } else if (strcmp(a, "--lto") == 0) {
+            cli->lto = 1;
         } else if (strcmp(a, "--keep-bc") == 0) {
             cli->keep_bc = 1;
         } else if (strcmp(a, "-v") == 0 || strcmp(a, "--verbose") == 0) {
@@ -456,7 +483,40 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* cvm-translate the (possibly linked) module. */
+    /* Optional cross-file optimisation: run opt 'default<O2>' on the module.
+     * After llvm-link the inliner sees every TU, so small cross-file helpers
+     * (e.g. fixed-point and renderer accessors) inline at their call sites.
+     * Vectorisation is forced off because the translator/VM has no vector
+     * types (an O2 pipeline would otherwise emit <N x iM> and be rejected). */
+    char *opt_out = NULL;
+    if (!fail && cli.lto) {
+        opt_out = (char *)malloc(outlen + 16);
+        if (!opt_out) { perror("malloc"); fail = 1; }
+        else {
+            snprintf(opt_out, outlen + 16, "%s.opt.bc", cli.output);
+            char *opt = find_opt(&cli);
+            char *oargv[10];
+            int   n = 0;
+            oargv[n++] = opt;
+            oargv[n++] = (char *)"--passes=default<O2>";
+            oargv[n++] = (char *)"-vectorize-loops=false";
+            oargv[n++] = (char *)"-vectorize-slp=false";
+            oargv[n++] = (char *)module;
+            oargv[n++] = (char *)"-o";
+            oargv[n++] = opt_out;
+            oargv[n] = NULL;
+            int orc = run_cmd(&cli, oargv);
+            free(opt);
+            if (orc != 0) {
+                fprintf(stderr, "cvm-cc: opt failed (exit %d)\n", orc);
+                fail = 1;
+            } else {
+                module = opt_out;
+            }
+        }
+    }
+
+    /* cvm-translate the (possibly linked, possibly optimised) module. */
     int trc = 0;
     if (!fail) {
         char *translator = find_translator(&cli, argv[0]);
@@ -487,11 +547,13 @@ int main(int argc, char **argv) {
     if (!cli.keep_bc) {
         for (int i = 0; i < bc_count; ++i)
             if (bc_owned[i]) remove(bc_paths[i]);
-        if (linked) remove(linked);
+        if (linked)  remove(linked);
+        if (opt_out) remove(opt_out);
     }
     for (int i = 0; i < bc_count; ++i)
         if (bc_owned[i]) free(bc_paths[i]);
     free(linked);
+    free(opt_out);
 
     if (fail) return 1;
     return trc < 0 ? 1 : trc;
