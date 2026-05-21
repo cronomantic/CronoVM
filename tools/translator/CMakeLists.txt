@@ -141,7 +141,7 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
              fib_recursive many_args alloca_swap fnptr fnptr_export
              dispatch_table const_gep reg_pressure float_mem struct_init reg_reuse
              narrow_ops mem_intrin long_branch switch_dispatch
-             switch_table switch_neg_table spill_loop vararg reject_double)
+             switch_table switch_neg_table spill_loop vararg globptr reject_double)
     set(_src ${_fixture_dir}/${name}.c)
     set(_bc  ${_fixture_out}/${name}.bc)
     # -ffreestanding turns off __STDC_HOSTED__, so clang's bundled
@@ -198,7 +198,7 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
              alloca_swap fnptr fnptr_export dispatch_table const_gep reg_pressure float_mem struct_init reg_reuse
              narrow_ops mem_intrin
              long_branch switch_dispatch switch_table switch_neg_table
-             spill_loop vararg)
+             spill_loop vararg globptr)
     set(_bc  ${_fixture_out}/${name}.bc)
     set(_bin ${_fixture_out}/${name}.bin)
     add_custom_command(
@@ -389,6 +389,8 @@ add_test(NAME e2e_spill_loop_4     COMMAND test_e2e ${_fixture_out}/spill_loop.b
 add_test(NAME e2e_spill_loop_8     COMMAND test_e2e ${_fixture_out}/spill_loop.bin   1380580815 8)
 # Variadic functions: va_start/va_arg lowering. vm_main(7,5) = 7+5+106 = 118.
 add_test(NAME e2e_vararg           COMMAND test_e2e ${_fixture_out}/vararg.bin             118 7 5)
+# Pointer-relocation global initializers (tables of char*/data-global pointers).
+add_test(NAME e2e_globptr          COMMAND test_e2e ${_fixture_out}/globptr.bin             91 1 0)
 set_tests_properties(
     e2e_add e2e_pick_true e2e_pick_false e2e_fib_10 e2e_fib_0
     e2e_abs_neg e2e_abs_pos e2e_max_lhs e2e_max_rhs
@@ -411,5 +413,5 @@ set_tests_properties(
     e2e_switch_neg_m4 e2e_switch_neg_m3 e2e_switch_neg_m2 e2e_switch_neg_m1
     e2e_switch_neg_zero e2e_switch_neg_m5 e2e_switch_neg_pos
     e2e_spill_loop_0 e2e_spill_loop_1 e2e_spill_loop_4 e2e_spill_loop_8
-    e2e_vararg
+    e2e_vararg e2e_globptr
     PROPERTIES FIXTURES_REQUIRED emitted_bins)

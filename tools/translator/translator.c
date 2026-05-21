@@ -423,6 +423,48 @@ static int serialize_function_index(const struct cg_globals *g,
     return 0;
 }
 
+static int cg_const_gep_offset(const struct cg_globals *g, LLVMValueRef gep,
+                               long long *out);
+
+/* Serialize a pointer-typed constant that addresses another global (a string
+ * literal, a data global, or a pointer into one) as that global's data offset.
+ * Globals live at heap offset 0 onward (DATA is the first heap section) and VM
+ * pointers are heap offsets, so a global at data offset `o` simply has address
+ * `o` — the same value codegen materialises for &global. No runtime relocation
+ * is needed; we resolve the offset at translate time (which is why globals are
+ * laid out in a first pass before any initializer is serialized). Returns 0 on
+ * success, 1 if `c` is not a recognised global-address constant. */
+static int serialize_global_ptr(const struct cg_globals *g, LLVMValueRef c,
+                                uint8_t *out, uint32_t off, uint32_t sz)
+{
+    if (sz < 4) return 1;
+    long long extra = 0;
+
+    if (LLVMIsAConstantExpr(c)) {
+        LLVMOpcode op = LLVMGetConstOpcode(c);
+        if (op == LLVMBitCast || op == LLVMAddrSpaceCast ||
+            op == LLVMIntToPtr || op == LLVMPtrToInt) {
+            return serialize_global_ptr(g, LLVMGetOperand(c, 0), out, off, sz);
+        }
+        if (op == LLVMGetElementPtr) {
+            if (cg_const_gep_offset(g, c, &extra) != 0) return 1;
+            c = LLVMGetOperand(c, 0);   /* fall through with the base global */
+        } else {
+            return 1;
+        }
+    }
+
+    if (!LLVMIsAGlobalVariable(c)) return 1;
+    int idx = cg_globals_lookup(g, c);
+    if (idx < 0) return 1;                 /* not laid out (should not happen) */
+    uint32_t addr = g->items[idx].offset + (uint32_t)extra;
+    out[off + 0] = (uint8_t)(addr);
+    out[off + 1] = (uint8_t)(addr >> 8);
+    out[off + 2] = (uint8_t)(addr >> 16);
+    out[off + 3] = (uint8_t)(addr >> 24);
+    return 0;
+}
+
 static int serialize_constant(const struct cg_globals *g, LLVMValueRef c,
                               uint8_t *out, uint32_t off, uint32_t cap)
 {
@@ -487,11 +529,21 @@ static int serialize_constant(const struct cg_globals *g, LLVMValueRef c,
         }
         return 0;
     }
+    /* A pointer initializer holding the address of another global (string
+     * literal / data global / a pointer into one). Resolved to that global's
+     * data offset. */
+    if (LLVMGetTypeKind(ty) == LLVMPointerTypeKind) {
+        return serialize_global_ptr(g, c, out, off, sz);
+    }
     return 1;
 }
 
 static int cg_collect_globals(struct cg_globals *g, LLVMModuleRef mod) {
     char err[256];
+
+    /* Pass 1: lay out every global (assign a data offset) WITHOUT serializing.
+     * An initializer may take the address of another global, so all offsets
+     * must be known before any initializer is emitted (forward references). */
     uint32_t cursor = 0;
     for (LLVMValueRef gv = LLVMGetFirstGlobal(mod);
          gv; gv = LLVMGetNextGlobal(gv))
@@ -515,18 +567,24 @@ static int cg_collect_globals(struct cg_globals *g, LLVMModuleRef mod) {
         cursor = (cursor + align - 1) & ~(align - 1);
 
         cg_data_reserve(g, cursor + size);
+        if (cg_globals_append(g, gv, cursor, size) != 0) return 1;
+        cursor += size;
+        if (cursor > g->data_size) g->data_size = cursor;
+    }
+
+    /* Pass 2: serialize each initializer at its assigned offset. Now that the
+     * layout is complete, address-of-global relocations resolve to offsets. */
+    for (int i = 0; i < (int)g->count; ++i) {
+        LLVMValueRef gv   = g->items[i].value;
         LLVMValueRef init = LLVMGetInitializer(gv);
-        if (init && serialize_constant(g, init,
-                                       g->data_bytes, cursor, g->data_cap) != 0) {
+        if (init && serialize_constant(g, init, g->data_bytes,
+                                       g->items[i].offset, g->data_cap) != 0) {
             ERR(NULL, "global '%s': unsupported initializer shape "
                       "(or function-pointer initialiser without a "
                       "definition for the referenced function)",
                 value_name(gv));
             return 1;
         }
-        if (cg_globals_append(g, gv, cursor, size) != 0) return 1;
-        cursor += size;
-        if (cursor > g->data_size) g->data_size = cursor;
     }
     return 0;
 }
@@ -884,7 +942,7 @@ static uint8_t cg_assign(struct cg *cg, LLVMValueRef v, uint8_t r) {
  * ConstantExpr GEP is a compile-time constant, so the whole offset folds.
  * Mirrors the index-walk in the LLVMGetElementPtr instruction handler.
  * Returns 0 on success (offset in *out), nonzero on an unsupported shape. */
-static int cg_const_gep_offset(struct cg *cg, LLVMValueRef gep, long long *out) {
+static int cg_const_gep_offset(const struct cg_globals *g, LLVMValueRef gep, long long *out) {
     LLVMTypeRef cur_ty = LLVMGetGEPSourceElementType(gep);
     if (!cur_ty) return 1;
     long long off = 0;
@@ -894,15 +952,15 @@ static int cg_const_gep_offset(struct cg *cg, LLVMValueRef gep, long long *out) 
         if (!LLVMIsAConstantInt(idx_v)) return 1;
         if (k == 0) {
             long long ci = LLVMConstIntGetSExtValue(idx_v);
-            off += ci * (long long)LLVMABISizeOfType(cg->globals->td, cur_ty);
+            off += ci * (long long)LLVMABISizeOfType(g->td, cur_ty);
         } else if (LLVMGetTypeKind(cur_ty) == LLVMArrayTypeKind) {
             LLVMTypeRef et = LLVMGetElementType(cur_ty);
             long long ci = LLVMConstIntGetSExtValue(idx_v);
-            off += ci * (long long)LLVMABISizeOfType(cg->globals->td, et);
+            off += ci * (long long)LLVMABISizeOfType(g->td, et);
             cur_ty = et;
         } else if (LLVMGetTypeKind(cur_ty) == LLVMStructTypeKind) {
             unsigned fi = (unsigned)LLVMConstIntGetZExtValue(idx_v);
-            off += (long long)LLVMOffsetOfElement(cg->globals->td, cur_ty, fi);
+            off += (long long)LLVMOffsetOfElement(g->td, cur_ty, fi);
             cur_ty = LLVMStructGetTypeAtIndex(cur_ty, fi);
         } else {
             return 1;
@@ -1027,7 +1085,7 @@ static uint8_t cg_reg_for(struct cg *cg, LLVMValueRef v) {
         }
         if (op == LLVMGetElementPtr) {
             long long off = 0;
-            if (cg_const_gep_offset(cg, v, &off) != 0) {
+            if (cg_const_gep_offset(cg->globals, v, &off) != 0) {
                 ERR(cg->fn_name, "unsupported constant GEP expression");
                 cg->had_error = 1;
                 return 0;
