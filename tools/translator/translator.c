@@ -2385,12 +2385,16 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                  *   ord(a,b) ↔ both not NaN  → FCMP_EQ a,a AND FCMP_EQ b,b
                  *   uno(a,b) ↔ either is NaN → FCMP_NE a,a OR  FCMP_NE b,b
                  * Lowered to three instructions each since IEEE NaN
-                 * compares unequal to itself. The remaining six predicates
-                 * (ONE, UEQ, ULT, ULE, UGT, UGE) almost never appear from
-                 * straight C code and are rejected. */
+                 * compares unequal to itself.
+                 * The unordered relational predicates (UGE/UGT/ULT/ULE) are the
+                 * exact negation of the complementary ORDERED predicate — e.g.
+                 * uge(a,b) ⇔ !(a<b ordered) — which is NaN-correct (a NaN makes
+                 * the ordered compare false, so the negation is true, matching
+                 * "unordered → true"). We compute the ordered compare and flip
+                 * the 0/1 result with `1 - r`. ONE/UEQ are built from two LTs. */
                 LLVMRealPredicate p = LLVMGetFCmpPredicate(i);
-                int op2 = -1, swap = 0;
-                int compound_kind = 0;       /* 0=normal, 1=ord, 2=uno */
+                int op2 = -1, swap = 0, negate = 0;
+                int compound_kind = 0;       /* 0=normal,1=ord,2=uno,3=one,4=ueq */
                 switch (p) {
                 case LLVMRealOEQ: op2 = CVM_OP_FCMP_EQ;             break;
                 case LLVMRealUNE: op2 = CVM_OP_FCMP_NE;             break;
@@ -2398,14 +2402,19 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 case LLVMRealOLE: op2 = CVM_OP_FCMP_LE;             break;
                 case LLVMRealOGT: op2 = CVM_OP_FCMP_LT; swap = 1;   break;
                 case LLVMRealOGE: op2 = CVM_OP_FCMP_LE; swap = 1;   break;
+                case LLVMRealUGE: op2 = CVM_OP_FCMP_LT; negate = 1; break; /* !(a<b)  */
+                case LLVMRealUGT: op2 = CVM_OP_FCMP_LE; negate = 1; break; /* !(a<=b) */
+                case LLVMRealULT: op2 = CVM_OP_FCMP_LE; swap = 1; negate = 1; break; /* !(b<=a) */
+                case LLVMRealULE: op2 = CVM_OP_FCMP_LT; swap = 1; negate = 1; break; /* !(b<a)  */
                 case LLVMRealORD: compound_kind = 1;                break;
                 case LLVMRealUNO: compound_kind = 2;                break;
+                case LLVMRealONE: compound_kind = 3;                break; /* (a<b)|(b<a)   */
+                case LLVMRealUEQ: compound_kind = 4;                break; /* !((a<b)|(b<a))*/
                 default: break;
                 }
                 if (op2 < 0 && compound_kind == 0) {
                     ERR(cg->fn_name,
-                        "fcmp predicate %d not in the supported subset "
-                        "(use ==, !=, <, <=, >, >=)", (int)p);
+                        "fcmp predicate %d not in the supported subset", (int)p);
                     cg->had_error = 1;
                     break;
                 }
@@ -2428,10 +2437,25 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     cg_emit(cg, enc_r(CVM_OP_FCMP_NE, t1,  lhs, lhs));
                     cg_emit(cg, enc_r(CVM_OP_FCMP_NE, t2,  rhs, rhs));
                     cg_emit(cg, enc_r(CVM_OP_OR,      dst, t1,  t2 ));
-                } else if (swap) {
-                    cg_emit(cg, enc_r((uint8_t)op2, dst, rhs, lhs));
+                } else if (compound_kind == 3 || compound_kind == 4) {
+                    /* one(a,b) = (a<b) | (b<a) ; ueq = !one */
+                    uint8_t t1 = cg_alloc_reg(cg);
+                    uint8_t t2 = cg_alloc_reg(cg);
+                    if (cg->had_error) break;
+                    cg_emit(cg, enc_r(CVM_OP_FCMP_LT, t1,  lhs, rhs));
+                    cg_emit(cg, enc_r(CVM_OP_FCMP_LT, t2,  rhs, lhs));
+                    cg_emit(cg, enc_r(CVM_OP_OR,      dst, t1,  t2 ));
                 } else {
-                    cg_emit(cg, enc_r((uint8_t)op2, dst, lhs, rhs));
+                    if (swap) cg_emit(cg, enc_r((uint8_t)op2, dst, rhs, lhs));
+                    else      cg_emit(cg, enc_r((uint8_t)op2, dst, lhs, rhs));
+                }
+                /* Flip the 0/1 result for the unordered-relational and UEQ
+                 * predicates: dst = 1 - dst. */
+                if (negate || compound_kind == 4) {
+                    uint8_t one_r = cg_alloc_reg(cg);
+                    if (cg->had_error) break;
+                    cg_emit(cg, enc_i16(CVM_OP_MOVI, one_r, 1));
+                    cg_emit(cg, enc_r(CVM_OP_SUB, dst, one_r, dst));
                 }
                 break;
             }
@@ -3049,6 +3073,34 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     break;
                 }
 
+                /* llvm.ctlz.i32(%x, is_zero_undef) — count leading zeros.
+                 * No CLZ opcode, so lower to a tiny loop: shift x right until
+                 * it is zero, counting shifts (= highest-set-bit index + 1);
+                 * the result is 32 - count, which is also correct for x==0
+                 * (0 shifts -> 32). The is_zero_undef flag doesn't affect this
+                 * exact lowering. clang folds bit-scan idioms (R_FixWiggle's
+                 * log2) into this intrinsic. */
+                if (strcmp(name, "llvm.ctlz.i32") == 0) {
+                    uint8_t src = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                    uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                    uint8_t x   = cg_alloc_reg(cg);
+                    uint8_t n   = cg_alloc_reg(cg);
+                    uint8_t one = cg_alloc_reg(cg);
+                    uint8_t k32 = cg_alloc_reg(cg);
+                    if (cg->had_error) break;
+                    cg_emit(cg, enc_r  (CVM_OP_MOV,  x, src, 0));
+                    cg_emit(cg, enc_i16(CVM_OP_MOVI, n, 0));
+                    cg_emit(cg, enc_i16(CVM_OP_MOVI, one, 1));
+                    /* loop: while (x != 0) { x >>= 1; n++; } */
+                    cg_emit(cg, enc_br (CVM_OP_BEQ, x, cg->zero_reg, 3)); /* x==0 -> exit */
+                    cg_emit(cg, enc_r  (CVM_OP_SHR, x, x, one));          /* x >>= 1   */
+                    cg_emit(cg, enc_r  (CVM_OP_ADD, n, n, one));          /* n++       */
+                    cg_emit(cg, enc_i24(CVM_OP_JMP, -4));                 /* loop back */
+                    cg_emit(cg, enc_i16(CVM_OP_MOVI, k32, 32));
+                    cg_emit(cg, enc_r  (CVM_OP_SUB, dst, k32, n));        /* 32 - n    */
+                    break;
+                }
+
                 /* llvm.fmuladd.f32(a, b, c) = a*b + c. clang emits it for
                  * float `a*b + c` under the default fp-contract — pervasive
                  * in matrix/vector maths. The VM has no fused op (and doesn't
@@ -3178,25 +3230,52 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     }
                 }
 
-                /* min/max family. Lowered as cmp + branch + 2 MOVs. */
-                int is_min = 0, is_signed = 0, is_minmax = 0;
-                if (strcmp(name, "llvm.smax.i32") == 0) { is_minmax = 1; is_signed = 1; }
-                else if (strcmp(name, "llvm.smin.i32") == 0) { is_minmax = 1; is_signed = 1; is_min = 1; }
-                else if (strcmp(name, "llvm.umax.i32") == 0) { is_minmax = 1; }
-                else if (strcmp(name, "llvm.umin.i32") == 0) { is_minmax = 1; is_min = 1; }
+                /* min/max family, any integer width. clang -O1 folds
+                 * `a<b?a:b` / `a>b?a:b` (and abs) into llvm.{s,u}{max,min}.iN.
+                 * Lowered as cmp + branch + 2 MOVs. For narrow widths (i16/i8)
+                 * the operands are extended to 32 bits before the compare so
+                 * the ordering is correct; the SELECTED value is the original
+                 * (untruncated) operand — the consumer truncates to width. */
+                int is_min = 0, is_signed = 0, is_minmax = 0, mm_bits = 32;
+                if      (strncmp(name, "llvm.smax.i", 11) == 0) { is_minmax=1; is_signed=1;            mm_bits=atoi(name+11); }
+                else if (strncmp(name, "llvm.smin.i", 11) == 0) { is_minmax=1; is_signed=1; is_min=1; mm_bits=atoi(name+11); }
+                else if (strncmp(name, "llvm.umax.i", 11) == 0) { is_minmax=1;                         mm_bits=atoi(name+11); }
+                else if (strncmp(name, "llvm.umin.i", 11) == 0) { is_minmax=1;             is_min=1;   mm_bits=atoi(name+11); }
 
                 if (is_minmax) {
                     uint8_t a    = cg_reg_for(cg, LLVMGetOperand(i, 0));
                     uint8_t b2   = cg_reg_for(cg, LLVMGetOperand(i, 1));
                     uint8_t dst  = cg->regs[cg_lookup(cg, i)];
+                    /* compare operands ca/cb — widened for narrow types */
+                    uint8_t ca = a, cb = b2;
+                    if (mm_bits > 0 && mm_bits < 32) {
+                        ca = cg_alloc_reg(cg);
+                        cb = cg_alloc_reg(cg);
+                        if (cg->had_error) break;
+                        if (is_signed) {
+                            uint8_t sh = cg_alloc_reg(cg);
+                            if (cg->had_error) break;
+                            cg_emit_load_const32(cg, sh, 32 - mm_bits);
+                            cg_emit(cg, enc_r(CVM_OP_SHL, ca, a,  sh));
+                            cg_emit(cg, enc_r(CVM_OP_SAR, ca, ca, sh));
+                            cg_emit(cg, enc_r(CVM_OP_SHL, cb, b2, sh));
+                            cg_emit(cg, enc_r(CVM_OP_SAR, cb, cb, sh));
+                        } else {
+                            uint8_t mask = cg_alloc_reg(cg);
+                            if (cg->had_error) break;
+                            cg_emit_load_const32(cg, mask, (int32_t)(((uint32_t)1 << mm_bits) - 1u));
+                            cg_emit(cg, enc_r(CVM_OP_AND, ca, a,  mask));
+                            cg_emit(cg, enc_r(CVM_OP_AND, cb, b2, mask));
+                        }
+                    }
                     uint8_t cond = cg_alloc_reg(cg);
                     if (cg->had_error) break;
-                    /* cond = (a < b). For max, true -> b ; false -> a.
+                    /* cond = (ca < cb). For max, true -> b ; false -> a.
                      * For min, true -> a ; false -> b. */
                     uint8_t cmp_op = is_signed ? CVM_OP_CMP_LT : CVM_OP_CMP_LTU;
                     uint8_t true_v  = is_min ? a  : b2;
                     uint8_t false_v = is_min ? b2 : a;
-                    cg_emit(cg, enc_r (cmp_op, cond, a, b2));
+                    cg_emit(cg, enc_r (cmp_op, cond, ca, cb));
                     cg_emit(cg, enc_br(CVM_OP_BEQ, cond, cg->zero_reg, 2));
                     cg_emit(cg, enc_r (CVM_OP_MOV, dst, true_v, 0));
                     cg_emit(cg, enc_i24(CVM_OP_JMP, 1));
