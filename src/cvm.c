@@ -513,9 +513,15 @@ int cvm_link(struct cvm_image *img, const char *name,
     return CVM_E_NO_SUCH_IMPORT;
 }
 
+/* Syscall-facing pointer accessors. They bound-check against mem_size (the
+ * full allocation: DATA|BSS|REGIONS|ROM|RESERVE|STACK), matching the in-VM
+ * LDB/STB checks above — NOT heap_size, which excludes the stack. Otherwise a
+ * cart could read/write a stack-local with LDB/STB but a syscall handed the
+ * same pointer (e.g. cron_log of a stack buffer, cron_mouse(&x,&y)) would trap.
+ * The stack is the cart's own memory; there is no reason to forbid it here. */
 int cvm_heap_read(struct cvm_image *img, uint32_t addr, void *out, size_t n) {
     if (!img || !out) return CVM_E_BAD_ADDR;
-    if (addr > img->heap_size || (size_t)(img->heap_size - addr) < n)
+    if (addr > img->mem_size || (size_t)(img->mem_size - addr) < n)
         return CVM_E_BAD_ADDR;
     memcpy(out, img->heap + addr, n);
     return CVM_OK;
@@ -523,7 +529,7 @@ int cvm_heap_read(struct cvm_image *img, uint32_t addr, void *out, size_t n) {
 
 int cvm_heap_write(struct cvm_image *img, uint32_t addr, const void *in, size_t n) {
     if (!img || !in) return CVM_E_BAD_ADDR;
-    if (addr > img->heap_size || (size_t)(img->heap_size - addr) < n)
+    if (addr > img->mem_size || (size_t)(img->mem_size - addr) < n)
         return CVM_E_BAD_ADDR;
     memcpy(img->heap + addr, in, n);
     return CVM_OK;
