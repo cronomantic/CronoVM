@@ -1634,6 +1634,20 @@ static void cg_emit_phi_moves(struct cg *cg,
     }
 }
 
+/* True if `to` carries phi moves on an edge from any predecessor — i.e. it
+ * starts with a PHI. Phis sit at the block head, and every predecessor edge
+ * (including `from`) appears in each phi, so one phi means this edge has moves.
+ * Side-effect free (does NOT call cg_phi_src_loc, which would emit a constant
+ * materialisation). Used by the conditional-branch handler to decide whether
+ * phi-move copies must be ISOLATED to their edge — emitting them unconditionally
+ * before the branch corrupts the other edge when a move's destination is a
+ * value that edge still needs (the lost-copy problem: a loop back-edge writes
+ * the induction phi register that the loop-exit edge reads). */
+static int cg_block_has_phi(LLVMBasicBlockRef bb) {
+    LLVMValueRef inst = LLVMGetFirstInstruction(bb);
+    return inst && LLVMGetInstructionOpcode(inst) == LLVMPHI;
+}
+
 static int icmp_to_op(LLVMIntPredicate p, int *swap_out) {
     *swap_out = 0;
     switch (p) {
@@ -2539,12 +2553,71 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     uint8_t cond_reg = cg_reg_for(cg, LLVMGetCondition(i));
                     LLVMBasicBlockRef true_bb  = LLVMGetSuccessor(i, 0);
                     LLVMBasicBlockRef false_bb = LLVMGetSuccessor(i, 1);
-                    cg_emit_phi_moves(cg, cg->cur_block, true_bb);
-                    cg_emit_phi_moves(cg, cg->cur_block, false_bb);
-                    cg_queue_fixup(cg, cg->count, true_bb, 24, 8);
-                    cg_emit(cg, enc_br(CVM_OP_BNE, cond_reg, cg->zero_reg, 0));
-                    cg_queue_fixup(cg, cg->count, false_bb, 8, 24);
-                    cg_emit(cg, enc_i24(CVM_OP_JMP, 0));
+                    int true_phi  = cg_block_has_phi(true_bb);
+                    int false_phi = cg_block_has_phi(false_bb);
+
+                    /* Phi-move ISOLATION (see cg_block_has_phi): a move must run
+                     * only on its own edge. Emitting both edges' moves before
+                     * the branch (the naive form) lets one edge's write corrupt
+                     * a value the other edge needs — e.g. a single-block loop
+                     * `for(;*p;p=p->next)` whose back-edge updates the `p` phi
+                     * register that the exit edge then reads.
+                     *
+                     * We place an edge's moves on the fall-through AFTER the
+                     * conditional branch so they run only when that edge is
+                     * taken. The branch-relaxation pass preserves this (it flips
+                     * the opcode and keeps the +1 skip), so it survives long
+                     * branches. A conditional branch can only fall through to
+                     * ONE edge, so when BOTH successors carry moves we add a
+                     * local skip to isolate the second. */
+                    if (true_phi && false_phi) {
+                        /* Both edges carry moves: fully isolate.
+                         *   BNE cond -> (skip the false section)   cond!=0=true
+                         *   <false moves>; JMP false_bb            cond==0=false
+                         *   <true moves>;  JMP true_bb             (skip lands here) */
+                        uint32_t bne_idx = cg->count;
+                        cg_emit(cg, enc_br(CVM_OP_BNE, cond_reg, cg->zero_reg, 0));
+                        cg_emit_phi_moves(cg, cg->cur_block, false_bb);
+                        cg_queue_fixup(cg, cg->count, false_bb, 8, 24);
+                        cg_emit(cg, enc_i24(CVM_OP_JMP, 0));
+                        int32_t skip = (int32_t)cg->count - (int32_t)(bne_idx + 1u);
+                        if (skip < -128 || skip > 127) {
+                            /* This BNE carries no fixup (its target is a local
+                             * offset, not a block) so relaxation can't lift it;
+                             * fail loudly rather than emit a wrong skip. Only a
+                             * pathological count of phi moves on the false edge
+                             * could trigger this. */
+                            ERR(cg->fn_name,
+                                "phi-isolation skip %d out of imm8 range "
+                                "(too many phi moves on one edge)", skip);
+                            cg->had_error = 1;
+                        } else {
+                            cg->code[bne_idx] =
+                                enc_br(CVM_OP_BNE, cond_reg, cg->zero_reg,
+                                       (int8_t)skip);
+                        }
+                        cg_emit_phi_moves(cg, cg->cur_block, true_bb);
+                        cg_queue_fixup(cg, cg->count, true_bb, 8, 24);
+                        cg_emit(cg, enc_i24(CVM_OP_JMP, 0));
+                    } else if (true_phi) {
+                        /* Only the true edge has moves: branch to the move-less
+                         * false edge, then run the true moves on the fall-through. */
+                        cg_queue_fixup(cg, cg->count, false_bb, 24, 8);
+                        cg_emit(cg, enc_br(CVM_OP_BEQ, cond_reg, cg->zero_reg, 0));
+                        cg_emit_phi_moves(cg, cg->cur_block, true_bb);
+                        cg_queue_fixup(cg, cg->count, true_bb, 8, 24);
+                        cg_emit(cg, enc_i24(CVM_OP_JMP, 0));
+                    } else {
+                        /* Only the false edge has moves, or neither: branch to
+                         * the move-less true edge, then run any false moves on
+                         * the fall-through. (Neither-moves degenerates to the
+                         * original BNE/JMP pair.) */
+                        cg_queue_fixup(cg, cg->count, true_bb, 24, 8);
+                        cg_emit(cg, enc_br(CVM_OP_BNE, cond_reg, cg->zero_reg, 0));
+                        cg_emit_phi_moves(cg, cg->cur_block, false_bb);
+                        cg_queue_fixup(cg, cg->count, false_bb, 8, 24);
+                        cg_emit(cg, enc_i24(CVM_OP_JMP, 0));
+                    }
                 } else {
                     LLVMBasicBlockRef target = LLVMGetSuccessor(i, 0);
                     cg_emit_phi_moves(cg, cg->cur_block, target);
