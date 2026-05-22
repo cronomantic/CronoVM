@@ -1207,6 +1207,39 @@ static uint8_t cg_reg_for(struct cg *cg, LLVMValueRef v) {
     return 0;
 }
 
+/* Normalise an icmp operand to its comparison width `w` (only matters when
+ * w < 32). The VM has no narrow compares, so both operands must agree in their
+ * high bits. But the narrow-value register representation is NOT uniform:
+ * loads zero-extend (LDB/LDH), Trunc masks, yet ZExt is a bare MOV and narrow
+ * arithmetic leaves dirty high bits, while integer CONSTANTS are materialised
+ * SIGN-extended (cg_reg_for). So a raw 32-bit compare of `iN` values is wrong:
+ * e.g. `icmp eq i8 %v, -1` compares a zero-extended loaded 0x000000FF against a
+ * sign-extended 0xFFFFFFFF and never matches — the infinite loop in
+ * P_InitPicAnims's `animdefs[i].istexture != -1` terminator scan. Canonicalise
+ * each operand per predicate signedness: zero-extend (AND mask) for
+ * eq/ne/unsigned, sign-extend (SHL/SAR, as in the SExt lowering) for signed.
+ * Uses CG_REG_SCRATCH for the mask/shift amount; cg_reg_for runs first (its
+ * spill-reload path also clobbers SCRATCH) and the result lands in a fresh
+ * transient so the two operands never alias. */
+static uint8_t cg_icmp_operand(struct cg *cg, LLVMValueRef v,
+                               unsigned w, int is_signed) {
+    uint8_t src = cg_reg_for(cg, v);
+    if (cg->had_error || w >= 32) return src;
+    uint8_t dst = cg_alloc_reg(cg);
+    if (cg->had_error) return src;
+    if (is_signed) {
+        int16_t shift = (int16_t)(32u - w);
+        cg_emit(cg, enc_i16(CVM_OP_MOVI, (uint8_t)CG_REG_SCRATCH, shift));
+        cg_emit(cg, enc_r(CVM_OP_SHL, dst, src, (uint8_t)CG_REG_SCRATCH));
+        cg_emit(cg, enc_r(CVM_OP_SAR, dst, dst, (uint8_t)CG_REG_SCRATCH));
+    } else {
+        uint32_t mask = (uint32_t)(((uint64_t)1 << w) - 1u);
+        cg_emit_load_const32(cg, (uint8_t)CG_REG_SCRATCH, (int32_t)mask);
+        cg_emit(cg, enc_r(CVM_OP_AND, dst, src, (uint8_t)CG_REG_SCRATCH));
+    }
+    return dst;
+}
+
 /* --- block + fixup helpers ---------------------------------------------- */
 
 static int cg_find_block(struct cg *cg, LLVMBasicBlockRef bb) {
@@ -2336,8 +2369,16 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     cg->had_error = 1;
                     break;
                 }
-                uint8_t lhs = cg_reg_for(cg, LLVMGetOperand(i, 0));
-                uint8_t rhs = cg_reg_for(cg, LLVMGetOperand(i, 1));
+                LLVMValueRef o0 = LLVMGetOperand(i, 0);
+                LLVMValueRef o1 = LLVMGetOperand(i, 1);
+                unsigned w = 32;
+                LLVMTypeRef oty = LLVMTypeOf(o0);
+                if (LLVMGetTypeKind(oty) == LLVMIntegerTypeKind)
+                    w = LLVMGetIntTypeWidth(oty);
+                int is_signed = (p == LLVMIntSLT || p == LLVMIntSLE ||
+                                 p == LLVMIntSGT || p == LLVMIntSGE);
+                uint8_t lhs = cg_icmp_operand(cg, o0, w, is_signed);
+                uint8_t rhs = cg_icmp_operand(cg, o1, w, is_signed);
                 uint8_t dst = cg->regs[cg_lookup(cg, i)];
                 if (swap) cg_emit(cg, enc_r((uint8_t)op2, dst, rhs, lhs));
                 else      cg_emit(cg, enc_r((uint8_t)op2, dst, lhs, rhs));

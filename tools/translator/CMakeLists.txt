@@ -140,7 +140,7 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
              i64_basic f64_basic two_funcs
              fib_recursive many_args alloca_swap fnptr fnptr_export
              dispatch_table const_gep reg_pressure float_mem struct_init reg_reuse
-             narrow_ops mem_intrin long_branch switch_dispatch
+             narrow_ops narrow_cmp mem_intrin long_branch switch_dispatch
              switch_table switch_neg_table spill_loop vararg globptr lower_intrin fsh_narrow unreachable reject_double
              spill_many spill_crossblock spill_call)
     set(_src ${_fixture_dir}/${name}.c)
@@ -197,7 +197,7 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
              mulh float_basic fsqrt i64_basic f64_basic
              two_funcs fib_recursive many_args
              alloca_swap fnptr fnptr_export dispatch_table const_gep reg_pressure float_mem struct_init reg_reuse
-             narrow_ops mem_intrin
+             narrow_ops narrow_cmp mem_intrin
              long_branch switch_dispatch switch_table switch_neg_table
              spill_loop vararg globptr lower_intrin fsh_narrow unreachable
              spill_many spill_crossblock spill_call)
@@ -334,6 +334,7 @@ add_test(NAME e2e_dispatch_add     COMMAND test_e2e ${_fixture_out}/dispatch_tab
 add_test(NAME e2e_dispatch_sub     COMMAND test_e2e ${_fixture_out}/dispatch_table.bin   4 1 7 3)
 add_test(NAME e2e_dispatch_mul     COMMAND test_e2e ${_fixture_out}/dispatch_table.bin  21 2 7 3)
 add_test(NAME e2e_narrow_ops       COMMAND test_e2e ${_fixture_out}/narrow_ops.bin    16214 8)
+add_test(NAME e2e_narrow_cmp       COMMAND test_e2e ${_fixture_out}/narrow_cmp.bin     2202 4)
 add_test(NAME e2e_mem_intrin       COMMAND test_e2e ${_fixture_out}/mem_intrin.bin     226 10)
 # long_branch: forward goto over a huge volatile-arithmetic body. The BNE
 # in entry must reach `end_short` (last block) — ~145 instructions away,
@@ -425,7 +426,7 @@ set_tests_properties(
     e2e_const_gep e2e_reg_pressure e2e_float_mem e2e_struct_init
     e2e_reg_reuse e2e_reg_reuse_zero
     e2e_dispatch_add e2e_dispatch_sub e2e_dispatch_mul
-    e2e_narrow_ops e2e_mem_intrin
+    e2e_narrow_ops e2e_narrow_cmp e2e_mem_intrin
     e2e_long_branch_zero e2e_long_branch_path
     e2e_switch_case_0 e2e_switch_case_1 e2e_switch_case_2
     e2e_switch_case_5 e2e_switch_case_10
