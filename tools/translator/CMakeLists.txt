@@ -136,7 +136,7 @@ set(_fixture_out ${CMAKE_CURRENT_BINARY_DIR})
 
 set(_fixture_targets "")
 foreach(name add pick fib abs max divmod bitops counter sum_global
-             alloc_sum free_list regions mulh qdiv float_basic fsqrt
+             alloc_sum free_list regions mulh qdiv xor_i1 float_basic fsqrt
              i64_basic f64_basic two_funcs
              fib_recursive many_args alloca_swap fnptr fnptr_export
              dispatch_table const_gep reg_pressure float_mem struct_init reg_reuse
@@ -194,7 +194,7 @@ endif()
 # Emit each .bin via the translator. Depends on cvm-translate + the .bc.
 set(_emit_targets "")
 foreach(name add pick fib abs max divmod bitops counter sum_global
-             mulh qdiv float_basic fsqrt i64_basic f64_basic
+             mulh qdiv xor_i1 float_basic fsqrt i64_basic f64_basic
              two_funcs fib_recursive many_args
              alloca_swap fnptr fnptr_export dispatch_table const_gep reg_pressure float_mem struct_init reg_reuse
              narrow_ops narrow_cmp mem_intrin
@@ -292,6 +292,7 @@ add_test(NAME e2e_regions    COMMAND test_regions ${_fixture_out}/regions.bin)
 add_test(NAME e2e_allocator  COMMAND test_allocator ${_fixture_out}/add.bin)
 add_test(NAME e2e_mulh       COMMAND test_e2e ${_fixture_out}/mulh.bin  0 0)
 add_test(NAME e2e_qdiv       COMMAND test_e2e ${_fixture_out}/qdiv.bin  0 0)
+add_test(NAME e2e_xor_i1     COMMAND test_e2e ${_fixture_out}/xor_i1.bin 0 0)
 add_test(NAME e2e_float_basic COMMAND test_e2e ${_fixture_out}/float_basic.bin 0 0)
 add_test(NAME e2e_fsqrt       COMMAND test_e2e ${_fixture_out}/fsqrt.bin       0 0)
 add_test(NAME e2e_i64_basic   COMMAND test_e2e ${_fixture_out}/i64_basic.bin   0 0)
@@ -422,7 +423,7 @@ set_tests_properties(
     e2e_add e2e_pick_true e2e_pick_false e2e_fib_10 e2e_fib_0
     e2e_abs_neg e2e_abs_pos e2e_max_lhs e2e_max_rhs
     e2e_divmod e2e_bitops e2e_counter e2e_sum_global e2e_alloc_sum
-    e2e_free_list e2e_regions e2e_allocator e2e_mulh e2e_qdiv e2e_float_basic
+    e2e_free_list e2e_regions e2e_allocator e2e_mulh e2e_qdiv e2e_xor_i1 e2e_float_basic
     e2e_fsqrt e2e_i64_basic e2e_f64_basic
     e2e_two_funcs e2e_fib_rec_10 e2e_fib_rec_1 e2e_fib_rec_0
     e2e_many_args e2e_alloca_swap e2e_fnptr_add e2e_fnptr_sub e2e_fnptr_export

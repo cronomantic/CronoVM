@@ -61,6 +61,16 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Fixed
 
+- **`i1` (boolean) constants now materialise zero-extended (0/1), not
+  sign-extended.** `cg_reg_for` loaded constant operands with
+  `LLVMConstIntGetSExtValue`, so `i1 true` became -1. clang lowers
+  `cond ? 0 : 1` on a reused boolean to `zext(xor i1 %cond, true)`, and with
+  `true` = -1 the xor became a full-width NOT (`!1` → -2, `!0` → -1) — a silent
+  boolean miscompile (it dropped DOOM's keyboard events, whose event type is
+  `down ? ev_keydown : ev_keyup`). i1 constants now use the 0/1 zero-extended
+  value; wider integers keep sign-extension (normalised at the use). Regression
+  test `tests/fixtures/xor_i1.c` → `e2e_xor_i1`.
+
 - **Transient registers are now recycled per instruction — fixes spurious
   "ran out of registers" in constant-heavy functions.** `cg_reg_for`
   materialises constants, globals and constant-expressions into registers

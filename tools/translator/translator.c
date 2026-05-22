@@ -1070,7 +1070,15 @@ static uint8_t cg_reg_for(struct cg *cg, LLVMValueRef v) {
     }
 
     if (LLVMIsAConstantInt(v)) {
-        long long imm = LLVMConstIntGetSExtValue(v);
+        /* i1 booleans live as 0/1 in registers (icmp and the logic ops
+         * produce 0/1). The *sign*-extended value of `i1 true` is -1, which
+         * turns `xor i1 %x, true` (a one-bit flip, e.g. how clang lowers
+         * `cond ? 0 : 1`) into a full-width NOT — silently miscompiling the
+         * boolean. Materialise i1 constants zero-extended (0 or 1); wider
+         * integer constants keep sign-extension (normalised at the use). */
+        long long imm = (LLVMGetIntTypeWidth(LLVMTypeOf(v)) == 1)
+                            ? (long long)LLVMConstIntGetZExtValue(v)
+                            : LLVMConstIntGetSExtValue(v);
         if (imm < INT32_MIN || imm > INT32_MAX) {
             ERR(cg->fn_name,
                 "constant %lld is wider than i32 (i64 not yet supported)",
