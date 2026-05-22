@@ -142,7 +142,7 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
              dispatch_table const_gep reg_pressure float_mem struct_init reg_reuse
              narrow_ops narrow_cmp mem_intrin long_branch switch_dispatch
              switch_table switch_neg_table spill_loop vararg globptr lower_intrin fsh_narrow unreachable reject_double
-             spill_many spill_crossblock spill_call phi_loop_exit)
+             spill_many spill_crossblock spill_call phi_loop_exit ctpop)
     set(_src ${_fixture_dir}/${name}.c)
     set(_bc  ${_fixture_out}/${name}.bc)
     # -ffreestanding turns off __STDC_HOSTED__, so clang's bundled
@@ -200,7 +200,7 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
              narrow_ops narrow_cmp mem_intrin
              long_branch switch_dispatch switch_table switch_neg_table
              spill_loop vararg globptr lower_intrin fsh_narrow unreachable
-             spill_many spill_crossblock spill_call phi_loop_exit)
+             spill_many spill_crossblock spill_call phi_loop_exit ctpop)
     set(_bc  ${_fixture_out}/${name}.bc)
     set(_bin ${_fixture_out}/${name}.bin)
     add_custom_command(
@@ -336,6 +336,7 @@ add_test(NAME e2e_dispatch_mul     COMMAND test_e2e ${_fixture_out}/dispatch_tab
 add_test(NAME e2e_narrow_ops       COMMAND test_e2e ${_fixture_out}/narrow_ops.bin    16214 8)
 add_test(NAME e2e_narrow_cmp       COMMAND test_e2e ${_fixture_out}/narrow_cmp.bin     2202 4)
 add_test(NAME e2e_phi_loop_exit    COMMAND test_e2e ${_fixture_out}/phi_loop_exit.bin    46 4)
+add_test(NAME e2e_ctpop            COMMAND test_e2e ${_fixture_out}/ctpop.bin              6 183)
 add_test(NAME e2e_mem_intrin       COMMAND test_e2e ${_fixture_out}/mem_intrin.bin     226 10)
 # long_branch: forward goto over a huge volatile-arithmetic body. The BNE
 # in entry must reach `end_short` (last block) — ~145 instructions away,
@@ -427,7 +428,7 @@ set_tests_properties(
     e2e_const_gep e2e_reg_pressure e2e_float_mem e2e_struct_init
     e2e_reg_reuse e2e_reg_reuse_zero
     e2e_dispatch_add e2e_dispatch_sub e2e_dispatch_mul
-    e2e_narrow_ops e2e_narrow_cmp e2e_phi_loop_exit e2e_mem_intrin
+    e2e_narrow_ops e2e_narrow_cmp e2e_phi_loop_exit e2e_ctpop e2e_mem_intrin
     e2e_long_branch_zero e2e_long_branch_path
     e2e_switch_case_0 e2e_switch_case_1 e2e_switch_case_2
     e2e_switch_case_5 e2e_switch_case_10

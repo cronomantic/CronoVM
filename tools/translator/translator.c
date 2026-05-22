@@ -3226,6 +3226,32 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     break;
                 }
 
+                /* llvm.ctpop.i32(%x) — population count (set bits). No POPCNT
+                 * opcode, so lower with Kernighan's loop (one iteration per set
+                 * bit): n=0; while (x) { x &= x-1; n++; }. clang folds power-of-
+                 * two tests `x & (x-1)` into a ctpop compare, so this shows up
+                 * in ordinary code (e.g. DOOM's texture-height pow2 check). */
+                if (strcmp(name, "llvm.ctpop.i32") == 0) {
+                    uint8_t src = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                    uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                    uint8_t x   = cg_alloc_reg(cg);
+                    uint8_t n   = cg_alloc_reg(cg);
+                    uint8_t one = cg_alloc_reg(cg);
+                    uint8_t t   = cg_alloc_reg(cg);
+                    if (cg->had_error) break;
+                    cg_emit(cg, enc_r  (CVM_OP_MOV,  x, src, 0));
+                    cg_emit(cg, enc_i16(CVM_OP_MOVI, n, 0));
+                    cg_emit(cg, enc_i16(CVM_OP_MOVI, one, 1));
+                    /* loop: while (x != 0) { x &= x-1; n++; } */
+                    cg_emit(cg, enc_br (CVM_OP_BEQ, x, cg->zero_reg, 4)); /* x==0 -> exit */
+                    cg_emit(cg, enc_r  (CVM_OP_SUB, t, x, one));          /* t = x-1   */
+                    cg_emit(cg, enc_r  (CVM_OP_AND, x, x, t));            /* x &= x-1  */
+                    cg_emit(cg, enc_r  (CVM_OP_ADD, n, n, one));          /* n++       */
+                    cg_emit(cg, enc_i24(CVM_OP_JMP, -5));                 /* loop back */
+                    cg_emit(cg, enc_r  (CVM_OP_MOV, dst, n, 0));          /* dst = n   */
+                    break;
+                }
+
                 /* llvm.fmuladd.f32(a, b, c) = a*b + c. clang emits it for
                  * float `a*b + c` under the default fp-contract — pervasive
                  * in matrix/vector maths. The VM has no fused op (and doesn't
