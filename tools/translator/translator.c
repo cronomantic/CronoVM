@@ -3558,6 +3558,15 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     break;
                 }
 
+                /* Optimiser hints with no runtime effect. `llvm.assume(i1)`
+                 * (and `llvm.donothing`) carry no semantics for codegen — newer
+                 * clang emits llvm.assume on noreturn/unreachable paths (e.g.
+                 * the `unreachable` fixture's assert-style helper). Drop them. */
+                if (strncmp(name, "llvm.assume", 11) == 0 ||
+                    strncmp(name, "llvm.donothing", 14) == 0) {
+                    break;
+                }
+
                 /* Variadic support. The i386 va_list is a single pointer to
                  * the next argument in memory. A variadic callee receives ALL
                  * its args on the stack (see the prologue and the LLVMCall
