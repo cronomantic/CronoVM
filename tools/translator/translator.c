@@ -4492,6 +4492,37 @@ int main(int argc, char **argv) {
                        output, cg.count, globals.data_size,
                        cg.import_count, cg.func_count,
                        heap_reserve, stack_size, cli_region_count, rom_size);
+
+                /* Optional symbol sidecar for the self-time profiler: with
+                 * CVM_SYMS set, write "<output>.sym" mapping each FUNCS index
+                 * to its entry instruction and source name. Index order here
+                 * matches CALL imm24 / cvm_image.func_offsets exactly. */
+                if (getenv("CVM_SYMS")) {
+                    size_t olen = strlen(output);
+                    char *sympath = (char *)malloc(olen + 5);
+                    if (sympath) {
+                        memcpy(sympath, output, olen);
+                        memcpy(sympath + olen, ".sym", 5);
+                        FILE *sf = fopen(sympath, "wb");
+                        if (sf) {
+                            /* User function k lives at FUNCS[k+1] (slot 0 is
+                             * the reserved null-fn-ptr trap), so the runtime
+                             * FUNCS index — what the interpreter and profiler
+                             * see as the call target — is k+1. */
+                            for (int k = 0; k < cg.func_count; ++k)
+                                fprintf(sf, "%d\t%u\t%s\n", k + 1,
+                                        cg.funcs[k].entry_offset,
+                                        value_name(cg.funcs[k].value));
+                            fclose(sf);
+                            printf("translator: wrote %s (%d symbols)\n",
+                                   sympath, cg.func_count);
+                        } else {
+                            fprintf(stderr, "translator: cannot write '%s'\n",
+                                    sympath);
+                        }
+                        free(sympath);
+                    }
+                }
             }
         }
         free(rom_buf);

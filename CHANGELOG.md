@@ -10,6 +10,24 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **Optional interpreter self-time profiler (`-DCVM_PROFILE`).** Building
+  `src/cvm.c` with `CVM_PROFILE` defined makes `cvm_exec_at` attribute every
+  executed instruction to the currently-running FUNCS index, tracked with a
+  shadow call stack kept in step with `CALL`/`CALLR`/`RET`. The result is
+  per-function *self* instruction counts (exclusive of callees) — where the
+  interpreter actually spends cycles. Surface: `cvm_prof_counts[]` /
+  `cvm_prof_len` / `cvm_prof_total`, `cvm_profile_reset(func_count)`, plus
+  caller attribution (`cvm_prof_watch = <fid>` → `cvm_prof_caller[caller]++`
+  on each call into that fid). Zero overhead when `CVM_PROFILE` is undefined
+  (the `PROF_*` hooks expand to no-ops), so the default build is unchanged.
+  Pairs with the new `CVM_SYMS` sidecar to resolve indices to names; Cronopio's
+  `headless_prof` is a ready-made driver.
+- **`CVM_SYMS` symbol sidecar from the translator.** With the `CVM_SYMS`
+  environment variable set, `cvm-translate` writes `<out>.bin.sym` —
+  `fid<TAB>entry_offset<TAB>name` per user function, where `fid` is the runtime
+  FUNCS index (the `+1` for the reserved `FUNCS[0]` null-fn slot is applied).
+  Lets index-only tooling (e.g. the `CVM_PROFILE` profiler) map back to source
+  names. Off by default; the loader never reads it. See [docs/translator.md].
 - **`CVM_SEC_ROM` (section type 10) — read-only cartridge data.** A binary
   can bake an arbitrary byte blob (e.g. a game WAD) into the `.bin`; the
   loader copies it into the heap (layout `DATA | BSS | REGIONS | ROM |

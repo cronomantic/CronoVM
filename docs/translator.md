@@ -358,6 +358,24 @@ clang --target=i386-elf -emit-llvm -O1 -I runtime/lib -c user.c -o user.bc
 cvm-translate user.bc -o game.bin
 ```
 
+## Symbol sidecar (`CVM_SYMS`)
+
+Setting the `CVM_SYMS` environment variable makes the translator write a
+`<out>.bin.sym` companion file next to the binary: one tab-separated line
+per user function, `fid<TAB>entry_offset<TAB>name`.
+
+```sh
+CVM_SYMS=1 cvm-cc user.c -o game.bin   # also writes game.bin.sym
+```
+
+`fid` is the runtime **FUNCS index** — i.e. exactly the value a `CALL`/`CALLR`
+targets, what `cvm_image.func_offsets` is indexed by, and what the optional
+interpreter profiler reports. User function *k* lives at `FUNCS[k+1]` (slot 0
+is the reserved null-function-pointer trap), so the sidecar already accounts
+for the `+1`. The file is intended for tooling that has only function indices
+(e.g. the `CVM_PROFILE` self-time profiler) and needs to map them back to
+source names. It is never read by the loader.
+
 ## Adding new IR support
 
 When the time comes to broaden the subset (e.g. enabling `i64`):

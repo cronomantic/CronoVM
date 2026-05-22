@@ -20,6 +20,52 @@
 #define CVM_MAX_SEC_TYPE  10u
 #define CVM_REGION_ENTRY_SIZE 28u   /* name[16] + size + direction + flags */
 
+/* --- Optional self-time profiler (build with -DCVM_PROFILE) ---------------
+ * When enabled, the interpreter attributes every executed instruction to the
+ * currently-running FUNCS index (tracked with a shadow call stack alongside
+ * the real one). cvm_prof_counts[i] is the self-instruction count for func i
+ * — exclusive of callees, so it points at where the interpreter actually
+ * spends cycles. Zero overhead when CVM_PROFILE is undefined. */
+#ifdef CVM_PROFILE
+#include <stdlib.h>
+uint64_t *cvm_prof_counts = NULL;   /* [cvm_prof_len] self-instruction counts */
+uint32_t  cvm_prof_len    = 0;
+uint64_t  cvm_prof_total  = 0;       /* total instructions executed           */
+/* Caller attribution: when cvm_prof_watch names a FUNCS index, every CALL/
+ * CALLR to it bumps cvm_prof_caller[caller], so the host can see who drives a
+ * hot leaf. Off (no attribution) when watch == 0xFFFFFFFF. */
+uint32_t  cvm_prof_watch  = 0xFFFFFFFFu;
+uint64_t *cvm_prof_caller = NULL;   /* [cvm_prof_len] calls into the watched fn */
+
+void cvm_profile_reset(uint32_t func_count) {
+    uint32_t n = func_count ? func_count : 1u;
+    free(cvm_prof_counts);
+    free(cvm_prof_caller);
+    cvm_prof_counts = (uint64_t *)calloc(n, sizeof(uint64_t));
+    cvm_prof_caller = (uint64_t *)calloc(n, sizeof(uint64_t));
+    cvm_prof_len    = cvm_prof_counts ? func_count : 0u;
+    cvm_prof_total  = 0;
+}
+#endif
+
+/* PROF_TICK charges the instruction about to run to the current function;
+ * PROF_CALL/PROF_RET keep the shadow call stack in step with CALL/CALLR/RET.
+ * All three vanish when CVM_PROFILE is undefined. They reference locals
+ * declared inside cvm_exec_at, so they only ever expand there. */
+#ifdef CVM_PROFILE
+#  define PROF_TICK()    do { if (prof_cur < cvm_prof_len) cvm_prof_counts[prof_cur]++; \
+                              cvm_prof_total++; } while (0)
+#  define PROF_CALL(fid) do { if (prof_sp < CVM_PROF_DEPTH) prof_stack[prof_sp++] = prof_cur; \
+                              if ((uint32_t)(fid) == cvm_prof_watch && prof_cur < cvm_prof_len) \
+                                  cvm_prof_caller[prof_cur]++; \
+                              prof_cur = (uint32_t)(fid); } while (0)
+#  define PROF_RET()     do { if (prof_sp > 0) prof_cur = prof_stack[--prof_sp]; } while (0)
+#else
+#  define PROF_TICK()    ((void)0)
+#  define PROF_CALL(fid) ((void)0)
+#  define PROF_RET()     ((void)0)
+#endif
+
 static uint32_t read_u32_le(const uint8_t *p) {
     return  (uint32_t)p[0]
          | ((uint32_t)p[1] << 8)
@@ -683,6 +729,15 @@ static int cvm_exec_at(struct cvm_image *img,
     const uint32_t  func_count   = img->func_count;
     uint32_t        pc           = start_pc;
 
+#ifdef CVM_PROFILE
+#  define CVM_PROF_DEPTH 8192u
+    uint32_t prof_stack[CVM_PROF_DEPTH];
+    uint32_t prof_sp  = 0;
+    uint32_t prof_cur = 0;              /* FUNCS index of start_pc, if known */
+    for (uint32_t fi = 1; fi < func_count; ++fi)
+        if (func_offsets[fi] == start_pc) { prof_cur = fi; break; }
+#endif
+
     /* Set up SP at the very top of memory and push the run-completion
      * sentinel as the outermost return PC. RET pops it and halts. Programs
      * that don't use CALL/RET get a zero stack region and never touch SP. */
@@ -760,6 +815,7 @@ static int cvm_exec_at(struct cvm_image *img,
 
 #  define DISPATCH() do {                                  \
         if (pc >= code_count) return CVM_E_BAD_PC;         \
+        PROF_TICK();                                       \
         inst = code[pc++];                                 \
         op = (uint8_t)(inst & 0xFFu);                      \
         a  = (uint8_t)((inst >>  8) & 0xFFu);              \
@@ -869,6 +925,7 @@ static int cvm_exec_at(struct cvm_image *img,
         memcpy(heap + sp, &pc, 4);
         R[CVM_REG_SP] = (int32_t)sp;
         pc = func_offsets[fid];
+        PROF_CALL(fid);
         DISPATCH();
     }
     L_RET: {
@@ -882,6 +939,7 @@ static int cvm_exec_at(struct cvm_image *img,
             return CVM_OK;
         }
         pc = ret_pc;
+        PROF_RET();
         DISPATCH();
     }
     L_CALLR: {
@@ -894,6 +952,7 @@ static int cvm_exec_at(struct cvm_image *img,
         memcpy(heap + sp, &pc, 4);
         R[CVM_REG_SP] = (int32_t)sp;
         pc = func_offsets[fid];
+        PROF_CALL(fid);
         DISPATCH();
     }
     L_LDB: {
@@ -1023,6 +1082,7 @@ static int cvm_exec_at(struct cvm_image *img,
 
     for (;;) {
         if (pc >= code_count) return CVM_E_BAD_PC;
+        PROF_TICK();
         inst = code[pc++];
         op = (uint8_t)(inst & 0xFFu);
         a  = (uint8_t)((inst >>  8) & 0xFFu);
@@ -1115,6 +1175,7 @@ static int cvm_exec_at(struct cvm_image *img,
             memcpy(heap + sp, &pc, 4);
             R[CVM_REG_SP] = (int32_t)sp;
             pc = func_offsets[fid];
+            PROF_CALL(fid);
             break;
         }
         case CVM_OP_RET: {
@@ -1128,6 +1189,7 @@ static int cvm_exec_at(struct cvm_image *img,
                 return CVM_OK;
             }
             pc = ret_pc;
+            PROF_RET();
             break;
         }
         case CVM_OP_CALLR: {
@@ -1140,6 +1202,7 @@ static int cvm_exec_at(struct cvm_image *img,
             memcpy(heap + sp, &pc, 4);
             R[CVM_REG_SP] = (int32_t)sp;
             pc = func_offsets[fid];
+            PROF_CALL(fid);
             break;
         }
         case CVM_OP_LDB: {
