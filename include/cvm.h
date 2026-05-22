@@ -336,6 +336,16 @@ enum cvm_opcode {
      * op like FNEG does. Surfaced by the translator from `cvm_intrin_fsqrt`
      * in cvm_intrin.h; users call `cvm_fsqrt(x)`. */
     CVM_OP_FSQRT   = 0x37,
+
+    /* Q16.16 fixed-point divide: R[A] = (u32)((((u64)(u32)R[B]) << 16) /
+     * (u32)R[C]); traps on R[C]==0 like DIV/DIVU. The 64-bit numerator and
+     * the divide happen in one host op, so a fixed-point quotient costs a
+     * single instruction instead of a software 48-bit long division. The
+     * divide sibling of MULH's Q16.16 multiply; surfaced by the translator
+     * from `cvm_intrin_qdiv_16_16` (cvm_intrin.h), users call
+     * `cvm_qdiv_16_16(a, b)`. Operands are unsigned magnitudes — callers
+     * (e.g. DOOM's FixedDiv) apply sign and the overflow guard themselves. */
+    CVM_OP_QDIV1616 = 0x38,
 };
 
 #define CVM_REG_COUNT 256

@@ -811,6 +811,7 @@ static int cvm_exec_at(struct cvm_image *img,
         [CVM_OP_I2F_U]   = &&L_I2F_U,
         [CVM_OP_JMPR]    = &&L_JMPR,
         [CVM_OP_FSQRT]   = &&L_FSQRT,
+        [CVM_OP_QDIV1616] = &&L_QDIV1616,
     };
 
 #  define DISPATCH() do {                                  \
@@ -1075,6 +1076,11 @@ static int cvm_exec_at(struct cvm_image *img,
     L_FSQRT:
         R[a] = cvm_f32_to_bits(sqrtf(cvm_bits_to_f32(R[b])));
         DISPATCH();
+    L_QDIV1616:
+        if (R[c] == 0) return CVM_E_DIV_BY_ZERO;
+        R[a] = (int32_t)(uint32_t)((((uint64_t)(uint32_t)R[b]) << 16)
+                                   / (uint32_t)R[c]);
+        DISPATCH();
 
 #  undef DISPATCH
 
@@ -1322,6 +1328,11 @@ static int cvm_exec_at(struct cvm_image *img,
         }
         case CVM_OP_FSQRT:
             R[a] = cvm_f32_to_bits(sqrtf(cvm_bits_to_f32(R[b])));
+            break;
+        case CVM_OP_QDIV1616:
+            if (R[c] == 0) return CVM_E_DIV_BY_ZERO;
+            R[a] = (int32_t)(uint32_t)((((uint64_t)(uint32_t)R[b]) << 16)
+                                       / (uint32_t)R[c]);
             break;
         default:
             return CVM_E_BAD_OPCODE;

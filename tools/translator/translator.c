@@ -3374,16 +3374,18 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                  * CALL — there's no body anywhere; the name exists only
                  * so clang has something to reference in the IR. */
                 {
-                    int is_mulh    = (strcmp(name, "cvm_intrin_mulh")       == 0);
-                    int is_mulhu   = (strcmp(name, "cvm_intrin_mulhu")      == 0);
-                    int is_f2i_s   = (strcmp(name, "cvm_intrin_f2i_sat_s")  == 0);
-                    int is_f2i_u   = (strcmp(name, "cvm_intrin_f2i_sat_u")  == 0);
-                    int is_fsqrt   = (strcmp(name, "cvm_intrin_fsqrt")      == 0);
+                    int is_mulh    = (strcmp(name, "cvm_intrin_mulh")        == 0);
+                    int is_mulhu   = (strcmp(name, "cvm_intrin_mulhu")       == 0);
+                    int is_qdiv    = (strcmp(name, "cvm_intrin_qdiv_16_16")  == 0);
+                    int is_f2i_s   = (strcmp(name, "cvm_intrin_f2i_sat_s")   == 0);
+                    int is_f2i_u   = (strcmp(name, "cvm_intrin_f2i_sat_u")   == 0);
+                    int is_fsqrt   = (strcmp(name, "cvm_intrin_fsqrt")       == 0);
 
-                    int two_arg_op = -1;   /* MULH/MULHU shape */
+                    int two_arg_op = -1;   /* MULH/MULHU/QDIV1616 shape */
                     int one_arg_op = -1;   /* F2I_* / FSQRT shape */
                     if (is_mulh)       two_arg_op = CVM_OP_MULH;
                     else if (is_mulhu) two_arg_op = CVM_OP_MULHU;
+                    else if (is_qdiv)  two_arg_op = CVM_OP_QDIV1616;
                     else if (is_f2i_s) one_arg_op = CVM_OP_F2I_S;
                     else if (is_f2i_u) one_arg_op = CVM_OP_F2I_U;
                     else if (is_fsqrt) one_arg_op = CVM_OP_FSQRT;

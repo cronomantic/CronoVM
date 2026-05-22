@@ -72,4 +72,17 @@ static inline int32_t cvm_qmul_16_16(int32_t a, int32_t b) {
     return (int32_t)((uint32_t)lo >> 16) | (hi << 16);
 }
 
+/* Q16.16 divide (unsigned): result = ((uint64_t)a << 16) / b, computed by
+ * the QDIV1616 opcode as one host 64/32 division. The divide sibling of
+ * cvm_qmul_16_16 — the canonical fixed-point quotient an embedded ISA would
+ * provide so a `(a << 16) / b` doesn't fall back to a software 48-bit long
+ * division. `b == 0` traps (CVM_E_DIV_BY_ZERO), same as DIV/DIVU. Operands
+ * are unsigned magnitudes; signed callers (e.g. DOOM's FixedDiv) apply the
+ * sign and the overflow guard around it. */
+extern uint32_t cvm_intrin_qdiv_16_16(uint32_t a, uint32_t b);
+
+static inline uint32_t cvm_qdiv_16_16(uint32_t a, uint32_t b) {
+    return cvm_intrin_qdiv_16_16(a, b);
+}
+
 #endif /* CVM_INTRIN_H */
