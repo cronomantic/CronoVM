@@ -24,7 +24,8 @@ branch relaxation**. `i64` and `double` are both legalised inside a
 function body now — `i64` to inline 32-bit word pairs, `double` to
 soft-float runtime calls (see "64-bit integer legalisation" and "f64
 legalisation"). The remaining gaps are the 64-bit calling convention,
-`i64` `mul`/`div`, and the `llvm.*.f64` math intrinsics.
+`i64` `mul`/`div`, and the less-common `llvm.*.f64` math intrinsics
+(`fmuladd`/`fma`/`fabs`/`copysign` are handled; `sqrt` etc. are not).
 
 `fib_recursive.bin` shrank from 135 to 51 instructions when
 liveness landed (62% fewer); a deeply recursive function with
@@ -220,12 +221,17 @@ Lowered `f64` operations:
 - `sitofp` / `uitofp` / `fpext` (→ `double`) → `__cvm_f_from_{i32,u32,f32}` (sret)
 - `fptosi` / `fptoui` / `fptrunc` (`double` →) → `__cvm_f_to_{i32,u32,f32}`
 - `double` constant / `load` / `store` → materialised / two-word, like `i64`
+- `llvm.fmuladd.f64` / `llvm.fma.f64` → two runtime calls (`fmul` then `fadd`),
+  with the intermediate product written to the result's own slot. clang's
+  default `-ffp-contract=on` synthesises `fmuladd` from `a*b±c`, so this is the
+  common shape; the two-rounding lowering matches the soft runtime's existing
+  truncating-mul accuracy and `fmuladd`'s relaxed contract.
+- `llvm.fabs.f64` (inline sign-bit clear) / `llvm.copysign.f64` (inline)
 
-Not yet lowered (clear error): the `llvm.*.f64` math intrinsics — notably
-`llvm.fmuladd.f64`, which clang's default `-ffp-contract=on` synthesises from
-`a*b±c`; compile f64-heavy code with `-ffp-contract=off` until an `__cvm_fma`
-helper lands. Also `double` `phi`/`select` and `double` across a function
-boundary (the 64-bit calling convention is a later phase).
+Not yet lowered (clear error): other `llvm.*.f64` math intrinsics (e.g.
+`llvm.sqrt.f64` — `cvm_float64.h` has no soft sqrt yet), `double` `phi`/
+`select`, and `double` across a function boundary (the 64-bit calling
+convention is a later phase).
 
 ### Calling convention
 

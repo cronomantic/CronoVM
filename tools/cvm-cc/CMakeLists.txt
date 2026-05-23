@@ -128,4 +128,30 @@ if(TARGET cvm-translate)
              COMMAND test_e2e ${_cvmcc_f64} 0 0)
     set_tests_properties(e2e_cvm_cc_f64_slice
                          PROPERTIES FIXTURES_REQUIRED cvm_cc_bins)
+
+    # f64 intrinsics: clang's default -ffp-contract=on contracts a*b±c into
+    # llvm.fmuladd.f64 (lowered to fmul+fadd); __builtin_fabs/copysign ->
+    # llvm.{fabs,copysign}.f64 (inline). f64_fma_main returns 0 for any seed.
+    set(_cvmcc_fma ${CMAKE_CURRENT_BINARY_DIR}/cvm_cc_f64_fma.bin)
+    add_custom_command(
+        OUTPUT  ${_cvmcc_fma}
+        COMMAND $<TARGET_FILE:cvm-cc>
+                ${_fixture_dir}/f64_fma.c
+                ${CVM_SOURCE_ROOT}/runtime/lib/cvm_float64_rt.c
+                -o ${_cvmcc_fma}
+        DEPENDS cvm-cc cvm-translate
+                ${_fixture_dir}/f64_fma.c
+                ${CVM_SOURCE_ROOT}/runtime/lib/cvm_float64_rt.c
+        VERBATIM
+    )
+    add_custom_target(cvm_cc_fma_round_trip DEPENDS ${_cvmcc_fma})
+    add_test(NAME cvm_cc_compile_f64_fma
+             COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+                                      --target cvm_cc_fma_round_trip)
+    set_tests_properties(cvm_cc_compile_f64_fma
+                         PROPERTIES FIXTURES_SETUP cvm_cc_bins)
+    add_test(NAME e2e_cvm_cc_f64_fma
+             COMMAND test_e2e ${_cvmcc_fma} 0 0)
+    set_tests_properties(e2e_cvm_cc_f64_fma
+                         PROPERTIES FIXTURES_REQUIRED cvm_cc_bins)
 endif()

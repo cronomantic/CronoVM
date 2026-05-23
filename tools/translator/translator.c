@@ -1814,6 +1814,14 @@ static int cg_op_is_f64_runtime_call(LLVMValueRef i, LLVMOpcode op) {
     case LLVMFCmp:
     case LLVMFPToSI: case LLVMFPToUI: case LLVMFPTrunc:
         return cg_type_is_f64(LLVMTypeOf(LLVMGetOperand(i, 0)));
+    case LLVMCall: {
+        /* llvm.fmuladd/fma.f64 lower to two runtime calls; fabs/copysign are
+         * inline. Only the former are spill points. */
+        if (!cg_type_is_f64(LLVMTypeOf(i))) return 0;
+        const char *cn = value_name(LLVMGetCalledValue(i));
+        return strcmp(cn, "llvm.fmuladd.f64") == 0
+            || strcmp(cn, "llvm.fma.f64") == 0;
+    }
     default:
         return 0;
     }
@@ -2704,6 +2712,59 @@ static void cg_emit_f64_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
         uint8_t hi = cg_alloc_reg(cg); if (cg->had_error) return;
         cg_emit(cg, enc_r(CVM_OP_LDW, hi, a4, 0));
         cg_i64_write(cg, idx, lo, hi);
+        break;
+    }
+    case LLVMCall: {
+        /* f64-returning intrinsic calls. clang -O1 with the default
+         * -ffp-contract=on synthesises llvm.fmuladd.f64 from `a*b±c`;
+         * llvm.fabs.f64 / llvm.copysign.f64 also appear. */
+        const char *cname = value_name(LLVMGetCalledValue(i));
+        if (strcmp(cname, "llvm.fmuladd.f64") == 0 ||
+            strcmp(cname, "llvm.fma.f64") == 0) {
+            /* a*b + c, in two runtime calls. The intermediate product is
+             * written to this value's OWN result slot, then read back as the
+             * first addend (passing `i` as a wide operand references its slot,
+             * which holds a*b after the first call). Two roundings, not one —
+             * matching the soft runtime's existing truncating-mul accuracy and
+             * the relaxed contract of fmuladd. */
+            LLVMValueRef mul[2] = { LLVMGetOperand(i, 0), LLVMGetOperand(i, 1) };
+            cg_emit_f64_call(cg, i, "__cvm_fmul", mul, 2, NULL, slot, 0);
+            if (cg->had_error) break;
+            LLVMValueRef add[2] = { i, LLVMGetOperand(i, 2) };
+            cg_emit_f64_call(cg, i, "__cvm_fadd", add, 2, NULL, slot, 0);
+            break;
+        }
+        if (strcmp(cname, "llvm.fabs.f64") == 0) {
+            /* inline: copy operand words, clear the sign bit in the hi word. */
+            uint8_t lo, hi;
+            if (cg_i64_read(cg, LLVMGetOperand(i, 0), &lo, &hi)) break;
+            cg_emit_load_const32(cg, (uint8_t)CG_REG_SCRATCH,
+                                 (int32_t)0x7FFFFFFFu);
+            cg_emit(cg, enc_r(CVM_OP_AND, hi, hi, (uint8_t)CG_REG_SCRATCH));
+            cg_i64_write(cg, idx, lo, hi);
+            break;
+        }
+        if (strcmp(cname, "llvm.copysign.f64") == 0) {
+            /* hi = (mag.hi & 0x7FFFFFFF) | (sgn.hi & 0x80000000); lo = mag.lo */
+            uint8_t mlo, mhi, slo, shi;
+            if (cg_i64_read(cg, LLVMGetOperand(i, 0), &mlo, &mhi)) break;
+            if (cg_i64_read(cg, LLVMGetOperand(i, 1), &slo, &shi)) break;
+            (void)slo;
+            cg_emit_load_const32(cg, (uint8_t)CG_REG_SCRATCH,
+                                 (int32_t)0x7FFFFFFFu);
+            cg_emit(cg, enc_r(CVM_OP_AND, mhi, mhi, (uint8_t)CG_REG_SCRATCH));
+            cg_emit_load_const32(cg, (uint8_t)CG_REG_SCRATCH,
+                                 (int32_t)0x80000000u);
+            cg_emit(cg, enc_r(CVM_OP_AND, shi, shi, (uint8_t)CG_REG_SCRATCH));
+            cg_emit(cg, enc_r(CVM_OP_OR, mhi, mhi, shi));
+            cg_i64_write(cg, idx, mlo, mhi);
+            break;
+        }
+        ERR(cg->fn_name,
+            "f64-returning call '%s' not legalised (only llvm.fmuladd/fma/"
+            "fabs/copysign.f64 are; a general double-returning function needs "
+            "the 64-bit calling convention, a later phase)", cname);
+        cg->had_error = 1;
         break;
     }
     default:

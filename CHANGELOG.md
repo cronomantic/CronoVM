@@ -22,13 +22,16 @@ version bump; breaks are called out explicitly under **Breaking**.
   is registered as a caller-save spill point so the existing liveness-narrowed
   save/restore protects live registers across it. Lowered: fadd/fsub/fmul/fdiv,
   fcmp (all 16 predicates, one call + optional 0/1 negation), sitofp/uitofp/
-  fptosi/fptoui/fpext/fptrunc, fneg, and double const/load/store. New e2e
-  fixture `f64_slice` (linked via cvm-cc against the runtime). **Not yet**
-  lowered (clear error): the `llvm.*.f64` math intrinsics — notably
-  `llvm.fmuladd.f64` (clang's default `-ffp-contract=on` makes it from `a*b±c`;
-  use `-ffp-contract=off` for now) — plus double `phi`/`select` and double
-  across a function boundary (64-bit calling convention, a later phase). See
-  `docs/translator.md` → "f64 (double) legalisation".
+  fptosi/fptoui/fpext/fptrunc, fneg, double const/load/store, and the
+  `llvm.fmuladd.f64`/`llvm.fma.f64` (→ fmul+fadd, intermediate in the result
+  slot) / `llvm.fabs.f64` / `llvm.copysign.f64` intrinsics — so default-O1
+  `double` code (which clang contracts `a*b±c` into `fmuladd`) translates
+  without `-ffp-contract=off`. New e2e fixtures `f64_slice` and `f64_fma`,
+  linked via cvm-cc against the runtime. **Not yet** lowered (clear error):
+  other `llvm.*.f64` math intrinsics (e.g. `llvm.sqrt.f64`), double
+  `phi`/`select`, and double across a function boundary (64-bit calling
+  convention, a later phase). See `docs/translator.md` → "f64 (double)
+  legalisation".
 - **`i64` legalisation in the translator (phase 1).** Native 64-bit integers
   are no longer rejected: code that uses `long long` inside a function body now
   translates without hand-writing `cvm_int64.h`. Each `i64` SSA value lives in
