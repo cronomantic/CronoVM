@@ -100,4 +100,32 @@ if(TARGET cvm-translate)
              COMMAND test_e2e ${_cvmcc_lto} 120 7 5)
     set_tests_properties(e2e_cvm_cc_lto
                          PROPERTIES FIXTURES_REQUIRED cvm_cc_bins)
+
+    # f64 legalisation end-to-end: native `double` in f64_slice.c is lowered by
+    # the translator to soft-float runtime calls, linked here against
+    # cvm_float64_rt.c (the __cvm_f* helpers). Exercises sitofp/fadd/fsub/fmul/
+    # fcmp/fptosi/fptoui/fneg with caller-save spill across each call.
+    # f64_slice_main returns 0 on success for any seed.
+    set(_cvmcc_f64 ${CMAKE_CURRENT_BINARY_DIR}/cvm_cc_f64_slice.bin)
+    add_custom_command(
+        OUTPUT  ${_cvmcc_f64}
+        COMMAND $<TARGET_FILE:cvm-cc>
+                ${_fixture_dir}/f64_slice.c
+                ${CVM_SOURCE_ROOT}/runtime/lib/cvm_float64_rt.c
+                -o ${_cvmcc_f64}
+        DEPENDS cvm-cc cvm-translate
+                ${_fixture_dir}/f64_slice.c
+                ${CVM_SOURCE_ROOT}/runtime/lib/cvm_float64_rt.c
+        VERBATIM
+    )
+    add_custom_target(cvm_cc_f64_round_trip DEPENDS ${_cvmcc_f64})
+    add_test(NAME cvm_cc_compile_f64
+             COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+                                      --target cvm_cc_f64_round_trip)
+    set_tests_properties(cvm_cc_compile_f64
+                         PROPERTIES FIXTURES_SETUP cvm_cc_bins)
+    add_test(NAME e2e_cvm_cc_f64_slice
+             COMMAND test_e2e ${_cvmcc_f64} 0 0)
+    set_tests_properties(e2e_cvm_cc_f64_slice
+                         PROPERTIES FIXTURES_REQUIRED cvm_cc_bins)
 endif()

@@ -20,10 +20,11 @@ entry-block allocas with escaping pointers, i8/i16 memory ops,
 arbitrary 32-bit constants, a NULL-fn-pointer trap, the
 `llvm.memcpy`/`llvm.memset`/`llvm.memmove` block intrinsics,
 liveness-based spill at every call site, and post-emission
-branch relaxation**. `i64` is now legalised to 32-bit word pairs
-inside a function body (see "64-bit integer legalisation"); the
-remaining gaps are the 64-bit calling convention, `i64`
-`mul`/`div`, and `f64` (soft-float).
+branch relaxation**. `i64` and `double` are both legalised inside a
+function body now — `i64` to inline 32-bit word pairs, `double` to
+soft-float runtime calls (see "64-bit integer legalisation" and "f64
+legalisation"). The remaining gaps are the 64-bit calling convention,
+`i64` `mul`/`div`, and the `llvm.*.f64` math intrinsics.
 
 `fib_recursive.bin` shrank from 135 to 51 instructions when
 liveness landed (62% fewer); a deeply recursive function with
@@ -87,9 +88,9 @@ the translator rejects with a clear message; that's a feature, not a bug.
 
 | Type | Reason |
 | ---- | ------ |
-| `i64` **across a function boundary** | the 64-bit calling convention (args / returns) is not implemented yet; `i64` *inside* a function body is legalised (see below) |
+| 64-bit values (`i64`/`double`) **across a function boundary** | the 64-bit calling convention (args / returns) is not implemented yet; `i64`/`f64` *inside* a function body are legalised (see below) |
 | integers wider than `i64` | not in the subset |
-| `half`, `double`, `fp128`, etc. (except `float`) | `f64` is deferred to the float64 legaliser; the others are out of the subset |
+| `half`, `fp128`, `x86_fp80`, etc. (`float` and `double` excepted) | not in the subset (`float` is first-class; `double` is legalised) |
 | vectors (`<N x T>`) | not in the subset; games target scalars |
 | address spaces other than 0 | not supported |
 | `token`, `x86_amx`, target_ext | not in the subset |
@@ -186,9 +187,45 @@ Currently lowered `i64` operations:
 Not yet legalised (these still error out with a clear message): `i64`
 `mul`/`div`/`rem`, `i64` `phi`/`select`, variable-amount shifts, and any `i64`
 that crosses a function boundary (argument, return value, or `i64`-returning
-call) — the 64-bit calling convention is a later phase. `f64` is a separate
-follow-on that reuses this two-slot machinery but lowers to soft-float runtime
-calls (`cvm_float64.h`).
+call) — the 64-bit calling convention is a later phase.
+
+### f64 (double) legalisation
+
+`double` reuses the same two-slot storage as `i64` (a 64-bit value in two
+consecutive frame slots), but its operations can't be open-coded inline, so
+each one is lowered to a **soft-float runtime call** into `cvm_float64_rt.c`
+(the `__cvm_f*` helpers, thin external wrappers over `cvm_float64.h`). cvm-cc
+links that TU into any module that uses `double`. Only `fneg`/`fabs` (a sign-bit
+flip), constants, and load/store are lowered inline.
+
+The calls reuse clang's i386 ABI for `cvm_f64` — which the translator already
+handles — so no new ABI work was needed: a 64-bit argument is passed as two i32
+words in (lo, hi) order, and a 64-bit return uses an `sret` hidden pointer (the
+result slot's address is handed in as that pointer, so the helper writes the
+answer straight into the value's frame slots). Comparison/conversion helpers
+that return `i32` use the normal R0 return.
+
+Crucially, **each f64-runtime-call instruction is registered as a caller-save
+spill point** (`cg_op_is_f64_runtime_call`, consumed by
+`cg_compute_call_liveouts`), so the same liveness-narrowed save/restore that
+protects a normal `call` protects these — live SSA registers survive the call.
+
+Lowered `f64` operations:
+
+- `fadd` / `fsub` / `fmul` / `fdiv` → `__cvm_fadd/fsub/fmul/fdiv` (sret)
+- `fcmp` → one `__cvm_f{eq,ne,lt,le,gt,ge,ord,one}` call, plus a `1 - r`
+  negation for the unordered-relational / `uno` / `ueq` predicates; `true`/
+  `false` fold to a constant
+- `fneg` → inline `xor` of the sign bit (no call)
+- `sitofp` / `uitofp` / `fpext` (→ `double`) → `__cvm_f_from_{i32,u32,f32}` (sret)
+- `fptosi` / `fptoui` / `fptrunc` (`double` →) → `__cvm_f_to_{i32,u32,f32}`
+- `double` constant / `load` / `store` → materialised / two-word, like `i64`
+
+Not yet lowered (clear error): the `llvm.*.f64` math intrinsics — notably
+`llvm.fmuladd.f64`, which clang's default `-ffp-contract=on` synthesises from
+`a*b±c`; compile f64-heavy code with `-ffp-contract=off` until an `__cvm_fma`
+helper lands. Also `double` `phi`/`select` and `double` across a function
+boundary (the 64-bit calling convention is a later phase).
 
 ### Calling convention
 

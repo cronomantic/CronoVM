@@ -10,6 +10,25 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **`f64` (double) legalisation in the translator (phase 2).** Native `double`
+  is no longer rejected. It reuses the i64 two-slot storage, but since f64 ops
+  can't be open-coded, each is lowered to a soft-float runtime CALL into the new
+  `runtime/lib/cvm_float64_rt.c` (`__cvm_f*` external wrappers over
+  `cvm_float64.h`); cvm-cc links that TU into any module using `double`. Inline
+  exceptions: `fneg`/`fabs` (sign-bit flip), constants, load/store. The calls
+  reuse clang's existing `cvm_f64` ABI (two i32 words per arg, `sret` for a
+  64-bit return) — which the translator already handled — so no new ABI work;
+  the result slot's address is passed as the sret pointer. Each f64-runtime-call
+  is registered as a caller-save spill point so the existing liveness-narrowed
+  save/restore protects live registers across it. Lowered: fadd/fsub/fmul/fdiv,
+  fcmp (all 16 predicates, one call + optional 0/1 negation), sitofp/uitofp/
+  fptosi/fptoui/fpext/fptrunc, fneg, and double const/load/store. New e2e
+  fixture `f64_slice` (linked via cvm-cc against the runtime). **Not yet**
+  lowered (clear error): the `llvm.*.f64` math intrinsics — notably
+  `llvm.fmuladd.f64` (clang's default `-ffp-contract=on` makes it from `a*b±c`;
+  use `-ffp-contract=off` for now) — plus double `phi`/`select` and double
+  across a function boundary (64-bit calling convention, a later phase). See
+  `docs/translator.md` → "f64 (double) legalisation".
 - **`i64` legalisation in the translator (phase 1).** Native 64-bit integers
   are no longer rejected: code that uses `long long` inside a function body now
   translates without hand-writing `cvm_int64.h`. Each `i64` SSA value lives in
