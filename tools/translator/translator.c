@@ -27,10 +27,11 @@
  * llvm_c_compat.cpp. See that file for the implementation. */
 extern LLVMValueRef cvm_llvm_get_switch_case_value(LLVMValueRef SI, unsigned i);
 
-/* Exit code from --probe-runtime meaning "this module uses double and needs
- * the soft-float runtime linked". Distinct from 0 (no runtime needed) and the
- * 1/2 used for IO/usage errors. cvm-cc relies on this exact value. */
-#define CVM_PROBE_F64 10
+/* --probe-runtime exit code: a bitmask of which soft runtimes the module
+ * needs linked. 0 = none; the bits combine (e.g. 30 = both). Distinct from the
+ * 1/2 used for IO/usage errors. cvm-cc relies on these exact values. */
+#define CVM_PROBE_F64 10   /* uses double -> link cvm_float64_rt */
+#define CVM_PROBE_I64 20   /* uses i64 div/rem -> link cvm_int64_rt */
 
 static int g_errors = 0;
 
@@ -238,6 +239,10 @@ static int opcode_in_subset(LLVMOpcode op) {
     case LLVMPtrToInt: case LLVMIntToPtr: case LLVMBitCast:
     case LLVMICmp: case LLVMPHI: case LLVMCall: case LLVMSelect:
     case LLVMExtractValue: case LLVMInsertValue:
+    /* freeze: lowered as identity (pass the operand through). clang emits it
+     * to block poison propagation, e.g. around div/rem and the i64 legaliser's
+     * volatile operands. Since the VM never exploits UB, identity is correct. */
+    case LLVMFreeze:
     /* f32 ops — see translator's float codegen. FRem deliberately
      * excluded (no FREM opcode; users wanting fmod can call libc-style
      * helper from a future runtime header). FPExt/FPTrunc excluded
@@ -272,8 +277,6 @@ static const char *reject_reason(LLVMOpcode op) {
         return "indirectbr / callbr not in the subset";
     case LLVMAddrSpaceCast:
         return "non-default address spaces not supported";
-    case LLVMFreeze:
-        return "freeze not yet supported";
     default:
         return "instruction not in the subset";
     }
@@ -1806,11 +1809,11 @@ static int cg_type_is_wide(LLVMTypeRef t) {
     return cg_type_is_i64(t) || cg_type_is_f64(t);
 }
 
-/* True if instruction `i` lowers to a soft-float runtime CALL (and thus is a
- * caller-save spill point, like an LLVMCall). f64 arithmetic, comparison and
- * conversion ops call into cvm_float64_rt; fneg is inline (a sign-bit flip)
- * and f32 ops map to native opcodes, so neither counts. */
-static int cg_op_is_f64_runtime_call(LLVMValueRef i, LLVMOpcode op) {
+/* True if instruction `i` lowers to a soft runtime CALL (and thus is a
+ * caller-save spill point, like an LLVMCall). f64 arithmetic/comparison/
+ * conversion ops call into cvm_float64_rt; i64 div/rem call into cvm_int64_rt.
+ * Inline ops (fneg, i64 add/sub/mul/logic/shifts, f32 ops) do not count. */
+static int cg_op_is_runtime_call(LLVMValueRef i, LLVMOpcode op) {
     switch (op) {
     case LLVMFAdd: case LLVMFSub: case LLVMFMul: case LLVMFDiv:
         return cg_type_is_f64(LLVMTypeOf(i));
@@ -1819,6 +1822,8 @@ static int cg_op_is_f64_runtime_call(LLVMValueRef i, LLVMOpcode op) {
     case LLVMFCmp:
     case LLVMFPToSI: case LLVMFPToUI: case LLVMFPTrunc:
         return cg_type_is_f64(LLVMTypeOf(LLVMGetOperand(i, 0)));
+    case LLVMUDiv: case LLVMSDiv: case LLVMURem: case LLVMSRem:
+        return cg_type_is_i64(LLVMTypeOf(i));   /* i64 div/rem -> runtime call */
     case LLVMCall: {
         /* llvm.fmuladd/fma.f64 lower to two runtime calls; fabs/copysign are
          * inline. Only the former are spill points. */
@@ -1872,6 +1877,12 @@ static int cg_i64_read(struct cg *cg, LLVMValueRef v, uint8_t *lo, uint8_t *hi) 
         cg_emit_load_const32(cg, *hi, (int32_t)chi);
         return 0;
     }
+    if (LLVMIsUndef(v)) {
+        /* poison/undef 64-bit value — any concretisation is valid; use 0. */
+        *lo = cg->zero_reg;
+        *hi = cg->zero_reg;
+        return 0;
+    }
     int idx = cg_lookup(cg, v);
     if (idx < 0 || cg->i64_slot[idx] == CG_NO_SLOT) {
         ERR(cg->fn_name, "internal: i64 operand without a frame slot");
@@ -1903,10 +1914,18 @@ static void cg_shift_imm(struct cg *cg, uint8_t cv, uint8_t dst,
     cg_emit(cg, enc_r(cv, dst, src, (uint8_t)CG_REG_SCRATCH));
 }
 
-/* Lower an instruction whose RESULT is an i64 SSA value (sext/zext/load and
- * the i64 arithmetic/logic/shift ops). Called from the codegen dispatch
- * before the generic register-based switch. The result is written to the
- * value's two frame slots; nothing lands in a register. */
+/* Forward decl: the generic soft-runtime call emitter (defined after the
+ * liveness helpers it depends on). i64 div/rem use it like f64 ops do. */
+static void cg_emit_runtime_call(struct cg *cg, LLVMValueRef i,
+                                 const char *name, LLVMValueRef *wide_args,
+                                 int n_wide, LLVMValueRef scalar_arg,
+                                 int ret_slot, uint8_t dst_reg);
+
+/* Lower an instruction whose RESULT is an i64 SSA value: sext/zext/load, the
+ * inline arithmetic/logic/shift/mul ops, and div/rem (a soft runtime call).
+ * Called from the codegen dispatch before the generic register-based switch.
+ * The result is written to the value's two frame slots; nothing lands in a
+ * register. */
 static void cg_emit_i64_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
     int idx = cg_lookup(cg, i);
     if (idx < 0 || cg->i64_slot[idx] == CG_NO_SLOT) {
@@ -1974,6 +1993,46 @@ static void cg_emit_i64_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
             cg_emit(cg, enc_r(cv, hi, ah, bh));
         }
         cg_i64_write(cg, idx, lo, hi);
+        break;
+    }
+    case LLVMMul: {
+        /* 64-bit product, low 64 bits (signed and unsigned agree under
+         * 2's complement). With a = ah:al, b = bh:bl:
+         *   lo = al*bl
+         *   hi = mulhu(al,bl) + al*bh + ah*bl   (the ah*bh*2^64 term drops)
+         * Inline via MUL/MULHU — no runtime call. */
+        uint8_t al, ah, bl, bh;
+        if (cg_i64_read(cg, LLVMGetOperand(i, 0), &al, &ah)) return;
+        if (cg_i64_read(cg, LLVMGetOperand(i, 1), &bl, &bh)) return;
+        uint8_t lo = cg_alloc_reg(cg); if (cg->had_error) return;
+        uint8_t hi = cg_alloc_reg(cg); if (cg->had_error) return;
+        uint8_t t  = cg_alloc_reg(cg); if (cg->had_error) return;
+        cg_emit(cg, enc_r(CVM_OP_MUL,   lo, al, bl));
+        cg_emit(cg, enc_r(CVM_OP_MULHU, hi, al, bl));
+        cg_emit(cg, enc_r(CVM_OP_MUL,   t,  al, bh));
+        cg_emit(cg, enc_r(CVM_OP_ADD,   hi, hi, t));
+        cg_emit(cg, enc_r(CVM_OP_MUL,   t,  ah, bl));
+        cg_emit(cg, enc_r(CVM_OP_ADD,   hi, hi, t));
+        cg_i64_write(cg, idx, lo, hi);
+        break;
+    }
+    case LLVMFreeze: {
+        /* identity: copy the operand's two words into the result slots. */
+        uint8_t lo, hi;
+        if (cg_i64_read(cg, LLVMGetOperand(i, 0), &lo, &hi)) break;
+        cg_i64_write(cg, idx, lo, hi);
+        break;
+    }
+    case LLVMUDiv: case LLVMSDiv: case LLVMURem: case LLVMSRem: {
+        /* 64-bit divide/remainder is too large to open-code; lower to a
+         * soft runtime call into cvm_int64_rt (sret result, like f64).
+         * cvm-cc auto-links that TU when a module uses i64 div/rem. */
+        const char *name = (op == LLVMUDiv) ? "__cvm_udiv64"
+                         : (op == LLVMSDiv) ? "__cvm_sdiv64"
+                         : (op == LLVMURem) ? "__cvm_umod64" : "__cvm_smod64";
+        LLVMValueRef a2[2] = { LLVMGetOperand(i, 0), LLVMGetOperand(i, 1) };
+        cg_emit_runtime_call(cg, i, name, a2, 2, NULL,
+                             (int)cg->i64_slot[idx], 0);
         break;
     }
     case LLVMLShr: case LLVMShl: case LLVMAShr: {
@@ -2477,7 +2536,7 @@ static void cg_compute_call_liveouts(struct cg *cg) {
             /* Snapshot before applying i's effects: `live` here is the set
              * of registers live at the program point AFTER i has executed.
              * f64 ops that lower to a soft-float CALL are spill points too. */
-            if (op == LLVMCall || cg_op_is_f64_runtime_call(i, op)) {
+            if (op == LLVMCall || cg_op_is_runtime_call(i, op)) {
                 if (cg->call_live_count == cg->call_live_cap) {
                     cg->call_live_cap = cg->call_live_cap
                                         ? cg->call_live_cap * 2 : 16;
@@ -2600,7 +2659,7 @@ static int cg_f64_operand_to_regs(struct cg *cg, LLVMValueRef v, uint8_t base) {
  *   dst_reg     : when ret_slot<0, the register that receives R0
  * Argument register layout: [sret ptr if ret_slot>=0] then the wide pairs,
  * then the scalar — filling R0,R1,... in order. */
-static void cg_emit_f64_call(struct cg *cg, LLVMValueRef i, const char *name,
+static void cg_emit_runtime_call(struct cg *cg, LLVMValueRef i, const char *name,
                              LLVMValueRef *wide_args, int n_wide,
                              LLVMValueRef scalar_arg,
                              int ret_slot, uint8_t dst_reg) {
@@ -2681,7 +2740,7 @@ static void cg_emit_f64_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
                          : (op == LLVMFSub) ? "__cvm_fsub"
                          : (op == LLVMFMul) ? "__cvm_fmul" : "__cvm_fdiv";
         LLVMValueRef a2[2] = { LLVMGetOperand(i, 0), LLVMGetOperand(i, 1) };
-        cg_emit_f64_call(cg, i, name, a2, 2, NULL, slot, 0);
+        cg_emit_runtime_call(cg, i, name, a2, 2, NULL, slot, 0);
         break;
     }
     case LLVMFNeg: {
@@ -2696,12 +2755,12 @@ static void cg_emit_f64_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
     case LLVMSIToFP: case LLVMUIToFP: {
         const char *name = (op == LLVMSIToFP) ? "__cvm_f_from_i32"
                                               : "__cvm_f_from_u32";
-        cg_emit_f64_call(cg, i, name, NULL, 0, LLVMGetOperand(i, 0), slot, 0);
+        cg_emit_runtime_call(cg, i, name, NULL, 0, LLVMGetOperand(i, 0), slot, 0);
         break;
     }
     case LLVMFPExt: {
         /* float -> double. The f32 operand is one word (in a register). */
-        cg_emit_f64_call(cg, i, "__cvm_f_from_f32", NULL, 0,
+        cg_emit_runtime_call(cg, i, "__cvm_f_from_f32", NULL, 0,
                          LLVMGetOperand(i, 0), slot, 0);
         break;
     }
@@ -2719,6 +2778,13 @@ static void cg_emit_f64_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
         cg_i64_write(cg, idx, lo, hi);
         break;
     }
+    case LLVMFreeze: {
+        /* identity: copy the operand's two words into the result slots. */
+        uint8_t lo, hi;
+        if (cg_i64_read(cg, LLVMGetOperand(i, 0), &lo, &hi)) break;
+        cg_i64_write(cg, idx, lo, hi);
+        break;
+    }
     case LLVMCall: {
         /* f64-returning intrinsic calls. clang -O1 with the default
          * -ffp-contract=on synthesises llvm.fmuladd.f64 from `a*b±c`;
@@ -2733,10 +2799,10 @@ static void cg_emit_f64_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
              * matching the soft runtime's existing truncating-mul accuracy and
              * the relaxed contract of fmuladd. */
             LLVMValueRef mul[2] = { LLVMGetOperand(i, 0), LLVMGetOperand(i, 1) };
-            cg_emit_f64_call(cg, i, "__cvm_fmul", mul, 2, NULL, slot, 0);
+            cg_emit_runtime_call(cg, i, "__cvm_fmul", mul, 2, NULL, slot, 0);
             if (cg->had_error) break;
             LLVMValueRef add[2] = { i, LLVMGetOperand(i, 2) };
-            cg_emit_f64_call(cg, i, "__cvm_fadd", add, 2, NULL, slot, 0);
+            cg_emit_runtime_call(cg, i, "__cvm_fadd", add, 2, NULL, slot, 0);
             break;
         }
         if (strcmp(cname, "llvm.fabs.f64") == 0) {
@@ -3127,7 +3193,7 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     uint8_t dst = cg->regs[cg_lookup(cg, i)];
                     LLVMValueRef a2[2] = { LLVMGetOperand(i, 0),
                                            LLVMGetOperand(i, 1) };
-                    cg_emit_f64_call(cg, i, fn, a2, 2, NULL, -1, dst);
+                    cg_emit_runtime_call(cg, i, fn, a2, 2, NULL, -1, dst);
                     if (cg->had_error) break;
                     if (negate) {
                         uint8_t one_r = cg_alloc_reg(cg);
@@ -3232,7 +3298,7 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                  * is a no-op clang never emits). Soft-float runtime call. */
                 uint8_t dst = cg->regs[cg_lookup(cg, i)];
                 LLVMValueRef a1[1] = { LLVMGetOperand(i, 0) };
-                cg_emit_f64_call(cg, i, "__cvm_f_to_f32", a1, 1, NULL, -1, dst);
+                cg_emit_runtime_call(cg, i, "__cvm_f_to_f32", a1, 1, NULL, -1, dst);
                 break;
             }
 
@@ -3247,7 +3313,7 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     const char *fn = (op == LLVMFPToSI) ? "__cvm_f_to_i32"
                                                         : "__cvm_f_to_u32";
                     LLVMValueRef a1[1] = { LLVMGetOperand(i, 0) };
-                    cg_emit_f64_call(cg, i, fn, a1, 1, NULL, -1, dst);
+                    cg_emit_runtime_call(cg, i, fn, a1, 1, NULL, -1, dst);
                     break;
                 }
                 uint8_t src = cg_reg_for(cg, LLVMGetOperand(i, 0));
@@ -3702,6 +3768,7 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
             case LLVMPtrToInt:
             case LLVMIntToPtr:
             case LLVMBitCast:
+            case LLVMFreeze:   /* identity for i32/f32/ptr (wide handled above) */
             case LLVMZExt: {
                 uint8_t src = cg_reg_for(cg, LLVMGetOperand(i, 0));
                 uint8_t dst = cg->regs[cg_lookup(cg, i)];
@@ -4369,6 +4436,15 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                  * the `unreachable` fixture's assert-style helper). Drop them. */
                 if (strncmp(name, "llvm.assume", 11) == 0 ||
                     strncmp(name, "llvm.donothing", 14) == 0) {
+                    break;
+                }
+
+                /* Alias-analysis scope metadata declarations — pure hints with
+                 * no runtime effect. clang emits llvm.experimental.noalias.
+                 * scope.decl when it inlines functions with restrict/noalias
+                 * args (e.g. the soft int64/float64 runtime helpers). Drop. */
+                if (strncmp(name, "llvm.experimental.noalias.scope.decl",
+                            36) == 0) {
                     break;
                 }
 
@@ -5064,11 +5140,13 @@ int cvm_fuzz_translate_buffer(const uint8_t *data, size_t len) {
 }
 
 #ifndef CVM_NO_TRANSLATOR_MAIN
-/* True if any defined function uses the `double` type (as an instruction
- * result or operand). Such a module needs the soft-float runtime linked in;
- * cvm-cc consults this (via --probe-runtime) to auto-link cvm_float64_rt.c
- * only when needed, so integer-only modules carry no soft-float code. */
-static int module_uses_f64(LLVMModuleRef mod) {
+/* Which soft runtimes the module needs (a CVM_PROBE_* bitmask): f64 if any
+ * `double` appears (instruction result or operand), i64 if any i64 div/rem
+ * appears (these lower to a runtime call; the other i64 ops are inline).
+ * cvm-cc consults this (via --probe-runtime) to auto-link the matching TU
+ * only when needed, so integer-only modules carry no soft code. */
+static int module_runtime_needs(LLVMModuleRef mod) {
+    int need = 0;
     for (LLVMValueRef fn = LLVMGetFirstFunction(mod);
          fn; fn = LLVMGetNextFunction(fn))
     {
@@ -5079,16 +5157,21 @@ static int module_uses_f64(LLVMModuleRef mod) {
             for (LLVMValueRef i = LLVMGetFirstInstruction(bb);
                  i; i = LLVMGetNextInstruction(i))
             {
-                if (cg_type_is_f64(LLVMTypeOf(i))) return 1;
+                LLVMOpcode op = LLVMGetInstructionOpcode(i);
+                if ((op == LLVMUDiv || op == LLVMSDiv ||
+                     op == LLVMURem || op == LLVMSRem) &&
+                    cg_type_is_i64(LLVMTypeOf(i)))
+                    need |= CVM_PROBE_I64;
+                if (cg_type_is_f64(LLVMTypeOf(i))) { need |= CVM_PROBE_F64; continue; }
                 unsigned n = LLVMGetNumOperands(i);
                 for (unsigned k = 0; k < n; ++k) {
                     LLVMValueRef o = LLVMGetOperand(i, k);
-                    if (o && cg_type_is_f64(LLVMTypeOf(o))) return 1;
+                    if (o && cg_type_is_f64(LLVMTypeOf(o))) { need |= CVM_PROBE_F64; break; }
                 }
             }
         }
     }
-    return 0;
+    return need;
 }
 
 int main(int argc, char **argv) {
@@ -5185,11 +5268,12 @@ int main(int argc, char **argv) {
      * readable token is also printed. (Bitcode/IO errors above already
      * returned 1, so the probe codes can't collide with those.) */
     if (probe_runtime) {
-        int needs_f64 = module_uses_f64(mod);
-        if (needs_f64) printf("f64\n");
+        int need = module_runtime_needs(mod);
+        if (need & CVM_PROBE_F64) printf("f64\n");
+        if (need & CVM_PROBE_I64) printf("i64\n");
         LLVMDisposeModule(mod);
         LLVMContextDispose(ctx);
-        return needs_f64 ? CVM_PROBE_F64 : 0;
+        return need;
     }
 
     size_t src_len = 0;

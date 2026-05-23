@@ -70,14 +70,17 @@
 #  define CVM_TRANSLATOR_DEFAULT "cvm-translate"
 #endif
 
-/* Exit code cvm-translate --probe-runtime returns when the module uses
- * `double` and needs the soft-float runtime linked. Must match CVM_PROBE_F64
- * in tools/translator/translator.c. */
-#define CVM_PROBE_F64 10
+/* Bitmask exit codes from `cvm-translate --probe-runtime`: which soft runtimes
+ * the module needs linked. Must match the CVM_PROBE_* values in
+ * tools/translator/translator.c. The two bits are disjoint, so they OR/AND
+ * cleanly (both => 30). */
+#define CVM_PROBE_F64 10   /* uses double -> link the f64 runtime  */
+#define CVM_PROBE_I64 20   /* uses i64 div/rem -> link the i64 runtime */
 
-/* Basename of the soft-float runtime TU, auto-linked when a program uses
- * double. Lives in the runtime dir; never hand-listed by the user. */
+/* Basenames of the soft runtime TUs, auto-linked on demand. They live in the
+ * runtime dir and are never hand-listed by the user. */
 #define CVM_F64_RUNTIME_TU "cvm_float64_rt.c"
+#define CVM_I64_RUNTIME_TU "cvm_int64_rt.c"
 
 #define MAX_REGIONS         64
 #define MAX_INCLUDE_DIRS    32
@@ -474,19 +477,25 @@ int main(int argc, char **argv) {
         if (!translator) fail = 1;
     }
 
-    /* Auto-link the soft-float runtime when the program uses `double`. Probe
-     * each compiled module; if any needs f64, compile cvm_float64_rt.c and add
-     * it to the link set so the translator's f64 legaliser finds the __cvm_f*
-     * helpers. Integer-only programs link nothing extra. Skipped if the user
-     * already listed the runtime TU (avoids a duplicate-symbol link error). */
+    /* Auto-link the soft runtimes a program needs. Probe each compiled module
+     * (cvm-translate --probe-runtime returns a CVM_PROBE_* bitmask: f64 for
+     * `double`, i64 for i64 div/rem); then compile and add each needed runtime
+     * TU so the translator's legaliser finds the __cvm_* helpers. Integer-only
+     * programs link nothing extra. A runtime the user already listed is left
+     * alone (no duplicate-symbol llvm-link error). */
     if (!fail) {
-        int rt_listed = 0;
-        for (int i = 0; i < cli.input_count; ++i)
-            if (strcmp(basename_of(cli.inputs[i]), CVM_F64_RUNTIME_TU) == 0)
-                rt_listed = 1;
+        struct { int bit; const char *tu; int listed; } rts[2] = {
+            { CVM_PROBE_F64, CVM_F64_RUNTIME_TU, 0 },
+            { CVM_PROBE_I64, CVM_I64_RUNTIME_TU, 0 },
+        };
+        for (int i = 0; i < cli.input_count; ++i) {
+            const char *b = basename_of(cli.inputs[i]);
+            for (int j = 0; j < 2; ++j)
+                if (strcmp(b, rts[j].tu) == 0) rts[j].listed = 1;
+        }
 
-        int needs_f64 = 0;
-        for (int i = 0; i < bc_count && !fail && !rt_listed; ++i) {
+        int need = 0;   /* accumulated CVM_PROBE_* bitmask over all modules */
+        for (int i = 0; i < bc_count && !fail; ++i) {
             char *pargv[4];
             int   pn = 0;
             pargv[pn++] = translator;
@@ -494,37 +503,38 @@ int main(int argc, char **argv) {
             pargv[pn++] = bc_paths[i];
             pargv[pn]   = NULL;
             int prc = run_cmd(&cli, pargv);
-            if (prc == CVM_PROBE_F64) { needs_f64 = 1; break; }
-            if (prc != 0) {
-                fprintf(stderr, "cvm-cc: soft-float probe failed on %s "
+            if (prc & ~(CVM_PROBE_F64 | CVM_PROBE_I64)) {
+                fprintf(stderr, "cvm-cc: runtime probe failed on %s "
                         "(exit %d)\n", bc_paths[i], prc);
                 fail = 1;
+                break;
             }
+            need |= prc;
+            if ((need & CVM_PROBE_F64) && (need & CVM_PROBE_I64)) break;
         }
 
-        if (!fail && needs_f64) {
+        for (int j = 0; j < 2 && !fail; ++j) {
+            if (!(need & rts[j].bit) || rts[j].listed) continue;
             if (bc_count >= MAX_INPUTS) {
-                fprintf(stderr, "cvm-cc: too many inputs to auto-link the "
-                        "soft-float runtime (max %d)\n", MAX_INPUTS);
+                fprintf(stderr, "cvm-cc: too many inputs to auto-link %s "
+                        "(max %d)\n", rts[j].tu, MAX_INPUTS);
                 fail = 1;
-            } else {
-                char rt_src[1100];
-                snprintf(rt_src, sizeof rt_src, "%s/%s",
-                         cli.runtime_dir, CVM_F64_RUNTIME_TU);
-                char *bc = (char *)malloc(outlen + 24);
-                if (!bc) { perror("malloc"); fail = 1; }
-                else {
-                    snprintf(bc, outlen + 24, "%s.rt.tmp.bc", cli.output);
-                    if (compile_c_to_bc(&cli, clang, rt_src, bc) != 0) {
-                        free(bc);
-                        fail = 1;
-                    } else {
-                        bc_paths[bc_count] = bc;
-                        bc_owned[bc_count] = 1;
-                        ++bc_count;
-                    }
-                }
+                break;
             }
+            char rt_src[1100];
+            snprintf(rt_src, sizeof rt_src, "%s/%s",
+                     cli.runtime_dir, rts[j].tu);
+            char *bc = (char *)malloc(outlen + 24);
+            if (!bc) { perror("malloc"); fail = 1; break; }
+            snprintf(bc, outlen + 24, "%s.rt%d.tmp.bc", cli.output, j);
+            if (compile_c_to_bc(&cli, clang, rt_src, bc) != 0) {
+                free(bc);
+                fail = 1;
+                break;
+            }
+            bc_paths[bc_count] = bc;
+            bc_owned[bc_count] = 1;
+            ++bc_count;
         }
     }
 

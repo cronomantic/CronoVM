@@ -23,9 +23,10 @@ liveness-based spill at every call site, and post-emission
 branch relaxation**. `i64` and `double` are both legalised inside a
 function body now — `i64` to inline 32-bit word pairs, `double` to
 soft-float runtime calls (see "64-bit integer legalisation" and "f64
-legalisation"). The remaining gaps are the 64-bit calling convention,
-`i64` `mul`/`div`, and the less-common `llvm.*.f64` math intrinsics
-(`fmuladd`/`fma`/`fabs`/`copysign` are handled; `sqrt` etc. are not).
+legalisation") — including `i64` `mul` (inline) and `div`/`rem` (soft
+runtime). The remaining gaps are the 64-bit calling convention, `i64`
+`phi`/`select`/variable-shifts, and the less-common `llvm.*.f64` math
+intrinsics (`fmuladd`/`fma`/`fabs`/`copysign` are handled; `sqrt` etc. are not).
 
 `fib_recursive.bin` shrank from 135 to 51 instructions when
 liveness landed (62% fewer); a deeply recursive function with
@@ -184,11 +185,19 @@ Currently lowered `i64` operations:
 - **`icmp`** — `eq`/`ne` combine the two word compares; the ordered predicates
   decompose to `(ah <hi bh) | ((ah == bh) & (al <lo bl))` with a signed or
   unsigned high-word compare and an unsigned low-word compare
+- **`mul`** — inline `lo = al*bl`, `hi = mulhu(al,bl) + al*bh + ah*bl` (the
+  `ah*bh` term overflows bit 63 and drops); signed/unsigned agree
+- **`udiv`/`sdiv`/`urem`/`srem`** — a soft runtime CALL into `cvm_int64_rt.c`
+  (`__cvm_{u,s}div64` / `__cvm_{u,s}mod64`, sret return, same ABI as the f64
+  helpers), since a 64/64 long division is too large to open-code. cvm-cc
+  auto-links that TU when a module uses i64 div/rem
+- **`freeze`** — identity (copy the two words); clang emits it to block poison
+  propagation around the volatile/div operands
 
 Not yet legalised (these still error out with a clear message): `i64`
-`mul`/`div`/`rem`, `i64` `phi`/`select`, variable-amount shifts, and any `i64`
-that crosses a function boundary (argument, return value, or `i64`-returning
-call) — the 64-bit calling convention is a later phase.
+`phi`/`select`, variable-amount shifts, and any `i64` that crosses a function
+boundary (argument, return value, or `i64`-returning call) — the 64-bit calling
+convention is a later phase.
 
 ### f64 (double) legalisation
 

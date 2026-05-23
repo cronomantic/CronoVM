@@ -10,6 +10,19 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **`i64` multiply / divide / remainder (completes the i64 legaliser).**
+  `i64` `mul` is lowered inline (`lo = al*bl`, `hi = mulhu(al,bl) + al*bh +
+  ah*bl`, via `MUL`/`MULHU`). `udiv`/`sdiv`/`urem`/`srem` lower to a soft
+  runtime CALL into the new `runtime/lib/cvm_int64_rt.c` (`__cvm_{u,s}div64` /
+  `__cvm_{u,s}mod64`, a ~64-iteration restoring long division on the `cvm_i64`
+  struct, sret return — same ABI path as the f64 helpers); cvm-cc auto-links it
+  when a module uses i64 div/rem (the `--probe-runtime` exit code is now a
+  bitmask: `10` f64, `20` i64, `30` both). Also: `freeze` is now accepted
+  (lowered as identity — clang emits it to block poison propagation, e.g.
+  around the div operands), and `llvm.experimental.noalias.scope.decl` is
+  dropped as a no-op (clang emits it when inlining the restrict-qualified
+  runtime helpers). New e2e fixture `i64_muldiv`. The remaining i64 gaps are
+  `phi`/`select`, variable-amount shifts, and the 64-bit calling convention.
 - **cvm-cc auto-links the soft-float runtime.** When a program uses `double`,
   cvm-cc now links `cvm_float64_rt.c` automatically — `double` "just works"
   without hand-listing the runtime TU. It runs the new `cvm-translate

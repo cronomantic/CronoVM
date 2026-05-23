@@ -153,4 +153,30 @@ if(TARGET cvm-translate)
              COMMAND test_e2e ${_cvmcc_fma} 0 0)
     set_tests_properties(e2e_cvm_cc_f64_fma
                          PROPERTIES FIXTURES_REQUIRED cvm_cc_bins)
+
+    # i64 multiply (inline MUL/MULHU) + divide/remainder (soft runtime call).
+    # cvm-cc AUTO-LINKS cvm_int64_rt.c after probing the module for i64 div/rem
+    # (the runtime is not listed here). f64-style sret ABI for the div helpers.
+    # i64_muldiv_main returns 0 on success for any seed.
+    set(_cvmcc_md ${CMAKE_CURRENT_BINARY_DIR}/cvm_cc_i64_muldiv.bin)
+    add_custom_command(
+        OUTPUT  ${_cvmcc_md}
+        COMMAND $<TARGET_FILE:cvm-cc>
+                ${_fixture_dir}/i64_muldiv.c
+                -o ${_cvmcc_md}
+        DEPENDS cvm-cc cvm-translate
+                ${_fixture_dir}/i64_muldiv.c
+                ${CVM_SOURCE_ROOT}/runtime/lib/cvm_int64_rt.c
+        VERBATIM
+    )
+    add_custom_target(cvm_cc_i64_muldiv_round_trip DEPENDS ${_cvmcc_md})
+    add_test(NAME cvm_cc_compile_i64_muldiv
+             COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+                                      --target cvm_cc_i64_muldiv_round_trip)
+    set_tests_properties(cvm_cc_compile_i64_muldiv
+                         PROPERTIES FIXTURES_SETUP cvm_cc_bins)
+    add_test(NAME e2e_cvm_cc_i64_muldiv
+             COMMAND test_e2e ${_cvmcc_md} 0 0)
+    set_tests_properties(e2e_cvm_cc_i64_muldiv
+                         PROPERTIES FIXTURES_REQUIRED cvm_cc_bins)
 endif()
