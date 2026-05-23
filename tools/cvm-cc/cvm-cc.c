@@ -70,6 +70,15 @@
 #  define CVM_TRANSLATOR_DEFAULT "cvm-translate"
 #endif
 
+/* Exit code cvm-translate --probe-runtime returns when the module uses
+ * `double` and needs the soft-float runtime linked. Must match CVM_PROBE_F64
+ * in tools/translator/translator.c. */
+#define CVM_PROBE_F64 10
+
+/* Basename of the soft-float runtime TU, auto-linked when a program uses
+ * double. Lives in the runtime dir; never hand-listed by the user. */
+#define CVM_F64_RUNTIME_TU "cvm_float64_rt.c"
+
 #define MAX_REGIONS         64
 #define MAX_INCLUDE_DIRS    32
 #define MAX_INPUTS         256   /* a multi-file port (e.g. Crispy) is ~100+ TUs */
@@ -147,6 +156,14 @@ static void usage(FILE *f) {
 static int has_suffix(const char *s, const char *suf) {
     size_t sl = strlen(s), tl = strlen(suf);
     return sl >= tl && memcmp(s + sl - tl, suf, tl) == 0;
+}
+
+/* The last path component of `s` (after the final '/' or '\'). */
+static const char *basename_of(const char *s) {
+    const char *b = s;
+    for (const char *p = s; *p; ++p)
+        if (*p == '/' || *p == '\\') b = p + 1;
+    return b;
 }
 
 /* Run `argv` (NULL-terminated) via exec/spawn. Returns the child's
@@ -449,6 +466,68 @@ int main(int argc, char **argv) {
         ++bc_count;
     }
 
+    /* Locate cvm-translate once: needed both for the soft-float probe below
+     * and the final translate. */
+    char *translator = NULL;
+    if (!fail) {
+        translator = find_translator(&cli, argv[0]);
+        if (!translator) fail = 1;
+    }
+
+    /* Auto-link the soft-float runtime when the program uses `double`. Probe
+     * each compiled module; if any needs f64, compile cvm_float64_rt.c and add
+     * it to the link set so the translator's f64 legaliser finds the __cvm_f*
+     * helpers. Integer-only programs link nothing extra. Skipped if the user
+     * already listed the runtime TU (avoids a duplicate-symbol link error). */
+    if (!fail) {
+        int rt_listed = 0;
+        for (int i = 0; i < cli.input_count; ++i)
+            if (strcmp(basename_of(cli.inputs[i]), CVM_F64_RUNTIME_TU) == 0)
+                rt_listed = 1;
+
+        int needs_f64 = 0;
+        for (int i = 0; i < bc_count && !fail && !rt_listed; ++i) {
+            char *pargv[4];
+            int   pn = 0;
+            pargv[pn++] = translator;
+            pargv[pn++] = (char *)"--probe-runtime";
+            pargv[pn++] = bc_paths[i];
+            pargv[pn]   = NULL;
+            int prc = run_cmd(&cli, pargv);
+            if (prc == CVM_PROBE_F64) { needs_f64 = 1; break; }
+            if (prc != 0) {
+                fprintf(stderr, "cvm-cc: soft-float probe failed on %s "
+                        "(exit %d)\n", bc_paths[i], prc);
+                fail = 1;
+            }
+        }
+
+        if (!fail && needs_f64) {
+            if (bc_count >= MAX_INPUTS) {
+                fprintf(stderr, "cvm-cc: too many inputs to auto-link the "
+                        "soft-float runtime (max %d)\n", MAX_INPUTS);
+                fail = 1;
+            } else {
+                char rt_src[1100];
+                snprintf(rt_src, sizeof rt_src, "%s/%s",
+                         cli.runtime_dir, CVM_F64_RUNTIME_TU);
+                char *bc = (char *)malloc(outlen + 24);
+                if (!bc) { perror("malloc"); fail = 1; }
+                else {
+                    snprintf(bc, outlen + 24, "%s.rt.tmp.bc", cli.output);
+                    if (compile_c_to_bc(&cli, clang, rt_src, bc) != 0) {
+                        free(bc);
+                        fail = 1;
+                    } else {
+                        bc_paths[bc_count] = bc;
+                        bc_owned[bc_count] = 1;
+                        ++bc_count;
+                    }
+                }
+            }
+        }
+    }
+
     /* The module to translate: a single input is used as-is; multiple inputs
      * are llvm-link'd into one module first. llvm-link gives real multi-file
      * linkage — file-local statics are uniqued, only true extern duplicates
@@ -516,32 +595,28 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* cvm-translate the (possibly linked, possibly optimised) module. */
+    /* cvm-translate the (possibly linked, possibly optimised) module. The
+     * translator was located earlier (for the soft-float probe). */
     int trc = 0;
     if (!fail) {
-        char *translator = find_translator(&cli, argv[0]);
-        if (!translator) {
-            fail = 1;
-        } else {
-            char *targv[16 + MAX_REGIONS];
-            int   n = 0;
-            targv[n++] = translator;
-            targv[n++] = (char *)module;
-            targv[n++] = (char *)"-o";
-            targv[n++] = (char *)cli.output;
-            if (cli.heap_reserve)  targv[n++] = (char *)cli.heap_reserve;
-            if (cli.stack_reserve) targv[n++] = (char *)cli.stack_reserve;
-            if (cli.rom)           targv[n++] = (char *)cli.rom;
-            for (int k = 0; k < cli.region_count; ++k)
-                targv[n++] = (char *)cli.regions[k];
-            targv[n] = NULL;
+        char *targv[16 + MAX_REGIONS];
+        int   n = 0;
+        targv[n++] = translator;
+        targv[n++] = (char *)module;
+        targv[n++] = (char *)"-o";
+        targv[n++] = (char *)cli.output;
+        if (cli.heap_reserve)  targv[n++] = (char *)cli.heap_reserve;
+        if (cli.stack_reserve) targv[n++] = (char *)cli.stack_reserve;
+        if (cli.rom)           targv[n++] = (char *)cli.rom;
+        for (int k = 0; k < cli.region_count; ++k)
+            targv[n++] = (char *)cli.regions[k];
+        targv[n] = NULL;
 
-            trc = run_cmd(&cli, targv);
-            free(translator);
-            if (trc != 0)
-                fprintf(stderr, "cvm-cc: cvm-translate failed (exit %d)\n", trc);
-        }
+        trc = run_cmd(&cli, targv);
+        if (trc != 0)
+            fprintf(stderr, "cvm-cc: cvm-translate failed (exit %d)\n", trc);
     }
+    free(translator);
 
     /* Clean up intermediates unless the user asked to keep them. */
     if (!cli.keep_bc) {

@@ -27,6 +27,11 @@
  * llvm_c_compat.cpp. See that file for the implementation. */
 extern LLVMValueRef cvm_llvm_get_switch_case_value(LLVMValueRef SI, unsigned i);
 
+/* Exit code from --probe-runtime meaning "this module uses double and needs
+ * the soft-float runtime linked". Distinct from 0 (no runtime needed) and the
+ * 1/2 used for IO/usage errors. cvm-cc relies on this exact value. */
+#define CVM_PROBE_F64 10
+
 static int g_errors = 0;
 
 static void diag_v(const char *func, const char *fmt, ...) {
@@ -5059,9 +5064,37 @@ int cvm_fuzz_translate_buffer(const uint8_t *data, size_t len) {
 }
 
 #ifndef CVM_NO_TRANSLATOR_MAIN
+/* True if any defined function uses the `double` type (as an instruction
+ * result or operand). Such a module needs the soft-float runtime linked in;
+ * cvm-cc consults this (via --probe-runtime) to auto-link cvm_float64_rt.c
+ * only when needed, so integer-only modules carry no soft-float code. */
+static int module_uses_f64(LLVMModuleRef mod) {
+    for (LLVMValueRef fn = LLVMGetFirstFunction(mod);
+         fn; fn = LLVMGetNextFunction(fn))
+    {
+        if (LLVMIsDeclaration(fn)) continue;
+        for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn);
+             bb; bb = LLVMGetNextBasicBlock(bb))
+        {
+            for (LLVMValueRef i = LLVMGetFirstInstruction(bb);
+                 i; i = LLVMGetNextInstruction(i))
+            {
+                if (cg_type_is_f64(LLVMTypeOf(i))) return 1;
+                unsigned n = LLVMGetNumOperands(i);
+                for (unsigned k = 0; k < n; ++k) {
+                    LLVMValueRef o = LLVMGetOperand(i, k);
+                    if (o && cg_type_is_f64(LLVMTypeOf(o))) return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *input  = NULL;
     const char *output = NULL;
+    int         probe_runtime = 0;   /* --probe-runtime: print needed runtimes */
     uint32_t    heap_reserve = 0;
     uint32_t    stack_reserve = 0;
     int         stack_reserve_set = 0;
@@ -5073,6 +5106,8 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-o") == 0) {
             if (i + 1 >= argc) { usage(); return 2; }
             output = argv[++i];
+        } else if (strcmp(argv[i], "--probe-runtime") == 0) {
+            probe_runtime = 1;
         } else if (strncmp(argv[i], "--heap-reserve=", 15) == 0) {
             if (parse_size(argv[i] + 15, &heap_reserve) != 0) {
                 fprintf(stderr, "translator: bad --heap-reserve value '%s'\n",
@@ -5141,6 +5176,21 @@ int main(int argc, char **argv) {
         return 1;
     }
     LLVMDisposeMemoryBuffer(buf);
+
+    /* Probe mode: report which runtime libraries the module needs, then exit
+     * without translating. Used by cvm-cc to auto-link the soft-float runtime
+     * only for modules that actually use `double`. The result is signalled via
+     * the EXIT CODE (cvm-cc doesn't capture stdout): CVM_PROBE_F64 means "needs
+     * the f64 soft-float runtime", 0 means "no runtime needed". A human-
+     * readable token is also printed. (Bitcode/IO errors above already
+     * returned 1, so the probe codes can't collide with those.) */
+    if (probe_runtime) {
+        int needs_f64 = module_uses_f64(mod);
+        if (needs_f64) printf("f64\n");
+        LLVMDisposeModule(mod);
+        LLVMContextDispose(ctx);
+        return needs_f64 ? CVM_PROBE_F64 : 0;
+    }
 
     size_t src_len = 0;
     const char *src = LLVMGetSourceFileName(mod, &src_len);

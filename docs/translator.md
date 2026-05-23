@@ -196,8 +196,11 @@ call) — the 64-bit calling convention is a later phase.
 consecutive frame slots), but its operations can't be open-coded inline, so
 each one is lowered to a **soft-float runtime call** into `cvm_float64_rt.c`
 (the `__cvm_f*` helpers, thin external wrappers over `cvm_float64.h`). cvm-cc
-links that TU into any module that uses `double`. Only `fneg`/`fabs` (a sign-bit
-flip), constants, and load/store are lowered inline.
+**auto-links** that TU into any module that uses `double` — it runs
+`cvm-translate --probe-runtime` on the compiled module (which exits
+`CVM_PROBE_F64` when a `double` appears) and adds the runtime to the link set
+only then, so integer-only programs carry no soft-float code. Only `fneg`/
+`fabs` (a sign-bit flip), constants, and load/store are lowered inline.
 
 The calls reuse clang's i386 ABI for `cvm_f64` — which the translator already
 handles — so no new ABI work was needed: a 64-bit argument is passed as two i32

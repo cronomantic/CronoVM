@@ -102,16 +102,16 @@ if(TARGET cvm-translate)
                          PROPERTIES FIXTURES_REQUIRED cvm_cc_bins)
 
     # f64 legalisation end-to-end: native `double` in f64_slice.c is lowered by
-    # the translator to soft-float runtime calls, linked here against
-    # cvm_float64_rt.c (the __cvm_f* helpers). Exercises sitofp/fadd/fsub/fmul/
-    # fcmp/fptosi/fptoui/fneg with caller-save spill across each call.
-    # f64_slice_main returns 0 on success for any seed.
+    # the translator to soft-float runtime calls. The runtime (cvm_float64_rt.c)
+    # is NOT listed here on purpose — cvm-cc AUTO-LINKS it after probing the
+    # module for double usage. Exercises sitofp/fadd/fsub/fmul/fcmp/fptosi/
+    # fptoui/fneg with caller-save spill across each call, plus the auto-link
+    # path. f64_slice_main returns 0 on success for any seed.
     set(_cvmcc_f64 ${CMAKE_CURRENT_BINARY_DIR}/cvm_cc_f64_slice.bin)
     add_custom_command(
         OUTPUT  ${_cvmcc_f64}
         COMMAND $<TARGET_FILE:cvm-cc>
                 ${_fixture_dir}/f64_slice.c
-                ${CVM_SOURCE_ROOT}/runtime/lib/cvm_float64_rt.c
                 -o ${_cvmcc_f64}
         DEPENDS cvm-cc cvm-translate
                 ${_fixture_dir}/f64_slice.c
@@ -137,7 +137,6 @@ if(TARGET cvm-translate)
         OUTPUT  ${_cvmcc_fma}
         COMMAND $<TARGET_FILE:cvm-cc>
                 ${_fixture_dir}/f64_fma.c
-                ${CVM_SOURCE_ROOT}/runtime/lib/cvm_float64_rt.c
                 -o ${_cvmcc_fma}
         DEPENDS cvm-cc cvm-translate
                 ${_fixture_dir}/f64_fma.c

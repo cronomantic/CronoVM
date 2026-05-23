@@ -10,6 +10,13 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **cvm-cc auto-links the soft-float runtime.** When a program uses `double`,
+  cvm-cc now links `cvm_float64_rt.c` automatically — `double` "just works"
+  without hand-listing the runtime TU. It runs the new `cvm-translate
+  --probe-runtime` on each compiled module (which exits `10`/`CVM_PROBE_F64`
+  when a `double` appears, `0` otherwise) and adds the runtime to the link set
+  only when needed, so integer-only programs link no soft-float code. Skipped
+  if the user already listed the runtime TU (no duplicate-symbol error).
 - **`f64` (double) legalisation in the translator (phase 2).** Native `double`
   is no longer rejected. It reuses the i64 two-slot storage, but since f64 ops
   can't be open-coded, each is lowered to a soft-float runtime CALL into the new
