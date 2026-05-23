@@ -293,23 +293,15 @@ static void validate_function(LLVMValueRef fn) {
     LLVMTypeRef ret_ty = LLVMGetReturnType(fnty);
     if (!type_in_subset(ret_ty, err, sizeof(err)))
         ERR(fn_name, "return type rejected: %s", err);
-    /* i64 is legal *inside* a function body (lowered to two 32-bit slots),
-     * but the calling convention for a 64-bit arg/return is not implemented
-     * yet (phase 3): an i64 param/return would be pre-allocated into a single
-     * register and silently lose its high word. Reject it explicitly. */
-    if (cg_type_is_wide(ret_ty))
-        ERR(fn_name, "64-bit return value (i64/f64) not yet supported "
-                     "(the 64-bit calling convention is a later phase)");
+    /* i64/f64 params and returns ARE supported (the 64-bit calling
+     * convention: a wide value occupies two argument words — R-pair or two
+     * stack words — and returns in R0:R1). */
 
     unsigned param_count = LLVMCountParams(fn);
     for (unsigned i = 0; i < param_count; ++i) {
         LLVMTypeRef pt = LLVMTypeOf(LLVMGetParam(fn, i));
         if (!type_in_subset(pt, err, sizeof(err)))
             ERR(fn_name, "parameter %u rejected: %s", i, err);
-        if (cg_type_is_wide(pt))
-            ERR(fn_name, "parameter %u: 64-bit argument (i64/f64) not yet "
-                         "supported (the 64-bit calling convention is a later "
-                         "phase)", i);
     }
 
     LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn);
@@ -1826,8 +1818,7 @@ static int32_t cg_val_slot_off(struct cg *cg, uint16_t slot) {
  * The 32-bit register file can't hold a 64-bit value, so an i64 SSA value
  * lives in TWO consecutive value-spill slots (lo at i64_slot[idx], hi at
  * i64_slot[idx]+1, contiguous in the frame). An i64 value never occupies a
- * register and never crosses a function boundary (args/returns are phase 3,
- * rejected in validate_function). It bridges to the 32-bit world only by
+ * register; it bridges to the 32-bit world only by
  * being produced from / consumed into 32-bit values: sext/zext widen, trunc/
  * icmp/store narrow. Each i64 operation is lowered to explicit lo/hi word
  * arithmetic here. Scratch registers for the lo/hi temporaries come from
@@ -1884,6 +1875,22 @@ static int cg_op_is_runtime_call(LLVMValueRef i, LLVMOpcode op) {
     default:
         return 0;
     }
+}
+
+/* True if `i` is an f64-returning CALL that cg_emit_f64_def handles directly
+ * (the soft-float intrinsics: fmuladd/fma/fabs/copysign/sqrt, plus a plain
+ * `sqrt`). Such calls are diverted to cg_emit_f64_def; every OTHER wide-
+ * returning call (a user or indirect function) goes through the generic
+ * LLVMCall handler and the R0:R1 64-bit return ABI. */
+static int cg_call_is_handled_f64_intrinsic(LLVMValueRef i) {
+    if (LLVMGetInstructionOpcode(i) != LLVMCall) return 0;
+    const char *cn = value_name(LLVMGetCalledValue(i));
+    return strcmp(cn, "llvm.fmuladd.f64")  == 0
+        || strcmp(cn, "llvm.fma.f64")      == 0
+        || strcmp(cn, "llvm.fabs.f64")     == 0
+        || strcmp(cn, "llvm.copysign.f64") == 0
+        || strcmp(cn, "llvm.sqrt.f64")     == 0
+        || strcmp(cn, "sqrt")              == 0;
 }
 
 /* SP-relative byte offset of the LO word of the i64 value at map index idx
@@ -2320,7 +2327,17 @@ static void cg_pre_alloc_function(struct cg *cg, LLVMValueRef fn) {
     unsigned np = LLVMCountParams(fn);
     for (unsigned i = 0; i < np; ++i) {
         LLVMValueRef p = LLVMGetParam(fn, i);
-        cg_assign(cg, p, cg_alloc_reg(cg));   /* R8..R(8+N-1) */
+        if (cg_type_is_wide(LLVMTypeOf(p))) {
+            /* A 64-bit param lives in two frame slots (like any wide value),
+             * fed from its two argument words by the prologue. It takes no
+             * SSA register. */
+            cg_assign(cg, p, (uint8_t)CG_REG_SPILLED);
+            int idx = cg->map_count - 1;
+            cg->i64_slot[idx] = (uint16_t)cg->val_spill_count;
+            cg->val_spill_count += 2;
+        } else {
+            cg_assign(cg, p, cg_alloc_reg(cg));   /* R8..R(8+N-1) */
+        }
     }
     /* zero_reg lives at the fixed CG_REG_ZERO (R253) across every
      * function — outside the spillable SSA range so callees can't
@@ -2801,6 +2818,72 @@ static void cg_emit_runtime_call(struct cg *cg, LLVMValueRef i, const char *name
         cg_emit(cg, enc_r(CVM_OP_MOV, dst_reg, 0, 0));
 }
 
+/* Number of argument WORDS a value of type `t` occupies in the calling
+ * convention: 2 for a 64-bit (i64/f64) value, 1 for any scalar. */
+static int cg_arg_words(LLVMTypeRef t) { return cg_type_is_wide(t) ? 2 : 1; }
+
+/* Place ONE argument word into its calling-convention destination during a
+ * user call. `av` is the argument value; `half` is -1 for a scalar arg (its
+ * single word) or 0/1 for the lo/hi word of a 64-bit arg. `wp` is the word's
+ * position in the flattened argument sequence: words < `n_reg_words` go into
+ * R[wp]; the rest are stored at [SP + (wp - n_reg_words)*4] (SP already
+ * dropped). `sp_bias` is added when reloading a spilled source. The emit
+ * scratch window is recycled (next_reg snapshot) so an arbitrary arg count
+ * never exhausts it. SSA sources are always >= R8 (or transient >= R230) and
+ * constants materialise into transients, so writing R0..R7 never clobbers an
+ * unconsumed source. */
+static void cg_place_arg_word(struct cg *cg, LLVMValueRef av, int half,
+                              unsigned wp, unsigned n_reg_words,
+                              int32_t sp_bias) {
+    int floor = cg->next_reg;
+    int      target_reg = (wp < n_reg_words);
+    uint8_t  rk         = (uint8_t)wp;                    /* if target_reg */
+    int32_t  stk_off    = (int32_t)(wp - n_reg_words) * 4;/* if !target_reg */
+
+    if (half < 0) {
+        /* scalar arg (one word) */
+        int aidx = cg_lookup(cg, av);
+        if (aidx >= 0 && cg->val_slot[aidx] != CG_NO_SLOT) {
+            int32_t voff = cg_val_slot_off(cg, cg->val_slot[aidx]) + sp_bias;
+            if (target_reg) { cg_ldw_sp_off(cg, rk, voff); cg->next_reg = floor; return; }
+            uint8_t s = cg_alloc_reg(cg); if (cg->had_error) { cg->next_reg = floor; return; }
+            if (cg_ldw_sp_off(cg, s, voff)) { cg->next_reg = floor; return; }
+            cg_stw_sp_off(cg, stk_off, s);
+            cg->next_reg = floor;
+            return;
+        }
+        uint8_t s = cg_reg_for(cg, av);
+        if (cg->had_error) { cg->next_reg = floor; return; }
+        if (target_reg) { if (s != rk) cg_emit(cg, enc_r(CVM_OP_MOV, rk, s, 0)); }
+        else            cg_stw_sp_off(cg, stk_off, s);
+        cg->next_reg = floor;
+        return;
+    }
+
+    /* one word of a 64-bit arg */
+    uint32_t clo, chi;
+    if (cg_wide_const_words(av, &clo, &chi) == 0) {
+        int32_t w = (int32_t)(half ? chi : clo);
+        if (target_reg) { cg_emit_load_const32(cg, rk, w); cg->next_reg = floor; return; }
+        uint8_t s = cg_alloc_reg(cg); if (cg->had_error) { cg->next_reg = floor; return; }
+        cg_emit_load_const32(cg, s, w);
+        cg_stw_sp_off(cg, stk_off, s);
+        cg->next_reg = floor;
+        return;
+    }
+    int aidx = cg_lookup(cg, av);
+    if (aidx < 0 || cg->i64_slot[aidx] == CG_NO_SLOT) {
+        ERR(cg->fn_name, "internal: 64-bit arg without a frame slot");
+        cg->had_error = 1; cg->next_reg = floor; return;
+    }
+    int32_t off = cg_i64_lo_off(cg, aidx) + half * 4 + sp_bias;
+    if (target_reg) { cg_ldw_sp_off(cg, rk, off); cg->next_reg = floor; return; }
+    uint8_t s = cg_alloc_reg(cg); if (cg->had_error) { cg->next_reg = floor; return; }
+    if (cg_ldw_sp_off(cg, s, off)) { cg->next_reg = floor; return; }
+    cg_stw_sp_off(cg, stk_off, s);
+    cg->next_reg = floor;
+}
+
 /* Lower an instruction whose RESULT is an f64 SSA value: arithmetic
  * (fadd/fsub/fmul/fdiv -> runtime call), fneg (inline sign flip), int/f32 ->
  * f64 conversions (sitofp/uitofp/fpext -> runtime call), and f64 load/const
@@ -3017,17 +3100,49 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
      * va_start can walk them. Non-variadic functions use the normal ABI:
      * first 8 params in the calling-convention regs, the 9th onward stacked. */
     int fn_is_vararg = LLVMIsFunctionVarArg(LLVMGlobalGetValueType(fn));
+    /* Argument WORD position (not param index): a 64-bit param occupies two
+     * consecutive words (lo, hi). Words 0..7 arrive in R0..R7 (non-vararg);
+     * words >= 8 (and all words of a vararg callee) sit on the stack at
+     * SP + frame + 4 + (word - 8 or word)*4. For scalar-only signatures word
+     * == param index, so this is byte-identical to the old prologue. */
+    unsigned word = 0;
+    cg->next_reg = cg->ssa_reg_high;   /* emit-scratch window for wide loads */
     for (unsigned p = 0; p < n_params; ++p) {
-        LLVMValueRef pv  = LLVMGetParam(fn, p);
-        uint8_t      dst = cg->regs[cg_lookup(cg, pv)];
-        if (!fn_is_vararg && p < 8) {
-            if (dst != p)
-                cg_emit(cg, enc_r(CVM_OP_MOV, dst, (uint8_t)p, 0));
+        LLVMValueRef pv   = LLVMGetParam(fn, p);
+        int          pidx = cg_lookup(cg, pv);
+        int          wide = (cg->i64_slot[pidx] != CG_NO_SLOT);
+        int          nw   = wide ? 2 : 1;
+        if (!wide) {
+            uint8_t dst = cg->regs[pidx];
+            if (!fn_is_vararg && word < 8) {
+                if (dst != word)
+                    cg_emit(cg, enc_r(CVM_OP_MOV, dst, (uint8_t)word, 0));
+            } else {
+                unsigned slot = fn_is_vararg ? word : (word - 8);
+                int32_t off = (int32_t)cg->frame_bytes + 4 + (int32_t)slot * 4;
+                if (cg_ldw_sp_off(cg, dst, off)) return 1;
+            }
         } else {
-            unsigned slot = fn_is_vararg ? p : (p - 8);
-            int32_t off = (int32_t)cg->frame_bytes + 4 + (int32_t)slot * 4;
-            if (cg_ldw_sp_off(cg, dst, off)) return 1;
+            /* Store each incoming word into the param's frame slot. */
+            int32_t loff = cg_i64_lo_off(cg, pidx);
+            for (int h = 0; h < 2; ++h) {
+                unsigned wpos = word + (unsigned)h;
+                if (!fn_is_vararg && wpos < 8) {
+                    if (cg_stw_sp_off(cg, loff + h * 4, (uint8_t)wpos))
+                        return 1;
+                } else {
+                    unsigned slot = fn_is_vararg ? wpos : (wpos - 8);
+                    int32_t inoff =
+                        (int32_t)cg->frame_bytes + 4 + (int32_t)slot * 4;
+                    cg->next_reg = cg->ssa_reg_high;
+                    uint8_t tmp = cg_alloc_reg(cg);
+                    if (cg->had_error) return 1;
+                    if (cg_ldw_sp_off(cg, tmp, inoff)) return 1;
+                    if (cg_stw_sp_off(cg, loff + h * 4, tmp)) return 1;
+                }
+            }
         }
+        word += (unsigned)nw;
     }
     cg_emit(cg, enc_i16(CVM_OP_MOVI, cg->zero_reg, 0));
 
@@ -3085,16 +3200,20 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
              * phi it carries no code at its def site — its slots are written
              * by the incoming-edge moves (cg_emit_phi_moves), so let it fall
              * through to the (empty) PHI case below. */
-            if (op != LLVMPHI && cg_type_is_i64(LLVMTypeOf(i))) {
+            if (op != LLVMPHI && op != LLVMCall
+                && cg_type_is_i64(LLVMTypeOf(i))) {
                 cg_emit_i64_def(cg, i, op);
                 if (cg->had_error) break;
                 continue;
             }
-            if (op != LLVMPHI && cg_type_is_f64(LLVMTypeOf(i))) {
+            if (op != LLVMPHI && cg_type_is_f64(LLVMTypeOf(i))
+                && (op != LLVMCall || cg_call_is_handled_f64_intrinsic(i))) {
                 cg_emit_f64_def(cg, i, op);
                 if (cg->had_error) break;
                 continue;
             }
+            /* A 64-bit-returning USER/indirect call falls through to the
+             * generic LLVMCall handler (the R0:R1 return ABI). */
 
             /* Spilled-DEF setup: if this instruction's result was spilled to
              * a frame slot, give the handler a transient register to compute
@@ -3744,10 +3863,19 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
 
             case LLVMRet: {
                 if (LLVMGetNumOperands(i) > 0) {
-                    uint8_t r = cg_reg_for(cg, LLVMGetOperand(i, 0));
-                    if (cg->had_error) break;
-                    if (r != 0)
-                        cg_emit(cg, enc_r(CVM_OP_MOV, 0, r, 0));
+                    LLVMValueRef rv = LLVMGetOperand(i, 0);
+                    if (cg_type_is_wide(LLVMTypeOf(rv))) {
+                        /* 64-bit return: lo -> R0, hi -> R1. */
+                        uint8_t lo, hi;
+                        if (cg_i64_read(cg, rv, &lo, &hi)) break;
+                        if (lo != 0) cg_emit(cg, enc_r(CVM_OP_MOV, 0, lo, 0));
+                        if (hi != 1) cg_emit(cg, enc_r(CVM_OP_MOV, 1, hi, 0));
+                    } else {
+                        uint8_t r = cg_reg_for(cg, rv);
+                        if (cg->had_error) break;
+                        if (r != 0)
+                            cg_emit(cg, enc_r(CVM_OP_MOV, 0, r, 0));
+                    }
                 }
                 if (cg_sp_add(cg, cg->frame_bytes)) break;
                 cg_emit(cg, enc_r(CVM_OP_RET, 0, 0, 0));
@@ -4620,9 +4748,16 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                  * normal callee uses the 8-in-regs convention. */
                 LLVMTypeRef call_fty = LLVMGetCalledFunctionType(i);
                 int call_is_vararg = call_fty && LLVMIsFunctionVarArg(call_fty);
-                unsigned n_in_reg  = call_is_vararg ? 0u
-                                   : (narg < 8 ? narg : 8);
-                unsigned n_stacked = narg - n_in_reg;
+                /* Word-based layout: a 64-bit arg takes two words. For
+                 * scalar-only calls total_words == narg, so this reduces to
+                 * the old per-arg scheme exactly. */
+                unsigned total_words = 0;
+                for (unsigned a = 0; a < narg; ++a)
+                    total_words += (unsigned)cg_arg_words(
+                                       LLVMTypeOf(LLVMGetOperand(i, a)));
+                unsigned n_reg_words = call_is_vararg ? 0u
+                                     : (total_words < 8 ? total_words : 8);
+                unsigned n_stacked_words = total_words - n_reg_words;
 
                 /* Argument lowering is done LAST (after caller-save spill and
                  * SP adjustment), one argument at a time, so we never need to
@@ -4686,68 +4821,37 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 }
                 if (cg->had_error) break;
 
-                /* SP drops by this many bytes for stacked args, so a
+                /* SP drops by this many bytes for stacked-arg words, so a
                  * value-spill slot at frame offset `off` is reachable at
                  * [SP_now + sp_bias + off] during the rest of the sequence.
                  * (The caller-save spill above ran BEFORE this drop, so it
                  * used the un-biased offsets — correct.) */
-                int32_t sp_bias = (int32_t)(n_stacked * 4u);
+                int32_t sp_bias = (int32_t)(n_stacked_words * 4u);
 
-                /* 2. Drop SP for the stacked args, then store each stacked
-                 *    arg (the 9th onward), one at a time. The emit scratch
-                 *    window is recycled per arg (next_reg snapshot/restore)
-                 *    so an arbitrary count never exhausts it. */
-                if (n_stacked > 0) {
-                    if (cg_sp_sub(cg, n_stacked * 4u)) break;
-                    int floor = cg->next_reg;
-                    for (unsigned k = 0; k < n_stacked; ++k) {
-                        cg->next_reg = floor;
-                        LLVMValueRef av = LLVMGetOperand(i, n_in_reg + k);
-                        int aidx = cg_lookup(cg, av);
-                        uint8_t srcr;
-                        if (aidx >= 0 && cg->val_slot[aidx] != CG_NO_SLOT) {
-                            /* spilled: reload from its (SP-biased) slot */
-                            srcr = cg_alloc_reg(cg);
-                            if (cg->had_error) break;
-                            int32_t voff = cg_val_slot_off(cg,
-                                              cg->val_slot[aidx]) + sp_bias;
-                            if (cg_ldw_sp_off(cg, srcr, voff)) break;
-                        } else {
-                            srcr = cg_reg_for(cg, av);   /* reg or constant */
-                            if (cg->had_error) break;
-                        }
-                        if (cg_stw_sp_off(cg, (int32_t)(k * 4u), srcr)) break;
-                    }
-                    cg->next_reg = floor;
-                    if (cg->had_error) break;
+                /* 2+3. Drop SP for the stacked words, then place every
+                 *      argument WORD at its calling-convention position
+                 *      (R0..R7 for words < n_reg_words, else the stack). A
+                 *      64-bit arg contributes two words (lo, hi). Register and
+                 *      stack placement may interleave safely: reg-arg sources
+                 *      are never R0..R7 and stack stores touch memory, so
+                 *      neither clobbers the other. cg_place_arg_word recycles
+                 *      the emit-scratch window per word. */
+                if (n_stacked_words > 0) {
+                    if (cg_sp_sub(cg, n_stacked_words * 4u)) break;
                 }
-
-                /* 3. Load first-8 args into R0..R7, one at a time. A spilled
-                 *    arg is LDW'd straight into its R0..R7 home (no shared
-                 *    reload reg); a register arg is MOV'd; a constant is
-                 *    materialised directly into R_k. SSA homes are >= R8 and
-                 *    we never read R0..R7 as a source, so writing R0..R7 in
-                 *    ascending order can't clobber a not-yet-consumed source
-                 *    — sequential lowering is safe. */
                 {
-                    int floor = cg->next_reg;
-                    for (unsigned k = 0; k < n_in_reg; ++k) {
-                        cg->next_reg = floor;
-                        LLVMValueRef av = LLVMGetOperand(i, k);
-                        int aidx = cg_lookup(cg, av);
-                        if (aidx >= 0 && cg->val_slot[aidx] != CG_NO_SLOT) {
-                            int32_t voff = cg_val_slot_off(cg,
-                                              cg->val_slot[aidx]) + sp_bias;
-                            if (cg_ldw_sp_off(cg, (uint8_t)k, voff)) break;
+                    unsigned wp = 0;
+                    for (unsigned a = 0; a < narg && !cg->had_error; ++a) {
+                        LLVMValueRef av = LLVMGetOperand(i, a);
+                        if (cg_type_is_wide(LLVMTypeOf(av))) {
+                            cg_place_arg_word(cg, av, 0, wp,     n_reg_words, sp_bias);
+                            cg_place_arg_word(cg, av, 1, wp + 1, n_reg_words, sp_bias);
+                            wp += 2;
                         } else {
-                            uint8_t srcr = cg_reg_for(cg, av);
-                            if (cg->had_error) break;
-                            if (srcr != k)
-                                cg_emit(cg, enc_r(CVM_OP_MOV,
-                                                  (uint8_t)k, srcr, 0));
+                            cg_place_arg_word(cg, av, -1, wp, n_reg_words, sp_bias);
+                            wp += 1;
                         }
                     }
-                    cg->next_reg = floor;
                     if (cg->had_error) break;
                 }
 
@@ -4776,9 +4880,9 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 }
                 cg->has_calls = 1;
 
-                /* 5. Pop stacked args (caller cleans). */
-                if (n_stacked > 0) {
-                    if (cg_sp_add(cg, n_stacked * 4u)) break;
+                /* 5. Pop stacked-arg words (caller cleans). */
+                if (n_stacked_words > 0) {
+                    if (cg_sp_add(cg, n_stacked_words * 4u)) break;
                 }
 
                 /* 6. Restore the same registers we spilled in step 1
@@ -4796,10 +4900,17 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 }
                 if (cg->had_error) break;
 
-                /* 7. Move R0 into the call's SSA home (after restore so
-                 *    the restore doesn't clobber the just-set return). */
+                /* 7. Take the return value (after restore so it isn't
+                 *    clobbered). A 64-bit return arrives in R0:R1 (lo:hi) and
+                 *    is stored to the result's two frame slots; a scalar
+                 *    return is MOV'd from R0 into its SSA home. */
                 LLVMTypeRef rty = LLVMTypeOf(i);
-                if (LLVMGetTypeKind(rty) != LLVMVoidTypeKind) {
+                if (cg_type_is_wide(rty)) {
+                    int ridx = cg_lookup(cg, i);
+                    int32_t off = cg_i64_lo_off(cg, ridx);
+                    if (cg_stw_sp_off(cg, off,     0)) break;
+                    if (cg_stw_sp_off(cg, off + 4, 1)) break;
+                } else if (LLVMGetTypeKind(rty) != LLVMVoidTypeKind) {
                     uint8_t dst = cg->regs[cg_lookup(cg, i)];
                     if (dst != 0)
                         cg_emit(cg, enc_r(CVM_OP_MOV, dst, 0, 0));

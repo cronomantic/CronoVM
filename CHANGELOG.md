@@ -10,6 +10,22 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **64-bit calling convention (phase 3 — completes i64/f64).** `i64`/`double`
+  may now be function arguments and return values, across real calls. The
+  convention is word-based and generalises the scalar one (no-64-bit
+  signatures get byte-identical code): arguments fill word positions, a 64-bit
+  value taking two consecutive words (lo, hi) — words 0–7 in `R0..R7`, the rest
+  on the stack, straddling allowed; a 64-bit return comes back in `R0`(lo):`R1`
+  (hi). The callee prologue reads each argument word into its param's home
+  (register for a scalar, two frame slots for a 64-bit param); `ret` of a wide
+  value loads its slots into R0:R1; a wide-returning call stores R0:R1 into the
+  result's slots. Distinct from the soft-runtime helpers' `sret` ABI (those
+  stay void + i32/pointer). With this the i64/f64 legaliser is complete — a
+  stock `double`/`long long` C interface translates and runs. New e2e fixture
+  `abi64` (i64/f64 params+returns, mixed scalar/wide args, five-i64 args that
+  straddle to the stack, nested wide calls). Removed the obsolete
+  `translator_reject_double` test (double is no longer rejected). Full suite
+  120/120; DOOM rebuilds unchanged.
 - **64-bit `phi`, `select`, variable shifts, and `sqrt` (completes the in-body
   64-bit surface).** Loop-carried `i64`/`double` `phi`s now work (the phi-move
   pass emits a lo and a hi word-move per wide phi, reusing the scalar parallel-

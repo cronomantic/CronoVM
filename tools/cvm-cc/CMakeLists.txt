@@ -205,4 +205,31 @@ if(TARGET cvm-translate)
              COMMAND test_e2e ${_cvmcc_gaps} 0 0)
     set_tests_properties(e2e_cvm_cc_i64f64_gaps
                          PROPERTIES FIXTURES_REQUIRED cvm_cc_bins)
+
+    # 64-bit calling convention (phase 3): i64/f64 as function args and return
+    # values across real (noinline) calls — incl. mixed scalar/wide args and
+    # five-i64 args that straddle to the stack. Runtimes auto-linked as needed.
+    # abi64_main returns 0 on success for any seed.
+    set(_cvmcc_abi ${CMAKE_CURRENT_BINARY_DIR}/cvm_cc_abi64.bin)
+    add_custom_command(
+        OUTPUT  ${_cvmcc_abi}
+        COMMAND $<TARGET_FILE:cvm-cc>
+                ${_fixture_dir}/abi64.c
+                -o ${_cvmcc_abi}
+        DEPENDS cvm-cc cvm-translate
+                ${_fixture_dir}/abi64.c
+                ${CVM_SOURCE_ROOT}/runtime/lib/cvm_int64_rt.c
+                ${CVM_SOURCE_ROOT}/runtime/lib/cvm_float64_rt.c
+        VERBATIM
+    )
+    add_custom_target(cvm_cc_abi64_round_trip DEPENDS ${_cvmcc_abi})
+    add_test(NAME cvm_cc_compile_abi64
+             COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+                                      --target cvm_cc_abi64_round_trip)
+    set_tests_properties(cvm_cc_compile_abi64
+                         PROPERTIES FIXTURES_SETUP cvm_cc_bins)
+    add_test(NAME e2e_cvm_cc_abi64
+             COMMAND test_e2e ${_cvmcc_abi} 0 0)
+    set_tests_properties(e2e_cvm_cc_abi64
+                         PROPERTIES FIXTURES_REQUIRED cvm_cc_bins)
 endif()

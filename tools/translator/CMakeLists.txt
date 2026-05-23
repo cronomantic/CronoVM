@@ -141,7 +141,7 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
              fib_recursive many_args alloca_swap fnptr fnptr_export
              dispatch_table const_gep reg_pressure float_mem struct_init reg_reuse
              narrow_ops narrow_cmp mem_intrin long_branch switch_dispatch
-             switch_table switch_neg_table spill_loop vararg globptr lower_intrin fsh_narrow unreachable reject_double
+             switch_table switch_neg_table spill_loop vararg globptr lower_intrin fsh_narrow unreachable
              spill_many spill_crossblock spill_call phi_loop_exit ctpop)
     set(_src ${_fixture_dir}/${name}.c)
     set(_bc  ${_fixture_out}/${name}.bc)
@@ -259,12 +259,6 @@ add_test(NAME translator_parse_add
          COMMAND $<TARGET_FILE:cvm-translate> ${_fixture_out}/add.bc)
 set_tests_properties(translator_parse_add
                      PROPERTIES FIXTURES_REQUIRED bc_fixtures)
-
-add_test(NAME translator_reject_double
-         COMMAND $<TARGET_FILE:cvm-translate> ${_fixture_out}/reject_double.bc)
-set_tests_properties(translator_reject_double PROPERTIES
-                     FIXTURES_REQUIRED bc_fixtures
-                     WILL_FAIL TRUE)
 
 add_test(NAME translator_emit_fixtures
          COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}

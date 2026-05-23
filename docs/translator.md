@@ -23,10 +23,11 @@ liveness-based spill at every call site, and post-emission
 branch relaxation**. `i64` and `double` are both legalised inside a
 function body now — `i64` to inline 32-bit word pairs, `double` to
 soft-float runtime calls (see "64-bit integer legalisation" and "f64
-legalisation"). Both 64-bit surfaces are complete *inside a function body*
-(arithmetic incl. `mul`/`div`/`rem`/`sqrt`, compares, conversions, `phi`,
-`select`, variable shifts). The one remaining gap is the 64-bit calling
-convention — `i64`/`double` as a function argument or return value.
+legalisation"), **including across function boundaries** — a 64-bit value
+may be a function argument or return value (the 64-bit calling convention,
+below). The i64/f64 surface is now complete: arithmetic incl.
+`mul`/`div`/`rem`/`sqrt`, compares, conversions, `phi`, `select`, variable
+shifts, params and returns.
 
 `fib_recursive.bin` shrank from 135 to 51 instructions when
 liveness landed (62% fewer); a deeply recursive function with
@@ -90,7 +91,6 @@ the translator rejects with a clear message; that's a feature, not a bug.
 
 | Type | Reason |
 | ---- | ------ |
-| 64-bit values (`i64`/`double`) **across a function boundary** | the 64-bit calling convention (args / returns) is not implemented yet; `i64`/`f64` *inside* a function body are legalised (see below) |
 | integers wider than `i64` | not in the subset |
 | `half`, `fp128`, `x86_fp80`, etc. (`float` and `double` excepted) | not in the subset (`float` is first-class; `double` is legalised) |
 | vectors (`<N x T>`) | not in the subset; games target scalars |
@@ -200,10 +200,9 @@ Currently lowered `i64` operations:
 - **`phi`** — its two slots are written by the incoming-edge moves
   (`cg_emit_phi_moves` pushes a lo and a hi word-move per wide phi, sharing the
   scalar parallel-copy / conflict-staging machinery)
+- **params / returns / calls** — see "64-bit calling convention" below
 
-Not yet legalised (errors out): `i64` that crosses a function boundary
-(argument, return value, or `i64`-returning call) — the 64-bit calling
-convention is a later phase. Inside a function body the i64 surface is complete.
+The i64 surface is complete.
 
 ### f64 (double) legalisation
 
@@ -249,11 +248,36 @@ Lowered `f64` operations:
   without `-fno-math-errno`) → `__cvm_fsqrt` (Newton–Raphson, exponent-halving
   seed). `double` `phi` and `select` work like their i64 counterparts.
 
-Not yet lowered (clear error): the rarer `llvm.*.f64` math intrinsics (`sin`,
-`cos`, `exp`, …) and `double` across a function boundary (the 64-bit calling
-convention is a later phase). Inside a function body the f64 surface is complete.
+`double` `phi`, `select`, params, returns and calls work like their i64
+counterparts (see "64-bit calling convention"). Not yet lowered (clear error):
+the rarer `llvm.*.f64` math intrinsics (`sin`, `cos`, `exp`, …). The f64
+surface is otherwise complete.
 
-### Calling convention
+### 64-bit calling convention
+
+i64/f64 cross function boundaries on a **word-based** convention that
+generalises the scalar one (so a function with no 64-bit params/returns gets
+byte-identical code):
+
+- **Arguments** fill word positions 0,1,2,…; a scalar takes one word, a 64-bit
+  value takes two (lo then hi). Words 0–7 arrive in `R0..R7`; words ≥ 8 (and
+  every word of a variadic callee) sit on the stack. A 64-bit argument may
+  straddle the register/stack boundary — each word is placed independently
+  (`cg_place_arg_word`).
+- **Return** — a scalar comes back in `R0`; a 64-bit value in `R0` (lo) and
+  `R1` (hi). The callee's `ret` loads its two slots into R0:R1; the caller
+  stores R0:R1 into the result value's two slots.
+- **Callee prologue** reads each incoming argument word (from `R0..R7` or the
+  stack) into its parameter's home — a register for a scalar, two frame slots
+  for a 64-bit param.
+
+This is distinct from the soft-runtime helpers' ABI: `cvm_float64_rt` /
+`cvm_int64_rt` return a `cvm_f64`/`cvm_i64` *struct*, which clang lowers to an
+`sret` hidden pointer (the legaliser hands the result slot's address as that
+pointer) — those are void functions with i32/pointer params, not 64-bit
+returns. Only native `i64`/`double` signatures use the R0:R1 convention.
+
+### Calling convention (scalar)
 
 Register reservations:
 
