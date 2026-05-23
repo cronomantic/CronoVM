@@ -136,7 +136,7 @@ set(_fixture_out ${CMAKE_CURRENT_BINARY_DIR})
 
 set(_fixture_targets "")
 foreach(name add pick fib abs max divmod bitops counter sum_global
-             alloc_sum free_list regions mulh qdiv xor_i1 float_basic fsqrt
+             alloc_sum free_list regions mulh qdiv qdiv6432 xor_i1 float_basic fsqrt
              i64_basic f64_basic two_funcs
              fib_recursive many_args alloca_swap fnptr fnptr_export
              dispatch_table const_gep reg_pressure float_mem struct_init reg_reuse
@@ -194,7 +194,7 @@ endif()
 # Emit each .bin via the translator. Depends on cvm-translate + the .bc.
 set(_emit_targets "")
 foreach(name add pick fib abs max divmod bitops counter sum_global
-             mulh qdiv xor_i1 float_basic fsqrt i64_basic f64_basic
+             mulh qdiv qdiv6432 xor_i1 float_basic fsqrt i64_basic f64_basic
              two_funcs fib_recursive many_args
              alloca_swap fnptr fnptr_export dispatch_table const_gep reg_pressure float_mem struct_init reg_reuse
              narrow_ops narrow_cmp mem_intrin
@@ -292,6 +292,7 @@ add_test(NAME e2e_regions    COMMAND test_regions ${_fixture_out}/regions.bin)
 add_test(NAME e2e_allocator  COMMAND test_allocator ${_fixture_out}/add.bin)
 add_test(NAME e2e_mulh       COMMAND test_e2e ${_fixture_out}/mulh.bin  0 0)
 add_test(NAME e2e_qdiv       COMMAND test_e2e ${_fixture_out}/qdiv.bin  0 0)
+add_test(NAME e2e_qdiv6432   COMMAND test_e2e ${_fixture_out}/qdiv6432.bin  0 0)
 add_test(NAME e2e_xor_i1     COMMAND test_e2e ${_fixture_out}/xor_i1.bin 0 0)
 add_test(NAME e2e_float_basic COMMAND test_e2e ${_fixture_out}/float_basic.bin 0 0)
 add_test(NAME e2e_fsqrt       COMMAND test_e2e ${_fixture_out}/fsqrt.bin       0 0)

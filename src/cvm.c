@@ -812,6 +812,7 @@ static int cvm_exec_at(struct cvm_image *img,
         [CVM_OP_JMPR]    = &&L_JMPR,
         [CVM_OP_FSQRT]   = &&L_FSQRT,
         [CVM_OP_QDIV1616] = &&L_QDIV1616,
+        [CVM_OP_QDIV6432] = &&L_QDIV6432,
     };
 
 #  define DISPATCH() do {                                  \
@@ -1081,6 +1082,11 @@ static int cvm_exec_at(struct cvm_image *img,
         R[a] = (int32_t)(uint32_t)((((uint64_t)(uint32_t)R[b]) << 16)
                                    / (uint32_t)R[c]);
         DISPATCH();
+    L_QDIV6432:
+        if (R[c] == 0) return CVM_E_DIV_BY_ZERO;
+        R[a] = (int32_t)(uint32_t)(((((uint64_t)(uint32_t)R[a]) << 32)
+                                    | (uint32_t)R[b]) / (uint32_t)R[c]);
+        DISPATCH();
 
 #  undef DISPATCH
 
@@ -1333,6 +1339,11 @@ static int cvm_exec_at(struct cvm_image *img,
             if (R[c] == 0) return CVM_E_DIV_BY_ZERO;
             R[a] = (int32_t)(uint32_t)((((uint64_t)(uint32_t)R[b]) << 16)
                                        / (uint32_t)R[c]);
+            break;
+        case CVM_OP_QDIV6432:
+            if (R[c] == 0) return CVM_E_DIV_BY_ZERO;
+            R[a] = (int32_t)(uint32_t)(((((uint64_t)(uint32_t)R[a]) << 32)
+                                        | (uint32_t)R[b]) / (uint32_t)R[c]);
             break;
         default:
             return CVM_E_BAD_OPCODE;

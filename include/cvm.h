@@ -346,6 +346,18 @@ enum cvm_opcode {
      * `cvm_qdiv_16_16(a, b)`. Operands are unsigned magnitudes — callers
      * (e.g. DOOM's FixedDiv) apply sign and the overflow guard themselves. */
     CVM_OP_QDIV1616 = 0x38,
+
+    /* General 64/32 unsigned divide: R[A] = (u32)(((((u64)(u32)R[A]) << 32) |
+     * (u32)R[B]) / (u32)R[C]); traps on R[C]==0 like DIV/DIVU. R[A] is BOTH the
+     * high 32 bits of the dividend (an input) AND the destination — the tied
+     * operand keeps a 3-source/1-dest divide inside the 3-register encoding.
+     * The full-numerator sibling of QDIV1616 (whose numerator is fixed to
+     * R[B]<<16): here the numerator is an arbitrary 64-bit value, so one host
+     * 64/32 divide replaces a software 64-bit long division. Surfaced by the
+     * translator from `cvm_intrin_qdiv_64_32` (cvm_intrin.h), users call
+     * `cvm_qdiv_64_32(hi, lo, divisor)`. Operands are unsigned magnitudes —
+     * callers (e.g. DOOM's CVM_CrossDiv) apply the sign themselves. */
+    CVM_OP_QDIV6432 = 0x39,
 };
 
 #define CVM_REG_COUNT 256

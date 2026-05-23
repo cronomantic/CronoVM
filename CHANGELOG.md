@@ -10,6 +10,21 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **`QDIV6432` opcode (0x39) — general 64/32 unsigned divide.** Computes
+  `R[A] = (u32)(((((u64)(u32)R[A]) << 32) | (u32)R[B]) / (u32)R[C])` in one
+  host op, trapping on `R[C]==0` like `DIV`/`DIVU`. `A` is both the dividend's
+  high word and the destination (a tied operand), which lets a 3-source/1-dest
+  divide fit the 3-register encoding. Where `QDIV1616`'s numerator is fixed to
+  `R[B]<<16`, this takes an arbitrary 64-bit dividend in two halves, so a
+  software 64-bit long division collapses to a single instruction. Surfaced
+  from `cvm_intrin_qdiv_64_32(hi, lo, divisor)` (`runtime/lib/cvm_intrin.h`);
+  the translator stages it as `MOV tmp,hi; QDIV6432 tmp,lo,div; MOV dst,tmp`
+  so the divide can't be corrupted by the destination aliasing an input. New
+  e2e fixture `qdiv6432` (6 phases). Motivation: DOOM's `CVM_CrossDiv`
+  (a 32×32 product difference / divisor) was a 64-iteration software loop at
+  ~12.8% of in-level interpreter time; routing it through `QDIV6432` removed it
+  from the hot path (−12.4% total in-level instructions on E1M1).
+
 - **Optional interpreter self-time profiler (`-DCVM_PROFILE`).** Building
   `src/cvm.c` with `CVM_PROFILE` defined makes `cvm_exec_at` attribute every
   executed instruction to the currently-running FUNCS index, tracked with a

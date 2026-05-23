@@ -85,4 +85,18 @@ static inline uint32_t cvm_qdiv_16_16(uint32_t a, uint32_t b) {
     return cvm_intrin_qdiv_16_16(a, b);
 }
 
+/* General 64/32 unsigned divide: result = (((u64)hi << 32) | lo) / divisor,
+ * computed by the QDIV6432 opcode as one host 64/32 division. Where
+ * cvm_qdiv_16_16's numerator is fixed to a<<16, this takes the full 64-bit
+ * dividend in two halves — so an arbitrary 64-bit numerator (e.g. a 32×32
+ * product difference) divides in one op instead of a software 64-bit long
+ * division. `divisor == 0` traps (CVM_E_DIV_BY_ZERO). Operands are unsigned
+ * magnitudes; signed callers (e.g. DOOM's CVM_CrossDiv) apply the sign and
+ * any overflow guard around it. */
+extern uint32_t cvm_intrin_qdiv_64_32(uint32_t hi, uint32_t lo, uint32_t divisor);
+
+static inline uint32_t cvm_qdiv_64_32(uint32_t hi, uint32_t lo, uint32_t divisor) {
+    return cvm_intrin_qdiv_64_32(hi, lo, divisor);
+}
+
 #endif /* CVM_INTRIN_H */

@@ -75,6 +75,7 @@ an offset of `0` means "fall through to the next instruction".
 | 0x36 | `JMPR` | `A` | `pc = (u32)R[A]`, bounds-checked against `code_count`; jump-table dispatcher's primitive |
 | 0x37 | `FSQRT` | `A, B` | `R[A] = sqrtf(f32(R[B]))` — single-precision square root via the host's `sqrtf()`. NaN / negative inputs propagate to NaN; `sqrt(±0)=±0`; `sqrt(+Inf)=+Inf`. Surfaced from `cvm_intrin_fsqrt` (see [`runtime/lib/cvm_intrin.h`](../runtime/lib/cvm_intrin.h)) — users call `cvm_fsqrt(x)`. |
 | 0x38 | `QDIV1616` | `A, B, C` | `R[A] = (u32)((((u64)(u32)R[B]) << 16) / (u32)R[C])` — unsigned Q16.16 fixed-point divide in one host 64/32 op; traps on `R[C]==0`. The divide sibling of `MULH`'s Q16.16 multiply. Surfaced from `cvm_intrin_qdiv_16_16` — users call `cvm_qdiv_16_16(a, b)`. |
+| 0x39 | `QDIV6432` | `A, B, C` | `R[A] = (u32)(((((u64)(u32)R[A]) << 32) \| (u32)R[B]) / (u32)R[C])` — general unsigned 64/32 divide in one host op; traps on `R[C]==0`. `A` is the dividend's high word **and** the destination (tied operand), so a 3-source/1-dest divide fits the 3-register encoding. Where `QDIV1616`'s numerator is fixed to `R[B]<<16`, here it is an arbitrary 64-bit value. Surfaced from `cvm_intrin_qdiv_64_32` — users call `cvm_qdiv_64_32(hi, lo, divisor)`; the translator stages it as `MOV tmp,hi; QDIV6432 tmp,lo,div; MOV dst,tmp`. |
 
 ### Forms
 

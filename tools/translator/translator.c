@@ -3427,6 +3427,31 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                         cg_emit(cg, enc_r((uint8_t)one_arg_op, dst, src, 0));
                         break;
                     }
+
+                    /* General 64/32 divide: cvm_intrin_qdiv_64_32(hi, lo, div).
+                     * QDIV6432 ties the dividend-high to the destination reg, so
+                     * a 3-source/1-dest op fits the 3-register encoding. We stage
+                     * through a fresh temp (MOV hi -> tmp; QDIV6432 tmp,lo,div;
+                     * MOV tmp -> dst) so the divide can't be corrupted by dst
+                     * aliasing the lo/divisor operands. */
+                    if (strcmp(name, "cvm_intrin_qdiv_64_32") == 0) {
+                        if (LLVMGetNumArgOperands(i) != 3) {
+                            ERR(cg->fn_name, "%s expects 3 args, got %u", name,
+                                LLVMGetNumArgOperands(i));
+                            cg->had_error = 1;
+                            break;
+                        }
+                        uint8_t r_hi = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                        uint8_t r_lo = cg_reg_for(cg, LLVMGetOperand(i, 1));
+                        uint8_t r_dv = cg_reg_for(cg, LLVMGetOperand(i, 2));
+                        uint8_t dst  = cg->regs[cg_lookup(cg, i)];
+                        uint8_t tmp  = cg_alloc_reg(cg);
+                        if (cg->had_error) break;
+                        cg_emit(cg, enc_r(CVM_OP_MOV, tmp, r_hi, 0));
+                        cg_emit(cg, enc_r(CVM_OP_QDIV6432, tmp, r_lo, r_dv));
+                        cg_emit(cg, enc_r(CVM_OP_MOV, dst, tmp, 0));
+                        break;
+                    }
                 }
 
                 /* min/max family, any integer width. clang -O1 folds
