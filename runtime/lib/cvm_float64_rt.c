@@ -50,3 +50,27 @@ int32_t  __cvm_f_to_i32(cvm_f64 x)    { return cvm_d_to_i32(x); }
 uint32_t __cvm_f_to_u32(cvm_f64 x)    { return cvm_d_to_u32(x); }
 cvm_f64  __cvm_f_from_f32(float f)    { return cvm_d_from_f32(f); }   /* sret */
 float    __cvm_f_to_f32(cvm_f64 x)    { return cvm_d_to_f32(x); }
+
+/* --- sqrt (llvm.sqrt.f64) ---------------------------------------------- *
+ * Newton–Raphson y' = (y + x/y)/2 on a seed that halves x's exponent (so it
+ * is within ~a factor of sqrt(2) of the answer for any magnitude). From a
+ * worst-case relative error ~0.5 the quadratic iteration reaches < 2^-53 in
+ * five steps; six are used for margin. Each step costs one soft f64 divide,
+ * so this is intentionally for the rare double-sqrt — game code uses sqrtf
+ * (the single FSQRT opcode). Special cases match IEEE: sqrt(NaN)=NaN,
+ * sqrt(-0)=-0, sqrt(x<0)=NaN, sqrt(+Inf)=+Inf. */
+cvm_f64 __cvm_fsqrt(cvm_f64 x) {
+    if (cvm_d_isnan(x))  return CVM_D_NAN;
+    if (cvm_d_iszero(x)) return x;                  /* +0 -> +0, -0 -> -0 */
+    if (CVM_D_SIGN(x))   return CVM_D_NAN;          /* negative -> NaN    */
+    if (cvm_d_isinf(x))  return x;                  /* +Inf -> +Inf       */
+
+    int32_t se = ((int32_t)CVM_D_EXP(x) - 1023) >> 1;     /* halved exponent */
+    cvm_f64 y    = cvm_d_pack(0u, (uint32_t)(se + 1023), 0u, 0u);
+    cvm_f64 half = cvm_d_pack(0u, 1022u, 0u, 0u);         /* 0.5 */
+    for (int it = 0; it < 6; ++it) {
+        cvm_f64 q = cvm_d_div(x, y);
+        y = cvm_d_mul(cvm_d_add(y, q), half);
+    }
+    return y;
+}

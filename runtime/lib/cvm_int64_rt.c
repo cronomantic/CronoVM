@@ -78,3 +78,11 @@ cvm_i64 __cvm_smod64(cvm_i64 a, cvm_i64 b) {
     cvm__udivmod64(ua, ub, &r);
     return na ? cvm_i64_neg(r) : r;   /* remainder sign follows the dividend */
 }
+
+/* --- variable-amount shifts -------------------------------------------- *
+ * The translator lowers a CONSTANT i64 shift inline; a variable amount goes
+ * through these. The amount is passed as a cvm_i64 (LLVM shift operands share
+ * the value's type) — only its low word matters (shifts are mod 64). */
+cvm_i64 __cvm_shl64(cvm_i64 x, cvm_i64 n) { return cvm_u64_shl(x, n.lo); }
+cvm_i64 __cvm_shr64(cvm_i64 x, cvm_i64 n) { return cvm_u64_shr(x, n.lo); }
+cvm_i64 __cvm_sar64(cvm_i64 x, cvm_i64 n) { return cvm_i64_sar(x, n.lo); }

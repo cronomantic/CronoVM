@@ -179,4 +179,30 @@ if(TARGET cvm-translate)
              COMMAND test_e2e ${_cvmcc_md} 0 0)
     set_tests_properties(e2e_cvm_cc_i64_muldiv
                          PROPERTIES FIXTURES_REQUIRED cvm_cc_bins)
+
+    # i64/f64 completeness gaps: loop-carried i64 AND f64 phis, i64/f64 select,
+    # i64 variable-amount shifts (runtime), and llvm.sqrt.f64. Both runtimes are
+    # auto-linked. i64f64_gaps_main returns 0 on success for any seed.
+    set(_cvmcc_gaps ${CMAKE_CURRENT_BINARY_DIR}/cvm_cc_i64f64_gaps.bin)
+    add_custom_command(
+        OUTPUT  ${_cvmcc_gaps}
+        COMMAND $<TARGET_FILE:cvm-cc>
+                ${_fixture_dir}/i64f64_gaps.c
+                -o ${_cvmcc_gaps}
+        DEPENDS cvm-cc cvm-translate
+                ${_fixture_dir}/i64f64_gaps.c
+                ${CVM_SOURCE_ROOT}/runtime/lib/cvm_int64_rt.c
+                ${CVM_SOURCE_ROOT}/runtime/lib/cvm_float64_rt.c
+        VERBATIM
+    )
+    add_custom_target(cvm_cc_gaps_round_trip DEPENDS ${_cvmcc_gaps})
+    add_test(NAME cvm_cc_compile_i64f64_gaps
+             COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+                                      --target cvm_cc_gaps_round_trip)
+    set_tests_properties(cvm_cc_compile_i64f64_gaps
+                         PROPERTIES FIXTURES_SETUP cvm_cc_bins)
+    add_test(NAME e2e_cvm_cc_i64f64_gaps
+             COMMAND test_e2e ${_cvmcc_gaps} 0 0)
+    set_tests_properties(e2e_cvm_cc_i64f64_gaps
+                         PROPERTIES FIXTURES_REQUIRED cvm_cc_bins)
 endif()

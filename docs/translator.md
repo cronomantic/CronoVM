@@ -23,10 +23,10 @@ liveness-based spill at every call site, and post-emission
 branch relaxation**. `i64` and `double` are both legalised inside a
 function body now — `i64` to inline 32-bit word pairs, `double` to
 soft-float runtime calls (see "64-bit integer legalisation" and "f64
-legalisation") — including `i64` `mul` (inline) and `div`/`rem` (soft
-runtime). The remaining gaps are the 64-bit calling convention, `i64`
-`phi`/`select`/variable-shifts, and the less-common `llvm.*.f64` math
-intrinsics (`fmuladd`/`fma`/`fabs`/`copysign` are handled; `sqrt` etc. are not).
+legalisation"). Both 64-bit surfaces are complete *inside a function body*
+(arithmetic incl. `mul`/`div`/`rem`/`sqrt`, compares, conversions, `phi`,
+`select`, variable shifts). The one remaining gap is the 64-bit calling
+convention — `i64`/`double` as a function argument or return value.
 
 `fib_recursive.bin` shrank from 135 to 51 instructions when
 liveness landed (62% fewer); a deeply recursive function with
@@ -193,11 +193,17 @@ Currently lowered `i64` operations:
   auto-links that TU when a module uses i64 div/rem
 - **`freeze`** — identity (copy the two words); clang emits it to block poison
   propagation around the volatile/div operands
+- **variable-amount `shl`/`lshr`/`ashr`** — a soft runtime CALL into
+  `cvm_int64_rt.c` (`__cvm_{shl,shr,sar}64`); a constant amount stays inline
+- **`select`** — two parallel word-MOVs picked by the condition (the wide twin
+  of the i32 select's branch)
+- **`phi`** — its two slots are written by the incoming-edge moves
+  (`cg_emit_phi_moves` pushes a lo and a hi word-move per wide phi, sharing the
+  scalar parallel-copy / conflict-staging machinery)
 
-Not yet legalised (these still error out with a clear message): `i64`
-`phi`/`select`, variable-amount shifts, and any `i64` that crosses a function
-boundary (argument, return value, or `i64`-returning call) — the 64-bit calling
-convention is a later phase.
+Not yet legalised (errors out): `i64` that crosses a function boundary
+(argument, return value, or `i64`-returning call) — the 64-bit calling
+convention is a later phase. Inside a function body the i64 surface is complete.
 
 ### f64 (double) legalisation
 
@@ -239,11 +245,13 @@ Lowered `f64` operations:
   common shape; the two-rounding lowering matches the soft runtime's existing
   truncating-mul accuracy and `fmuladd`'s relaxed contract.
 - `llvm.fabs.f64` (inline sign-bit clear) / `llvm.copysign.f64` (inline)
+- `llvm.sqrt.f64` (or a plain `sqrt` call — the errno-setting form clang emits
+  without `-fno-math-errno`) → `__cvm_fsqrt` (Newton–Raphson, exponent-halving
+  seed). `double` `phi` and `select` work like their i64 counterparts.
 
-Not yet lowered (clear error): other `llvm.*.f64` math intrinsics (e.g.
-`llvm.sqrt.f64` — `cvm_float64.h` has no soft sqrt yet), `double` `phi`/
-`select`, and `double` across a function boundary (the 64-bit calling
-convention is a later phase).
+Not yet lowered (clear error): the rarer `llvm.*.f64` math intrinsics (`sin`,
+`cos`, `exp`, …) and `double` across a function boundary (the 64-bit calling
+convention is a later phase). Inside a function body the f64 surface is complete.
 
 ### Calling convention
 

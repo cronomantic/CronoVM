@@ -10,6 +10,17 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **64-bit `phi`, `select`, variable shifts, and `sqrt` (completes the in-body
+  64-bit surface).** Loop-carried `i64`/`double` `phi`s now work (the phi-move
+  pass emits a lo and a hi word-move per wide phi, reusing the scalar parallel-
+  copy / conflict-staging path). `select` of a wide value lowers to two
+  parallel word-MOVs. Variable-amount `i64` `shl`/`lshr`/`ashr` lower to a soft
+  runtime call (`__cvm_{shl,shr,sar}64`; constant amounts stay inline).
+  `llvm.sqrt.f64` (and the plain `sqrt` libcall clang emits without
+  `-fno-math-errno`) lowers to `__cvm_fsqrt` (Newton–Raphson, exponent-halving
+  seed). With this, the i64 and f64 surfaces are complete inside a function
+  body; the only remaining gap is the 64-bit calling convention. New e2e
+  fixture `i64f64_gaps`.
 - **`i64` multiply / divide / remainder (completes the i64 legaliser).**
   `i64` `mul` is lowered inline (`lo = al*bl`, `hi = mulhu(al,bl) + al*bh +
   ah*bl`, via `MUL`/`MULHU`). `udiv`/`sdiv`/`urem`/`srem` lower to a soft

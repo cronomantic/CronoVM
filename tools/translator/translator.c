@@ -132,6 +132,7 @@ static const char *opcode_name(LLVMOpcode op) {
 static int cg_type_is_i64(LLVMTypeRef t);
 static int cg_type_is_f64(LLVMTypeRef t);
 static int cg_type_is_wide(LLVMTypeRef t);
+static int cg_wide_const_words(LLVMValueRef v, uint32_t *lo, uint32_t *hi);
 
 static const char *type_kind_name(LLVMTypeKind k) {
     switch (k) {
@@ -1579,6 +1580,31 @@ static void cg_phi_write_from(struct cg *cg, unsigned dst_loc, uint8_t src) {
     }
 }
 
+/* Resolve a WIDE (i64/f64) phi source's lo/hi word locations: slot locs for a
+ * wide SSA value, materialised registers for a wide constant, the zero
+ * register for undef. Mirrors cg_phi_src_loc for the two-word case. */
+static void cg_phi_wide_src_locs(struct cg *cg, LLVMValueRef src,
+                                 unsigned *lo, unsigned *hi) {
+    int idx = cg_lookup(cg, src);
+    if (idx >= 0 && cg->i64_slot[idx] != CG_NO_SLOT) {
+        *lo = PHI_SLOT_FLAG | cg->i64_slot[idx];
+        *hi = PHI_SLOT_FLAG | (unsigned)(cg->i64_slot[idx] + 1);
+        return;
+    }
+    uint32_t clo, chi;
+    if (cg_wide_const_words(src, &clo, &chi) == 0) {
+        uint8_t rlo = cg_alloc_reg(cg); if (cg->had_error) return;
+        cg_emit_load_const32(cg, rlo, (int32_t)clo);
+        uint8_t rhi = cg_alloc_reg(cg); if (cg->had_error) return;
+        cg_emit_load_const32(cg, rhi, (int32_t)chi);
+        *lo = rlo; *hi = rhi;
+        return;
+    }
+    if (LLVMIsUndef(src)) { *lo = cg->zero_reg; *hi = cg->zero_reg; return; }
+    ERR(cg->fn_name, "internal: wide phi source without a slot or constant");
+    cg->had_error = 1;
+}
+
 static void cg_emit_phi_moves(struct cg *cg,
                               LLVMBasicBlockRef from, LLVMBasicBlockRef to)
 {
@@ -1604,16 +1630,33 @@ static void cg_emit_phi_moves(struct cg *cg,
                 cg->had_error = 1;
                 return;
             }
-            unsigned dst_loc = cg_phi_dst_loc(cg, phi_idx);
-            unsigned src_loc = cg_phi_src_loc(cg, LLVMGetIncomingValue(inst, k));
-            if (cg->had_error) return;
-            if (src_loc == dst_loc) break;       /* no-op */
-            if (nmoves >= (int)(sizeof moves / sizeof moves[0])) {
+            LLVMValueRef sval = LLVMGetIncomingValue(inst, k);
+            if (nmoves + 2 > (int)(sizeof moves / sizeof moves[0])) {
                 ERR(cg->fn_name,
                     "internal: too many phi moves on a single edge");
                 cg->had_error = 1;
                 return;
             }
+            if (cg->i64_slot[phi_idx] != CG_NO_SLOT) {
+                /* Wide (i64/f64) phi: two parallel word-moves into its slots.
+                 * They flow through the same conflict detection / staging as
+                 * scalar moves (slot locs are comparable). */
+                unsigned dlo = PHI_SLOT_FLAG | cg->i64_slot[phi_idx];
+                unsigned dhi = PHI_SLOT_FLAG |
+                               (unsigned)(cg->i64_slot[phi_idx] + 1);
+                unsigned slo, shi;
+                cg_phi_wide_src_locs(cg, sval, &slo, &shi);
+                if (cg->had_error) return;
+                if (slo != dlo) { moves[nmoves].src = slo;
+                                  moves[nmoves].dst = dlo; nmoves++; }
+                if (shi != dhi) { moves[nmoves].src = shi;
+                                  moves[nmoves].dst = dhi; nmoves++; }
+                break;
+            }
+            unsigned dst_loc = cg_phi_dst_loc(cg, phi_idx);
+            unsigned src_loc = cg_phi_src_loc(cg, sval);
+            if (cg->had_error) return;
+            if (src_loc == dst_loc) break;       /* no-op */
             moves[nmoves].src = src_loc;
             moves[nmoves].dst = dst_loc;
             nmoves++;
@@ -1824,13 +1867,19 @@ static int cg_op_is_runtime_call(LLVMValueRef i, LLVMOpcode op) {
         return cg_type_is_f64(LLVMTypeOf(LLVMGetOperand(i, 0)));
     case LLVMUDiv: case LLVMSDiv: case LLVMURem: case LLVMSRem:
         return cg_type_is_i64(LLVMTypeOf(i));   /* i64 div/rem -> runtime call */
+    case LLVMShl: case LLVMLShr: case LLVMAShr:
+        /* i64 shift by a VARIABLE amount -> runtime call (constant is inline). */
+        return cg_type_is_i64(LLVMTypeOf(i))
+            && !LLVMIsAConstantInt(LLVMGetOperand(i, 1));
     case LLVMCall: {
         /* llvm.fmuladd/fma.f64 lower to two runtime calls; fabs/copysign are
          * inline. Only the former are spill points. */
         if (!cg_type_is_f64(LLVMTypeOf(i))) return 0;
         const char *cn = value_name(LLVMGetCalledValue(i));
         return strcmp(cn, "llvm.fmuladd.f64") == 0
-            || strcmp(cn, "llvm.fma.f64") == 0;
+            || strcmp(cn, "llvm.fma.f64") == 0
+            || strcmp(cn, "llvm.sqrt.f64") == 0
+            || strcmp(cn, "sqrt") == 0;
     }
     default:
         return 0;
@@ -1920,6 +1969,29 @@ static void cg_emit_runtime_call(struct cg *cg, LLVMValueRef i,
                                  const char *name, LLVMValueRef *wide_args,
                                  int n_wide, LLVMValueRef scalar_arg,
                                  int ret_slot, uint8_t dst_reg);
+
+/* `select` of a wide (i64/f64) value: result = cond ? a : b, both 64-bit.
+ * Same branch shape as the i32 select but copying two words. `i` is the
+ * select instruction; `idx` its map index (result slots = cg->i64_slot[idx]). */
+static void cg_emit_wide_select(struct cg *cg, LLVMValueRef i, int idx) {
+    uint8_t cond = cg_reg_for(cg, LLVMGetOperand(i, 0));
+    if (cg->had_error) return;
+    uint8_t al, ah, bl, bh;
+    if (cg_i64_read(cg, LLVMGetOperand(i, 1), &al, &ah)) return;
+    if (cg_i64_read(cg, LLVMGetOperand(i, 2), &bl, &bh)) return;
+    uint8_t lo = cg_alloc_reg(cg); if (cg->had_error) return;
+    uint8_t hi = cg_alloc_reg(cg); if (cg->had_error) return;
+    /*   BEQ cond, zero, +3   ; cond==0 -> take the false (b) words
+     *   MOV lo, al ; MOV hi, ah ; JMP +2
+     *   MOV lo, bl ; MOV hi, bh */
+    cg_emit(cg, enc_br(CVM_OP_BEQ, cond, cg->zero_reg, 3));
+    cg_emit(cg, enc_r(CVM_OP_MOV, lo, al, 0));
+    cg_emit(cg, enc_r(CVM_OP_MOV, hi, ah, 0));
+    cg_emit(cg, enc_i24(CVM_OP_JMP, 2));
+    cg_emit(cg, enc_r(CVM_OP_MOV, lo, bl, 0));
+    cg_emit(cg, enc_r(CVM_OP_MOV, hi, bh, 0));
+    cg_i64_write(cg, idx, lo, hi);
+}
 
 /* Lower an instruction whose RESULT is an i64 SSA value: sext/zext/load, the
  * inline arithmetic/logic/shift/mul ops, and div/rem (a soft runtime call).
@@ -2023,6 +2095,9 @@ static void cg_emit_i64_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
         cg_i64_write(cg, idx, lo, hi);
         break;
     }
+    case LLVMSelect:
+        cg_emit_wide_select(cg, i, idx);
+        break;
     case LLVMUDiv: case LLVMSDiv: case LLVMURem: case LLVMSRem: {
         /* 64-bit divide/remainder is too large to open-code; lower to a
          * soft runtime call into cvm_int64_rt (sret result, like f64).
@@ -2038,8 +2113,14 @@ static void cg_emit_i64_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
     case LLVMLShr: case LLVMShl: case LLVMAShr: {
         LLVMValueRef amt_v = LLVMGetOperand(i, 1);
         if (!LLVMIsAConstantInt(amt_v)) {
-            ERR(cg->fn_name, "i64 variable-amount shift not yet supported");
-            cg->had_error = 1;
+            /* Variable amount: a soft runtime call. The amount is an i64 (LLVM
+             * shift operands share the value type); the helper uses its low
+             * word. Constant amounts stay inline below. */
+            const char *name = (op == LLVMShl)  ? "__cvm_shl64"
+                             : (op == LLVMLShr) ? "__cvm_shr64" : "__cvm_sar64";
+            LLVMValueRef a2[2] = { LLVMGetOperand(i, 0), amt_v };
+            cg_emit_runtime_call(cg, i, name, a2, 2, NULL,
+                                 (int)cg->i64_slot[idx], 0);
             return;
         }
         unsigned n = (unsigned)(LLVMConstIntGetZExtValue(amt_v) & 63u);
@@ -2785,6 +2866,9 @@ static void cg_emit_f64_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
         cg_i64_write(cg, idx, lo, hi);
         break;
     }
+    case LLVMSelect:
+        cg_emit_wide_select(cg, i, idx);
+        break;
     case LLVMCall: {
         /* f64-returning intrinsic calls. clang -O1 with the default
          * -ffp-contract=on synthesises llvm.fmuladd.f64 from `a*b±c`;
@@ -2803,6 +2887,15 @@ static void cg_emit_f64_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
             if (cg->had_error) break;
             LLVMValueRef add[2] = { i, LLVMGetOperand(i, 2) };
             cg_emit_runtime_call(cg, i, "__cvm_fadd", add, 2, NULL, slot, 0);
+            break;
+        }
+        /* `llvm.sqrt.f64` (clang with -fno-math-errno) or a plain `sqrt` call
+         * (the default, errno-setting form — in a freestanding VM there is no
+         * libm, so a double-returning `sqrt` is the math one). Both -> the
+         * soft sqrt helper. */
+        if (strcmp(cname, "llvm.sqrt.f64") == 0 || strcmp(cname, "sqrt") == 0) {
+            LLVMValueRef a1[1] = { LLVMGetOperand(i, 0) };
+            cg_emit_runtime_call(cg, i, "__cvm_fsqrt", a1, 1, NULL, slot, 0);
             break;
         }
         if (strcmp(cname, "llvm.fabs.f64") == 0) {
@@ -2987,12 +3080,17 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
              * result never needs the spilled-DEF machinery below). Insts that
              * merely CONSUME an i64 — trunc, icmp, store — keep their i32/void
              * result and are handled inside the switch. */
-            if (cg_type_is_i64(LLVMTypeOf(i))) {
+            /* A wide (i64/f64) RESULT lives in frame slots; lower it here and
+             * skip the generic switch. PHI is the exception: like a scalar
+             * phi it carries no code at its def site — its slots are written
+             * by the incoming-edge moves (cg_emit_phi_moves), so let it fall
+             * through to the (empty) PHI case below. */
+            if (op != LLVMPHI && cg_type_is_i64(LLVMTypeOf(i))) {
                 cg_emit_i64_def(cg, i, op);
                 if (cg->had_error) break;
                 continue;
             }
-            if (cg_type_is_f64(LLVMTypeOf(i))) {
+            if (op != LLVMPHI && cg_type_is_f64(LLVMTypeOf(i))) {
                 cg_emit_f64_def(cg, i, op);
                 if (cg->had_error) break;
                 continue;
