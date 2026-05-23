@@ -20,8 +20,10 @@ entry-block allocas with escaping pointers, i8/i16 memory ops,
 arbitrary 32-bit constants, a NULL-fn-pointer trap, the
 `llvm.memcpy`/`llvm.memset`/`llvm.memmove` block intrinsics,
 liveness-based spill at every call site, and post-emission
-branch relaxation**. The biggest remaining gaps are 64-bit and
-floating-point types.
+branch relaxation**. `i64` is now legalised to 32-bit word pairs
+inside a function body (see "64-bit integer legalisation"); the
+remaining gaps are the 64-bit calling convention, `i64`
+`mul`/`div`, and `f64` (soft-float).
 
 `fib_recursive.bin` shrank from 135 to 51 instructions when
 liveness landed (62% fewer); a deeply recursive function with
@@ -85,8 +87,9 @@ the translator rejects with a clear message; that's a feature, not a bug.
 
 | Type | Reason |
 | ---- | ------ |
-| `i64` and wider integers | deferred to int64 opcodes |
-| `half`, `float`, `double`, etc. | deferred to float64 opcodes |
+| `i64` **across a function boundary** | the 64-bit calling convention (args / returns) is not implemented yet; `i64` *inside* a function body is legalised (see below) |
+| integers wider than `i64` | not in the subset |
+| `half`, `double`, `fp128`, etc. (except `float`) | `f64` is deferred to the float64 legaliser; the others are out of the subset |
 | vectors (`<N x T>`) | not in the subset; games target scalars |
 | address spaces other than 0 | not supported |
 | `token`, `x86_amx`, target_ext | not in the subset |
@@ -152,6 +155,40 @@ naturally traps with `CVM_E_NULL_FUNC_PTR` when called instead of
 silently dispatching to the first user function.
 
 `extern` data globals still error out (no host-side data linking yet).
+
+### 64-bit integer legalisation
+
+The register file is 32-bit, so a 64-bit integer can't live in a register.
+Rather than reject `i64` outright, the translator **legalises** it: each `i64`
+SSA value occupies **two consecutive value-spill slots** in the frame (lo word
+at `i64_slot`, hi word at `i64_slot + 1`), and every `i64` operation is lowered
+to explicit lo/hi 32-bit word arithmetic. An `i64` value never occupies a
+register and is invisible to the linear-scan / caller-save spill machinery — it
+already lives in memory. It crosses to the 32-bit world only at the boundaries
+(`sext`/`zext` widen into it; `trunc`/`icmp`/`store` consume it).
+
+Currently lowered `i64` operations:
+
+- **`sext`** (`lo = src`, `hi = src >>(arith) 31`) and **`zext`**
+  (`lo = src`, `hi = 0`)
+- **`load`** / **`store`** — two 32-bit `LDW`/`STW` at `[ptr]` and `[ptr+4]`
+  (a constant `i64` store, e.g. clang's struct zero-init, takes the same path)
+- **`add`** / **`sub`** with carry / borrow propagated through `CMP_LTU`
+- **`and`** / **`or`** / **`xor`** word-wise
+- **`shl`** / **`lshr`** / **`ashr`** by a **constant** amount (the variable
+  case is not legalised yet), correct across the `<32`, `==32` and `33..63`
+  ranges
+- **`trunc` i64→iN** — keeps the lo word (masked for `N < 32`)
+- **`icmp`** — `eq`/`ne` combine the two word compares; the ordered predicates
+  decompose to `(ah <hi bh) | ((ah == bh) & (al <lo bl))` with a signed or
+  unsigned high-word compare and an unsigned low-word compare
+
+Not yet legalised (these still error out with a clear message): `i64`
+`mul`/`div`/`rem`, `i64` `phi`/`select`, variable-amount shifts, and any `i64`
+that crosses a function boundary (argument, return value, or `i64`-returning
+call) — the 64-bit calling convention is a later phase. `f64` is a separate
+follow-on that reuses this two-slot machinery but lowers to soft-float runtime
+calls (`cvm_float64.h`).
 
 ### Calling convention
 

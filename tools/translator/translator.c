@@ -161,11 +161,12 @@ static int type_in_subset(LLVMTypeRef t, char *err, size_t errlen) {
     case LLVMIntegerTypeKind: {
         unsigned bits = LLVMGetIntTypeWidth(t);
         if (bits == 1 || bits == 8 || bits == 16 || bits == 32) return 1;
-        if (bits == 64) {
-            snprintf(err, errlen,
-                     "i64 not yet supported (deferred to int64 opcodes)");
-            return 0;
-        }
+        /* i64 is legalised in codegen: a 64-bit value lives in two 32-bit
+         * frame slots and every i64 operation is lowered to explicit lo/hi
+         * word arithmetic (see cg_emit_i64_def). The ISA stays 32-bit. i64
+         * across a function boundary (args/returns) is NOT yet handled —
+         * validate_function rejects that separately. */
+        if (bits == 64) return 1;
         snprintf(err, errlen, "unsupported integer width: i%u", bits);
         return 0;
     }
@@ -279,12 +280,24 @@ static void validate_function(LLVMValueRef fn) {
     LLVMTypeRef ret_ty = LLVMGetReturnType(fnty);
     if (!type_in_subset(ret_ty, err, sizeof(err)))
         ERR(fn_name, "return type rejected: %s", err);
+    /* i64 is legal *inside* a function body (lowered to two 32-bit slots),
+     * but the calling convention for a 64-bit arg/return is not implemented
+     * yet (phase 3): an i64 param/return would be pre-allocated into a single
+     * register and silently lose its high word. Reject it explicitly. */
+    if (LLVMGetTypeKind(ret_ty) == LLVMIntegerTypeKind
+        && LLVMGetIntTypeWidth(ret_ty) == 64)
+        ERR(fn_name, "i64 return value not yet supported "
+                     "(64-bit calling convention is phase 3)");
 
     unsigned param_count = LLVMCountParams(fn);
     for (unsigned i = 0; i < param_count; ++i) {
         LLVMTypeRef pt = LLVMTypeOf(LLVMGetParam(fn, i));
         if (!type_in_subset(pt, err, sizeof(err)))
             ERR(fn_name, "parameter %u rejected: %s", i, err);
+        if (LLVMGetTypeKind(pt) == LLVMIntegerTypeKind
+            && LLVMGetIntTypeWidth(pt) == 64)
+            ERR(fn_name, "parameter %u: i64 argument not yet supported "
+                         "(64-bit calling convention is phase 3)", i);
     }
 
     LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn);
@@ -753,6 +766,13 @@ struct cg {
                              * spilled value has regs[idx]==CG_REG_SPILLED and
                              * val_slot[idx] = its frame slot. Parallel to
                              * vals/regs. */
+    uint16_t     *i64_slot; /* i64 legalisation: if != CG_NO_SLOT, this SSA
+                             * value is a 64-bit integer living in TWO
+                             * consecutive value-spill slots (lo at i64_slot,
+                             * hi at i64_slot+1). Such a value never occupies a
+                             * register: regs[idx]==CG_REG_SPILLED and
+                             * val_slot[idx]==CG_NO_SLOT so the normal spill
+                             * path ignores it. Parallel to vals/regs. */
     int           map_count;
     int           map_cap;
     int           next_reg;
@@ -992,13 +1012,16 @@ static uint8_t cg_assign(struct cg *cg, LLVMValueRef v, uint8_t r) {
                                       cg->map_cap * sizeof(*cg->regs));
         cg->val_slot = (uint16_t *)realloc(cg->val_slot,
                                       cg->map_cap * sizeof(*cg->val_slot));
-        if (!cg->vals || !cg->regs || !cg->val_slot) {
+        cg->i64_slot = (uint16_t *)realloc(cg->i64_slot,
+                                      cg->map_cap * sizeof(*cg->i64_slot));
+        if (!cg->vals || !cg->regs || !cg->val_slot || !cg->i64_slot) {
             perror("realloc"); exit(1);
         }
     }
     cg->vals[cg->map_count] = v;
     cg->regs[cg->map_count] = r;
     cg->val_slot[cg->map_count] = CG_NO_SLOT;
+    cg->i64_slot[cg->map_count] = CG_NO_SLOT;
     cg->map_count++;
     return r;
 }
@@ -1745,6 +1768,221 @@ static int32_t cg_val_slot_off(struct cg *cg, uint16_t slot) {
          + (int32_t)slot * 4;
 }
 
+/* --- i64 legalisation ----------------------------------------------------
+ * The 32-bit register file can't hold a 64-bit value, so an i64 SSA value
+ * lives in TWO consecutive value-spill slots (lo at i64_slot[idx], hi at
+ * i64_slot[idx]+1, contiguous in the frame). An i64 value never occupies a
+ * register and never crosses a function boundary (args/returns are phase 3,
+ * rejected in validate_function). It bridges to the 32-bit world only by
+ * being produced from / consumed into 32-bit values: sext/zext widen, trunc/
+ * icmp/store narrow. Each i64 operation is lowered to explicit lo/hi word
+ * arithmetic here. Scratch registers for the lo/hi temporaries come from
+ * cg_alloc_reg (the per-instruction emit-scratch window R230..R252), which is
+ * reset at the top of every instruction, so an i64 op's handful of temps
+ * never collides with a live SSA value. */
+
+static int cg_type_is_i64(LLVMTypeRef t) {
+    return LLVMGetTypeKind(t) == LLVMIntegerTypeKind
+        && LLVMGetIntTypeWidth(t) == 64;
+}
+
+/* SP-relative byte offset of the LO word of the i64 value at map index idx
+ * (the HI word is at +4). */
+static int32_t cg_i64_lo_off(struct cg *cg, int idx) {
+    return cg_val_slot_off(cg, cg->i64_slot[idx]);
+}
+
+/* Read i64 operand `v` into two fresh scratch registers (*lo, *hi). Handles a
+ * 64-bit constant (materialised lo/hi words) or an i64 SSA value (loaded from
+ * its two frame slots). Returns 0 on success, 1 on error (cg->had_error set). */
+static int cg_i64_read(struct cg *cg, LLVMValueRef v, uint8_t *lo, uint8_t *hi) {
+    if (LLVMIsAConstantInt(v)) {
+        unsigned long long k = LLVMConstIntGetZExtValue(v);
+        *lo = cg_alloc_reg(cg); if (cg->had_error) return 1;
+        cg_emit_load_const32(cg, *lo, (int32_t)(uint32_t)(k & 0xFFFFFFFFu));
+        *hi = cg_alloc_reg(cg); if (cg->had_error) return 1;
+        cg_emit_load_const32(cg, *hi, (int32_t)(uint32_t)(k >> 32));
+        return 0;
+    }
+    int idx = cg_lookup(cg, v);
+    if (idx < 0 || cg->i64_slot[idx] == CG_NO_SLOT) {
+        ERR(cg->fn_name, "internal: i64 operand without a frame slot");
+        cg->had_error = 1;
+        return 1;
+    }
+    int32_t off = cg_i64_lo_off(cg, idx);
+    *lo = cg_alloc_reg(cg); if (cg->had_error) return 1;
+    if (cg_ldw_sp_off(cg, *lo, off))     { cg->had_error = 1; return 1; }
+    *hi = cg_alloc_reg(cg); if (cg->had_error) return 1;
+    if (cg_ldw_sp_off(cg, *hi, off + 4)) { cg->had_error = 1; return 1; }
+    return 0;
+}
+
+/* Store (lo, hi) into the two frame slots of the i64 value being defined. */
+static int cg_i64_write(struct cg *cg, int idx, uint8_t lo, uint8_t hi) {
+    int32_t off = cg_i64_lo_off(cg, idx);
+    if (cg_stw_sp_off(cg, off,     lo)) { cg->had_error = 1; return 1; }
+    if (cg_stw_sp_off(cg, off + 4, hi)) { cg->had_error = 1; return 1; }
+    return 0;
+}
+
+/* Emit `dst = src <shift> amt` where amt is a small constant. `cv` is one of
+ * CVM_OP_SHL / CVM_OP_SHR / CVM_OP_SAR. The amount goes through R254 (the
+ * shift opcode takes its count in a register; no immediate form). */
+static void cg_shift_imm(struct cg *cg, uint8_t cv, uint8_t dst,
+                         uint8_t src, unsigned amt) {
+    cg_emit(cg, enc_i16(CVM_OP_MOVI, (uint8_t)CG_REG_SCRATCH, (int16_t)amt));
+    cg_emit(cg, enc_r(cv, dst, src, (uint8_t)CG_REG_SCRATCH));
+}
+
+/* Lower an instruction whose RESULT is an i64 SSA value (sext/zext/load and
+ * the i64 arithmetic/logic/shift ops). Called from the codegen dispatch
+ * before the generic register-based switch. The result is written to the
+ * value's two frame slots; nothing lands in a register. */
+static void cg_emit_i64_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
+    int idx = cg_lookup(cg, i);
+    if (idx < 0 || cg->i64_slot[idx] == CG_NO_SLOT) {
+        ERR(cg->fn_name, "internal: i64 def without a frame slot");
+        cg->had_error = 1;
+        return;
+    }
+
+    switch (op) {
+    case LLVMSExt: {
+        /* lo = src; hi = src >>(arith) 31  (sign replicated). */
+        uint8_t src = cg_reg_for(cg, LLVMGetOperand(i, 0));
+        if (cg->had_error) return;
+        uint8_t hi = cg_alloc_reg(cg); if (cg->had_error) return;
+        cg_shift_imm(cg, CVM_OP_SAR, hi, src, 31);
+        cg_i64_write(cg, idx, src, hi);
+        break;
+    }
+    case LLVMZExt: {
+        /* lo = src; hi = 0. */
+        uint8_t src = cg_reg_for(cg, LLVMGetOperand(i, 0));
+        if (cg->had_error) return;
+        cg_i64_write(cg, idx, src, cg->zero_reg);
+        break;
+    }
+    case LLVMLoad: {
+        /* lo = [ptr]; hi = [ptr + 4]. */
+        uint8_t addr = cg_reg_for(cg, LLVMGetOperand(i, 0));
+        if (cg->had_error) return;
+        uint8_t lo = cg_alloc_reg(cg); if (cg->had_error) return;
+        cg_emit(cg, enc_r(CVM_OP_LDW, lo, addr, 0));
+        cg_movi_scratch(cg, 4);
+        uint8_t a4 = cg_alloc_reg(cg); if (cg->had_error) return;
+        cg_emit(cg, enc_r(CVM_OP_ADD, a4, addr, (uint8_t)CG_REG_SCRATCH));
+        uint8_t hi = cg_alloc_reg(cg); if (cg->had_error) return;
+        cg_emit(cg, enc_r(CVM_OP_LDW, hi, a4, 0));
+        cg_i64_write(cg, idx, lo, hi);
+        break;
+    }
+    case LLVMAdd: case LLVMSub:
+    case LLVMAnd: case LLVMOr: case LLVMXor: {
+        uint8_t al, ah, bl, bh;
+        if (cg_i64_read(cg, LLVMGetOperand(i, 0), &al, &ah)) return;
+        if (cg_i64_read(cg, LLVMGetOperand(i, 1), &bl, &bh)) return;
+        uint8_t lo = cg_alloc_reg(cg); if (cg->had_error) return;
+        uint8_t hi = cg_alloc_reg(cg); if (cg->had_error) return;
+        if (op == LLVMAdd) {
+            /* lo = al + bl; carry = (lo <u al); hi = ah + bh + carry. */
+            uint8_t carry = cg_alloc_reg(cg); if (cg->had_error) return;
+            cg_emit(cg, enc_r(CVM_OP_ADD, lo, al, bl));
+            cg_emit(cg, enc_r(CVM_OP_CMP_LTU, carry, lo, al));
+            cg_emit(cg, enc_r(CVM_OP_ADD, hi, ah, bh));
+            cg_emit(cg, enc_r(CVM_OP_ADD, hi, hi, carry));
+        } else if (op == LLVMSub) {
+            /* borrow = (al <u bl); lo = al - bl; hi = ah - bh - borrow. */
+            uint8_t borrow = cg_alloc_reg(cg); if (cg->had_error) return;
+            cg_emit(cg, enc_r(CVM_OP_CMP_LTU, borrow, al, bl));
+            cg_emit(cg, enc_r(CVM_OP_SUB, lo, al, bl));
+            cg_emit(cg, enc_r(CVM_OP_SUB, hi, ah, bh));
+            cg_emit(cg, enc_r(CVM_OP_SUB, hi, hi, borrow));
+        } else {
+            uint8_t cv = (op == LLVMAnd) ? CVM_OP_AND
+                       : (op == LLVMOr)  ? CVM_OP_OR : CVM_OP_XOR;
+            cg_emit(cg, enc_r(cv, lo, al, bl));
+            cg_emit(cg, enc_r(cv, hi, ah, bh));
+        }
+        cg_i64_write(cg, idx, lo, hi);
+        break;
+    }
+    case LLVMLShr: case LLVMShl: case LLVMAShr: {
+        LLVMValueRef amt_v = LLVMGetOperand(i, 1);
+        if (!LLVMIsAConstantInt(amt_v)) {
+            ERR(cg->fn_name, "i64 variable-amount shift not yet supported");
+            cg->had_error = 1;
+            return;
+        }
+        unsigned n = (unsigned)(LLVMConstIntGetZExtValue(amt_v) & 63u);
+        uint8_t al, ah;
+        if (cg_i64_read(cg, LLVMGetOperand(i, 0), &al, &ah)) return;
+        uint8_t out_lo = 0, out_hi = 0;
+        if (op == LLVMShl) {
+            if (n == 0) { out_lo = al; out_hi = ah; }
+            else if (n < 32) {
+                /* hi = (ah << n) | (al >> (32-n)); lo = al << n. */
+                uint8_t t1 = cg_alloc_reg(cg); if (cg->had_error) return;
+                uint8_t t2 = cg_alloc_reg(cg); if (cg->had_error) return;
+                out_hi = cg_alloc_reg(cg); if (cg->had_error) return;
+                out_lo = cg_alloc_reg(cg); if (cg->had_error) return;
+                cg_shift_imm(cg, CVM_OP_SHL, t1, ah, n);
+                cg_shift_imm(cg, CVM_OP_SHR, t2, al, 32u - n);
+                cg_emit(cg, enc_r(CVM_OP_OR, out_hi, t1, t2));
+                cg_shift_imm(cg, CVM_OP_SHL, out_lo, al, n);
+            } else if (n == 32) {
+                out_hi = al; out_lo = cg->zero_reg;
+            } else { /* 33..63 */
+                out_hi = cg_alloc_reg(cg); if (cg->had_error) return;
+                cg_shift_imm(cg, CVM_OP_SHL, out_hi, al, n - 32u);
+                out_lo = cg->zero_reg;
+            }
+        } else {
+            /* LShr (logical, fill 0) and AShr (arithmetic, fill sign). */
+            uint8_t fill_op = (op == LLVMAShr) ? CVM_OP_SAR : CVM_OP_SHR;
+            if (n == 0) { out_lo = al; out_hi = ah; }
+            else if (n < 32) {
+                /* lo = (al >> n) | (ah << (32-n)); hi = ah >>(fill) n. */
+                uint8_t t1 = cg_alloc_reg(cg); if (cg->had_error) return;
+                uint8_t t2 = cg_alloc_reg(cg); if (cg->had_error) return;
+                out_lo = cg_alloc_reg(cg); if (cg->had_error) return;
+                out_hi = cg_alloc_reg(cg); if (cg->had_error) return;
+                cg_shift_imm(cg, CVM_OP_SHR, t1, al, n);
+                cg_shift_imm(cg, CVM_OP_SHL, t2, ah, 32u - n);
+                cg_emit(cg, enc_r(CVM_OP_OR, out_lo, t1, t2));
+                cg_shift_imm(cg, fill_op, out_hi, ah, n);
+            } else if (n == 32) {
+                out_lo = ah;
+                if (op == LLVMAShr) {
+                    out_hi = cg_alloc_reg(cg); if (cg->had_error) return;
+                    cg_shift_imm(cg, CVM_OP_SAR, out_hi, ah, 31);
+                } else {
+                    out_hi = cg->zero_reg;
+                }
+            } else { /* 33..63 */
+                out_lo = cg_alloc_reg(cg); if (cg->had_error) return;
+                cg_shift_imm(cg, fill_op, out_lo, ah, n - 32u);
+                if (op == LLVMAShr) {
+                    out_hi = cg_alloc_reg(cg); if (cg->had_error) return;
+                    cg_shift_imm(cg, CVM_OP_SAR, out_hi, ah, 31);
+                } else {
+                    out_hi = cg->zero_reg;
+                }
+            }
+        }
+        cg_i64_write(cg, idx, out_lo, out_hi);
+        break;
+    }
+    default:
+        ERR(cg->fn_name, "i64 operation '%s' not yet supported "
+                         "(mul/div/rem, phi, select and i64-returning calls "
+                         "are not legalised yet)", opcode_name(op));
+        cg->had_error = 1;
+        break;
+    }
+}
+
 /* Walk the entry block, register every static-size alloca, and reject any
  * dynamic alloca or alloca outside the entry block. Sets cg->alloca_bytes. */
 static int cg_collect_allocas(struct cg *cg, LLVMValueRef fn) {
@@ -1915,7 +2153,17 @@ static void cg_pre_alloc_function(struct cg *cg, LLVMValueRef fn) {
             int dst_reg = -1;
             int dst_spilled = 0;
             LLVMTypeRef ty = LLVMTypeOf(i);
-            if (LLVMGetTypeKind(ty) != LLVMVoidTypeKind) {
+            if (cg_type_is_i64(ty)) {
+                /* i64 result: claim TWO consecutive value-spill slots (lo, hi)
+                 * instead of a register. regs stays CG_REG_SPILLED and
+                 * val_slot stays CG_NO_SLOT, so the linear-scan spill / caller-
+                 * save protocol ignores it — the value lives purely in memory,
+                 * accessed via cg->i64_slot in cg_emit_i64_def. */
+                cg_assign(cg, i, (uint8_t)CG_REG_SPILLED);
+                int idx = cg->map_count - 1;
+                cg->i64_slot[idx] = (uint16_t)cg->val_spill_count;
+                cg->val_spill_count += 2;
+            } else if (LLVMGetTypeKind(ty) != LLVMVoidTypeKind) {
                 cg_assign(cg, i, (uint8_t)CG_REG_SPILLED); /* placeholder */
                 int idx = cg->map_count - 1;
                 dst_reg = cg_pre_alloc_def(cg, idx);
@@ -2326,6 +2574,18 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
             cg->next_reg = cg->ssa_reg_high;
             cg->cur_op = op;
 
+            /* i64 legalisation: an instruction whose RESULT is i64 lives in
+             * two frame slots, not a register, so lower it to lo/hi word ops
+             * here and skip the generic register-based path entirely (its
+             * result never needs the spilled-DEF machinery below). Insts that
+             * merely CONSUME an i64 — trunc, icmp, store — keep their i32/void
+             * result and are handled inside the switch. */
+            if (cg_type_is_i64(LLVMTypeOf(i))) {
+                cg_emit_i64_def(cg, i, op);
+                if (cg->had_error) break;
+                continue;
+            }
+
             /* Spilled-DEF setup: if this instruction's result was spilled to
              * a frame slot, give the handler a transient register to compute
              * into (drawn FIRST, before any operand reload, so it stays
@@ -2384,6 +2644,51 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
 
             case LLVMICmp: {
                 LLVMIntPredicate p = LLVMGetICmpPredicate(i);
+                /* i64 comparison: read both operands as lo/hi word pairs. */
+                if (cg_type_is_i64(LLVMTypeOf(LLVMGetOperand(i, 0)))) {
+                    uint8_t al, ah, bl, bh;
+                    if (cg_i64_read(cg, LLVMGetOperand(i, 0), &al, &ah)) break;
+                    if (cg_i64_read(cg, LLVMGetOperand(i, 1), &bl, &bh)) break;
+                    uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                    if (p == LLVMIntEQ || p == LLVMIntNE) {
+                        /* eq: (al==bl) & (ah==bh);  ne: (al!=bl) | (ah!=bh). */
+                        uint8_t tlo = cg_alloc_reg(cg); if (cg->had_error) break;
+                        uint8_t thi = cg_alloc_reg(cg); if (cg->had_error) break;
+                        uint8_t cmp  = (p == LLVMIntEQ) ? CVM_OP_CMP_EQ : CVM_OP_CMP_NE;
+                        uint8_t comb = (p == LLVMIntEQ) ? CVM_OP_AND    : CVM_OP_OR;
+                        cg_emit(cg, enc_r(cmp, tlo, al, bl));
+                        cg_emit(cg, enc_r(cmp, thi, ah, bh));
+                        cg_emit(cg, enc_r(comb, dst, tlo, thi));
+                        break;
+                    }
+                    /* Ordered compare. Normalise GT/GE to LT/LE by swapping
+                     * operands, then:
+                     *   a < b  ⟺  (ah <hi bh) | ((ah == bh) & (al <u bl))
+                     *   a <= b ⟺  (ah <hi bh) | ((ah == bh) & (al <=u bl))
+                     * The high word uses a SIGNED strict-less compare for the
+                     * signed predicates and unsigned for the unsigned ones; the
+                     * low word is ALWAYS unsigned. */
+                    int is_le     = (p == LLVMIntSLE || p == LLVMIntULE ||
+                                     p == LLVMIntSGE || p == LLVMIntUGE);
+                    int is_signed = (p == LLVMIntSLT || p == LLVMIntSLE ||
+                                     p == LLVMIntSGT || p == LLVMIntSGE);
+                    int swap      = (p == LLVMIntSGT || p == LLVMIntSGE ||
+                                     p == LLVMIntUGT || p == LLVMIntUGE);
+                    if (swap) { uint8_t t;
+                        t = al; al = bl; bl = t;
+                        t = ah; ah = bh; bh = t; }
+                    uint8_t hcmp = is_signed ? CVM_OP_CMP_LT : CVM_OP_CMP_LTU;
+                    uint8_t lcmp = is_le     ? CVM_OP_CMP_LEU : CVM_OP_CMP_LTU;
+                    uint8_t hi_lt = cg_alloc_reg(cg); if (cg->had_error) break;
+                    uint8_t hi_eq = cg_alloc_reg(cg); if (cg->had_error) break;
+                    uint8_t lo_r  = cg_alloc_reg(cg); if (cg->had_error) break;
+                    cg_emit(cg, enc_r(hcmp, hi_lt, ah, bh));
+                    cg_emit(cg, enc_r(CVM_OP_CMP_EQ, hi_eq, ah, bh));
+                    cg_emit(cg, enc_r(lcmp, lo_r, al, bl));
+                    cg_emit(cg, enc_r(CVM_OP_AND, lo_r, hi_eq, lo_r));
+                    cg_emit(cg, enc_r(CVM_OP_OR, dst, hi_lt, lo_r));
+                    break;
+                }
                 int swap = 0;
                 int op2 = icmp_to_op(p, &swap);
                 if (op2 < 0) {
@@ -2926,33 +3231,22 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 LLVMTypeRef  vty   = LLVMTypeOf(val_v);
                 LLVMTypeKind vk    = LLVMGetTypeKind(vty);
 
-                /* clang lowers struct/array zero-init and small copies with
-                 * 8-byte `store i64` chunks even on a 32-bit target. The VM
-                 * has no 64-bit register, but a *constant* i64 store (the
-                 * zero-init case) splits cleanly into two 32-bit word stores
-                 * at addr and addr+4. A dynamic i64 store can't arise — the
-                 * type subset rejects i64 SSA values. */
+                /* A 64-bit store splits into two 32-bit word stores at addr
+                 * and addr+4. The value is either a constant (clang lowers
+                 * struct/array zero-init and small copies as 8-byte `store i64`
+                 * chunks) or an i64 SSA value (legalised into frame slots);
+                 * cg_i64_read materialises lo/hi for both. */
                 if (vk == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(vty) == 64) {
-                    if (!LLVMIsAConstantInt(val_v)) {
-                        ERR(cg->fn_name, "store: dynamic i64 value unsupported "
-                                         "on a 32-bit VM");
-                        cg->had_error = 1;
-                        break;
-                    }
-                    unsigned long long cv = LLVMConstIntGetZExtValue(val_v);
                     uint8_t addr = cg_reg_for(cg, LLVMGetOperand(i, 1));
-                    uint8_t lo   = cg_alloc_reg(cg);
                     if (cg->had_error) break;
-                    cg_emit_load_const32(cg, lo, (int32_t)(cv & 0xFFFFFFFFu));
+                    uint8_t lo, hi;
+                    if (cg_i64_read(cg, val_v, &lo, &hi)) break;
                     cg_emit(cg, enc_r(CVM_OP_STW, 0, addr, lo));
                     /* high word at addr + 4 */
                     cg_movi_scratch(cg, 4);
                     uint8_t a4 = cg_alloc_reg(cg);
                     if (cg->had_error) break;
                     cg_emit(cg, enc_r(CVM_OP_ADD, a4, addr, (uint8_t)CG_REG_SCRATCH));
-                    uint8_t hi = cg_alloc_reg(cg);
-                    if (cg->had_error) break;
-                    cg_emit_load_const32(cg, hi, (int32_t)(cv >> 32));
                     cg_emit(cg, enc_r(CVM_OP_STW, 0, a4, hi));
                     break;
                 }
@@ -3004,10 +3298,40 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
              * is materialised via MOVI/MOVHI (no immediate AND). For
              * Trunc-to-i32 (legal but a no-op) we degenerate to a MOV. */
             case LLVMTrunc: {
-                uint8_t src = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                LLVMValueRef src_v = LLVMGetOperand(i, 0);
                 uint8_t dst = cg->regs[cg_lookup(cg, i)];
                 LLVMTypeRef dty = LLVMTypeOf(i);
                 unsigned dw = LLVMGetIntTypeWidth(dty);
+                /* trunc from i64: the result is just the LO word (the high
+                 * word is discarded). Load it straight into dst; a following
+                 * mask handles sub-i32 destinations below. */
+                if (cg_type_is_i64(LLVMTypeOf(src_v))) {
+                    if (LLVMIsAConstantInt(src_v)) {
+                        unsigned long long k = LLVMConstIntGetZExtValue(src_v);
+                        cg_emit_load_const32(cg, dst, (int32_t)(uint32_t)k);
+                    } else {
+                        int sidx = cg_lookup(cg, src_v);
+                        if (sidx < 0 || cg->i64_slot[sidx] == CG_NO_SLOT) {
+                            ERR(cg->fn_name, "trunc: i64 source without slot");
+                            cg->had_error = 1;
+                            break;
+                        }
+                        if (cg_ldw_sp_off(cg, dst, cg_i64_lo_off(cg, sidx))) {
+                            cg->had_error = 1;
+                            break;
+                        }
+                    }
+                    if (dw < 32) {
+                        uint32_t mask = (dw == 0) ? 0u
+                            : (uint32_t)(((uint64_t)1 << dw) - 1u);
+                        cg_emit_load_const32(cg, (uint8_t)CG_REG_SCRATCH,
+                                             (int32_t)mask);
+                        cg_emit(cg, enc_r(CVM_OP_AND, dst, dst,
+                                          (uint8_t)CG_REG_SCRATCH));
+                    }
+                    break;
+                }
+                uint8_t src = cg_reg_for(cg, src_v);
                 if (dw >= 32) {
                     if (src != dst)
                         cg_emit(cg, enc_r(CVM_OP_MOV, dst, src, 0));

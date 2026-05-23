@@ -10,6 +10,22 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **`i64` legalisation in the translator (phase 1).** Native 64-bit integers
+  are no longer rejected: code that uses `long long` inside a function body now
+  translates without hand-writing `cvm_int64.h`. Each `i64` SSA value lives in
+  **two consecutive value-spill slots** (lo/hi words) and every `i64` operation
+  is lowered to explicit 32-bit word arithmetic — no register ever holds 64
+  bits, so the ISA stays 32-bit (no new opcodes). Lowered: `sext`, `zext`,
+  `load`, `store` (incl. constant `i64` stores, the old struct-zero-init
+  special case), `add`/`sub` (carry/borrow via `CMP_LTU`), `and`/`or`/`xor`,
+  constant-amount `shl`/`lshr`/`ashr`, `trunc`, and `icmp` (eq/ne + all ordered
+  predicates). New e2e fixture `i64_slice` (sext + i64 const store + volatile
+  i64 load + add-with-carry + lshr 32 + trunc). **Not yet** legalised (clear
+  error): `i64` `mul`/`div`/`rem`, `phi`/`select`, variable-amount shifts, and
+  `i64` across a function boundary (args/returns — the 64-bit calling
+  convention is a later phase). `f64` is a follow-on that reuses the two-slot
+  machinery but lowers to `cvm_float64.h` soft-float calls. See
+  `docs/translator.md` → "64-bit integer legalisation".
 - **`QDIV6432` opcode (0x39) — general 64/32 unsigned divide.** Computes
   `R[A] = (u32)(((((u64)(u32)R[A]) << 32) | (u32)R[B]) / (u32)R[C])` in one
   host op, trapping on `R[C]==0` like `DIV`/`DIVU`. `A` is both the dividend's

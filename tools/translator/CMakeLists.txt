@@ -137,7 +137,7 @@ set(_fixture_out ${CMAKE_CURRENT_BINARY_DIR})
 set(_fixture_targets "")
 foreach(name add pick fib abs max divmod bitops counter sum_global
              alloc_sum free_list regions mulh qdiv qdiv6432 xor_i1 float_basic fsqrt
-             i64_basic f64_basic two_funcs
+             i64_basic f64_basic i64_slice two_funcs
              fib_recursive many_args alloca_swap fnptr fnptr_export
              dispatch_table const_gep reg_pressure float_mem struct_init reg_reuse
              narrow_ops narrow_cmp mem_intrin long_branch switch_dispatch
@@ -195,7 +195,7 @@ endif()
 set(_emit_targets "")
 foreach(name add pick fib abs max divmod bitops counter sum_global
              mulh qdiv qdiv6432 xor_i1 float_basic fsqrt i64_basic f64_basic
-             two_funcs fib_recursive many_args
+             i64_slice two_funcs fib_recursive many_args
              alloca_swap fnptr fnptr_export dispatch_table const_gep reg_pressure float_mem struct_init reg_reuse
              narrow_ops narrow_cmp mem_intrin
              long_branch switch_dispatch switch_table switch_neg_table
@@ -297,6 +297,11 @@ add_test(NAME e2e_xor_i1     COMMAND test_e2e ${_fixture_out}/xor_i1.bin 0 0)
 add_test(NAME e2e_float_basic COMMAND test_e2e ${_fixture_out}/float_basic.bin 0 0)
 add_test(NAME e2e_fsqrt       COMMAND test_e2e ${_fixture_out}/fsqrt.bin       0 0)
 add_test(NAME e2e_i64_basic   COMMAND test_e2e ${_fixture_out}/i64_basic.bin   0 0)
+# i64_slice: the i64-legaliser derisk slice — sext + i64 const store + volatile
+# i64 load + add(carry) + lshr 32 + trunc, all lowered to lo/hi word ops.
+# n=0 -> (0 + 0xFFFFFFFF)>>32 = 0; n=1 -> (1 + 0xFFFFFFFF)>>32 = 1.
+add_test(NAME e2e_i64_slice   COMMAND test_e2e ${_fixture_out}/i64_slice.bin    0 0)
+add_test(NAME e2e_i64_slice1  COMMAND test_e2e ${_fixture_out}/i64_slice.bin    1 1)
 add_test(NAME e2e_f64_basic   COMMAND test_e2e ${_fixture_out}/f64_basic.bin   0 0)
 # (cvm-cc's end-to-end test is registered in tools/cvm-cc/CMakeLists.txt
 # so the cvm-cc target exists when the test is being defined.)
@@ -425,7 +430,7 @@ set_tests_properties(
     e2e_abs_neg e2e_abs_pos e2e_max_lhs e2e_max_rhs
     e2e_divmod e2e_bitops e2e_counter e2e_sum_global e2e_alloc_sum
     e2e_free_list e2e_regions e2e_allocator e2e_mulh e2e_qdiv e2e_xor_i1 e2e_float_basic
-    e2e_fsqrt e2e_i64_basic e2e_f64_basic
+    e2e_fsqrt e2e_i64_basic e2e_f64_basic e2e_i64_slice e2e_i64_slice1
     e2e_two_funcs e2e_fib_rec_10 e2e_fib_rec_1 e2e_fib_rec_0
     e2e_many_args e2e_alloca_swap e2e_fnptr_add e2e_fnptr_sub e2e_fnptr_export
     e2e_const_gep e2e_reg_pressure e2e_float_mem e2e_struct_init
