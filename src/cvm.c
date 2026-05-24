@@ -17,7 +17,7 @@
 
 #define CVM_HEADER_SIZE   24u
 #define CVM_SECTION_SIZE  16u
-#define CVM_MAX_SEC_TYPE  10u
+#define CVM_MAX_SEC_TYPE  11u   /* includes CVM_SEC_META (host-only, ignored by loader) */
 #define CVM_REGION_ENTRY_SIZE 28u   /* name[16] + size + direction + flags */
 
 /* --- Optional self-time profiler (build with -DCVM_PROFILE) ---------------
@@ -217,6 +217,37 @@ int cvm_load(const void *bytes, size_t len, struct cvm_image *out) {
     return cvm_load_ex(bytes, len, out, NULL);
 }
 
+int cvm_peek_section(const void *bytes, size_t len, enum cvm_section_type type,
+                     const unsigned char **out_ptr, uint32_t *out_size)
+{
+    if (out_ptr)  *out_ptr  = NULL;
+    if (out_size) *out_size = 0;
+    if (!bytes || len < CVM_HEADER_SIZE) return -1;
+
+    const uint8_t *base = (const uint8_t *)bytes;
+    if (base[0] != 'C' || base[1] != 'V' || base[2] != 'M' || base[3] != '1')
+        return -1;
+
+    uint32_t section_count     = read_u32_le(base + 12);
+    uint32_t section_table_off = read_u32_le(base + 16);
+    uint64_t table_end = (uint64_t)section_table_off
+                       + (uint64_t)section_count * CVM_SECTION_SIZE;
+    if (table_end > len) return -1;
+
+    for (uint32_t i = 0; i < section_count; ++i) {
+        const uint8_t *sec = base + section_table_off + (size_t)i * CVM_SECTION_SIZE;
+        uint32_t t  = read_u32_le(sec);
+        uint32_t fo = read_u32_le(sec + 4);
+        uint32_t sz = read_u32_le(sec + 8);
+        if (t != (uint32_t)type) continue;
+        if ((uint64_t)fo + sz > len) return -1;
+        if (out_ptr)  *out_ptr  = base + fo;
+        if (out_size) *out_size = sz;
+        return 1;
+    }
+    return 0;
+}
+
 int cvm_load_ex(const void *bytes, size_t len, struct cvm_image *out,
                 const cvm_allocator_t *allocator)
 {
@@ -314,6 +345,7 @@ int cvm_load_ex(const void *bytes, size_t len, struct cvm_image *out,
             rom_off  = file_off;
             rom_size = size;
             break;
+        case CVM_SEC_META:   /* host-only metadata; range already validated, not loaded */
         case CVM_SEC_DEBUG:
         default:
             break;

@@ -76,6 +76,12 @@ enum cvm_section_type {
                                   * discovers base/size via cvm_sys_rom_base /
                                   * cvm_sys_rom_size. Read-only by convention
                                   * (the VM enforces only heap bounds). */
+    CVM_SEC_META          = 11,  /* host-only metadata blob (title/author/etc.).
+                                  * Opaque to the VM: the loader validates its
+                                  * range and otherwise ignores it (never copied
+                                  * into the heap). The host reads it from the
+                                  * file with cvm_peek_section() — typically
+                                  * before running, e.g. to populate a browser. */
 };
 
 enum cvm_region_dir {
@@ -459,6 +465,15 @@ struct cvm_image {
 int  cvm_load(const void *bytes, size_t len, struct cvm_image *out);
 void cvm_image_free(struct cvm_image *img);
 const char *cvm_strerror(int result);
+
+/* Locate one section's payload in a .bin WITHOUT loading the image (just parses
+ * the header + section table). Intended for host-only sections like CVM_SEC_META
+ * that should be inspected before running — e.g. a launcher reading a cart's
+ * title. On a match sets out_ptr and out_size (pointers into `bytes`) and returns
+ * 1; returns 0 if the section is absent, -1 if the file/header is malformed.
+ * Does not allocate. */
+int cvm_peek_section(const void *bytes, size_t len, enum cvm_section_type type,
+                     const unsigned char **out_ptr, uint32_t *out_size);
 
 /* ---------------------------------------------------------------------------
  * Pluggable allocator. Embedded targets often have no `malloc`, custom

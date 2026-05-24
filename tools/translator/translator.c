@@ -5007,6 +5007,7 @@ static int write_bin(const char *path,
                      int emit_funcs,
                      const struct cli_region *regions, int region_count,
                      const uint8_t *rom, uint32_t rom_size,
+                     const uint8_t *meta, uint32_t meta_size,
                      uint32_t entry)
 {
     FILE *f = fopen(path, "wb");
@@ -5074,7 +5075,8 @@ static int write_bin(const char *path,
                            + (stack_reserve_size > 0 ? 1u : 0u)
                            + (funcs_size         > 0 ? 1u : 0u)
                            + (regions_size       > 0 ? 1u : 0u)
-                           + (rom_size           > 0 ? 1u : 0u);
+                           + (rom_size           > 0 ? 1u : 0u)
+                           + (meta_size          > 0 ? 1u : 0u);
     uint32_t table_off = 24;
     uint32_t code_off  = table_off + section_count * 16;
     uint32_t code_size = code_count * 4u;
@@ -5089,6 +5091,9 @@ static int write_bin(const char *path,
     uint32_t rom_off     = rom_size > 0
                          ? code_off + code_size + data_size + imports_size
                                     + funcs_size + regions_size : 0;
+    uint32_t meta_off    = meta_size > 0
+                         ? code_off + code_size + data_size + imports_size
+                                    + funcs_size + regions_size + rom_size : 0;
 
     uint8_t hdr[24] = {0};
     hdr[0] = 'C'; hdr[1] = 'V'; hdr[2] = 'M'; hdr[3] = '1';
@@ -5162,6 +5167,14 @@ static int write_bin(const char *path,
         put_u32_le(sec + 12, 0u);
         fwrite(sec, sizeof(sec), 1, f);
     }
+    if (meta_size > 0) {
+        memset(sec, 0, sizeof(sec));
+        put_u32_le(sec + 0,  CVM_SEC_META);
+        put_u32_le(sec + 4,  meta_off);
+        put_u32_le(sec + 8,  meta_size);
+        put_u32_le(sec + 12, 0u);
+        fwrite(sec, sizeof(sec), 1, f);
+    }
 
     for (uint32_t i = 0; i < code_count; ++i) {
         uint8_t b[4];
@@ -5174,6 +5187,7 @@ static int write_bin(const char *path,
     if (funcs_size > 0)   fwrite(funcs_buf, 1, funcs_size, f);
     if (regions_size > 0) fwrite(regions_buf, 1, regions_size, f);
     if (rom_size > 0)     fwrite(rom, 1, rom_size, f);
+    if (meta_size > 0)    fwrite(meta, 1, meta_size, f);
     free(imports_buf);
     free(funcs_buf);
     free(regions_buf);
@@ -5203,6 +5217,7 @@ static void usage(void) {
             "                       chars) of SIZE bytes. DIR is r, w, or rw\n"
             "                       (default rw). Repeatable.\n"
             "  --rom=FILE           Bake FILE's bytes into the .bin as read-only\n"
+            "  --meta=FILE          Append FILE as a host-only CVM_SEC_META blob\n"
             "                       cartridge ROM (e.g. a game WAD). The program\n"
             "                       reads it via cvm_sys_rom_base/cvm_sys_rom_size.\n");
 }
@@ -5416,6 +5431,7 @@ int main(int argc, char **argv) {
     uint32_t    stack_reserve = 0;
     int         stack_reserve_set = 0;
     const char *rom_path = NULL;
+    const char *meta_path = NULL;
     struct cli_region cli_regions[MAX_CLI_REGIONS];
     int         cli_region_count = 0;
 
@@ -5461,6 +5477,8 @@ int main(int argc, char **argv) {
             cli_region_count++;
         } else if (strncmp(argv[i], "--rom=", 6) == 0) {
             rom_path = argv[i] + 6;
+        } else if (strncmp(argv[i], "--meta=", 7) == 0) {
+            meta_path = argv[i] + 7;
         } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
             fprintf(stderr, "translator: unknown option '%s'\n", argv[i]);
             return 2;
@@ -5614,6 +5632,35 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* --meta=FILE: opaque host-only metadata blob, appended as CVM_SEC_META. */
+        uint8_t *meta_buf = NULL;
+        uint32_t meta_size = 0;
+        if (rc == 0 && meta_path) {
+            FILE *mf = fopen(meta_path, "rb");
+            if (!mf) {
+                fprintf(stderr, "translator: cannot read --meta file '%s': %s\n",
+                        meta_path, strerror(errno));
+                rc = 1;
+            } else {
+                fseek(mf, 0, SEEK_END);
+                long n = ftell(mf);
+                rewind(mf);
+                if (n < 0 || (unsigned long)n > 0xFFFFFFFFu) {
+                    fprintf(stderr, "translator: --meta file '%s' too large\n", meta_path);
+                    rc = 1;
+                } else if (n > 0) {
+                    meta_buf = (uint8_t *)malloc((size_t)n);
+                    if (!meta_buf || fread(meta_buf, 1, (size_t)n, mf) != (size_t)n) {
+                        fprintf(stderr, "translator: failed reading --meta file '%s'\n", meta_path);
+                        rc = 1;
+                    } else {
+                        meta_size = (uint32_t)n;
+                    }
+                }
+                fclose(mf);
+            }
+        }
+
         if (rc == 0) {
             uint32_t entry_off = cg.funcs[main_idx].entry_offset;
             if (write_bin(output, cg.code, cg.count,
@@ -5624,16 +5671,19 @@ int main(int argc, char **argv) {
                           cg.has_calls || cg.funcs_referenced,
                           cli_regions, cli_region_count,
                           rom_buf, rom_size,
+                          meta_buf, meta_size,
                           entry_off) != 0)
             {
                 rc = 1;
             } else {
                 printf("translator: wrote %s (%u instructions, %u data bytes, "
                        "%d imports, %d funcs, %u heap-reserve, "
-                       "%u stack-reserve, %d regions, %u rom-bytes)\n",
+                       "%u stack-reserve, %d regions, %u rom-bytes, "
+                       "%u meta-bytes)\n",
                        output, cg.count, globals.data_size,
                        cg.import_count, cg.func_count,
-                       heap_reserve, stack_size, cli_region_count, rom_size);
+                       heap_reserve, stack_size, cli_region_count, rom_size,
+                       meta_size);
 
                 /* Optional symbol sidecar for the self-time profiler: with
                  * CVM_SYMS set, write "<output>.sym" mapping each FUNCS index
@@ -5668,6 +5718,7 @@ int main(int argc, char **argv) {
             }
         }
         free(rom_buf);
+        free(meta_buf);
         free(cg.code);
         free(cg.vals);
         free(cg.regs);
