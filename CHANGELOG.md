@@ -10,6 +10,15 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **Source locations (`file:line`) in translator diagnostics.** `cvm-cc` now
+  compiles each TU with `-gline-tables-only`, and the translator reads the
+  current instruction's debug location, so every rejection prints
+  `file:line: in 'func': message` instead of just the function name. No `.bin`
+  impact (debug metadata is dropped when VM bytecode is emitted); minimal
+  bitcode/compile overhead. Unsupported `llvm.*` intrinsics with no dedicated
+  lowering now say "unsupported intrinsic 'X'" rather than the misleading
+  "extern is not supported".
+
 - **64-bit calling convention (phase 3 — completes i64/f64).** `i64`/`double`
   may now be function arguments and return values, across real calls. The
   convention is word-based and generalises the scalar one (no-64-bit

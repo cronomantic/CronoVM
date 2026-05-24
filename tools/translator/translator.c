@@ -35,8 +35,22 @@ extern LLVMValueRef cvm_llvm_get_switch_case_value(LLVMValueRef SI, unsigned i);
 
 static int g_errors = 0;
 
+/* The instruction currently being lowered (set per-iteration by the codegen
+ * loop, cleared otherwise). diag_v reads its debug location so errors carry
+ * file:line — present only when the cart was built with line tables, i.e.
+ * cvm-cc passed -gline-tables-only; harmless (no prefix) otherwise. */
+static LLVMValueRef g_cur_inst = NULL;
+
 static void diag_v(const char *func, const char *fmt, ...) {
     fprintf(stderr, "translator: ");
+    if (g_cur_inst) {
+        unsigned line = LLVMGetDebugLocLine(g_cur_inst);
+        if (line) {
+            unsigned flen = 0;
+            const char *file = LLVMGetDebugLocFilename(g_cur_inst, &flen);
+            if (file && flen) fprintf(stderr, "%.*s:%u: ", (int)flen, file, line);
+        }
+    }
     if (func) fprintf(stderr, "in '%s': ", func);
     va_list ap;
     va_start(ap, fmt);
@@ -3175,6 +3189,7 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
              i && !cg->had_error; i = LLVMGetNextInstruction(i))
         {
             LLVMOpcode op = LLVMGetInstructionOpcode(i);
+            g_cur_inst = i;   /* for file:line in diagnostics */
 
             /* Recycle the transient scratch region (R[ssa_reg_high..]) at the
              * start of every instruction. cg_reg_for materialises constants,
@@ -4727,9 +4742,16 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 if (!is_indirect) {
                     callee_idx = cg_func_lookup(cg, callee_fn);
                     if (callee_idx < 0) {
-                        ERR(cg->fn_name,
-                            "call to '%s': callee has no definition in this "
-                            "module (extern is not supported)", name);
+                        if (name && strncmp(name, "llvm.", 5) == 0)
+                            ERR(cg->fn_name,
+                                "unsupported intrinsic '%s': no lowering for this "
+                                "target. Rewrite the source to avoid it (e.g. take "
+                                "min/max/abs/fabs out-of-line so clang can't fold "
+                                "them into an intrinsic)", name);
+                        else
+                            ERR(cg->fn_name,
+                                "call to '%s': callee has no definition in this "
+                                "module (extern is not supported)", name);
                         cg->had_error = 1;
                         break;
                     }
@@ -4942,6 +4964,8 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
             }
         }
     }
+
+    g_cur_inst = NULL;   /* leaving per-instruction codegen; later passes have no source loc */
 
     /* Branch relaxation precedes fixup resolution: any imm8 fixup that
      * doesn't reach its target gets rewritten to a `BEQ +1; JMP imm24`
@@ -5273,6 +5297,7 @@ static void cvm_fuzz_diag_handler(LLVMDiagnosticInfoRef di, void *ctx) {
 
 int cvm_fuzz_translate_buffer(const uint8_t *data, size_t len) {
     g_errors = 0;
+    g_cur_inst = NULL;   /* never carry a pointer into a previous iteration's IR */
 
     LLVMMemoryBufferRef buf =
         LLVMCreateMemoryBufferWithMemoryRangeCopy(

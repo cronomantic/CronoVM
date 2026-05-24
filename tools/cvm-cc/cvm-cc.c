@@ -403,6 +403,10 @@ static int compile_c_to_bc(const struct cli *cli, const char *clang,
     cargv[n++] = (char *)"--target=i386-elf";
     cargv[n++] = (char *)"-ffreestanding";
     cargv[n++] = (char *)"-emit-llvm";
+    /* Line tables only: enough for the translator to report file:line on
+     * rejected constructs; no .bin impact (debug metadata is dropped when the
+     * translator emits VM bytecode), minimal bitcode/compile overhead. */
+    cargv[n++] = (char *)"-gline-tables-only";
     cargv[n++] = optflag;
     cargv[n++] = rtinc;
     for (int k = 0; k < cli->include_count; ++k) {

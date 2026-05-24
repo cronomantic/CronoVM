@@ -78,6 +78,9 @@ Validation alone (no `-o`) accepts any optimisation level and any target.
 
 The subset is deliberately narrow. If your C code uses anything outside it,
 the translator rejects with a clear message; that's a feature, not a bug.
+Diagnostics carry the source `file:line` of the offending instruction (cvm-cc
+builds with `-gline-tables-only`), e.g.
+`translator: game.c:42: in 'frame': unsupported intrinsic 'llvm.fabs.f32'`.
 
 ### Types accepted
 
