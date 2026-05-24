@@ -4997,6 +4997,31 @@ struct cli_region {
     uint32_t direction;  /* CVM_REGION_R / W / RW */
 };
 
+/* CRC-32 (IEEE) of a file's first `n` bytes, read in chunks. */
+static int crc32_file_prefix(const char *path, size_t n, uint32_t *out) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 1;
+    uint32_t crc = 0xFFFFFFFFu;
+    uint8_t buf[65536];
+    size_t left = n;
+    while (left) {
+        size_t want = left < sizeof buf ? left : sizeof buf;
+        size_t got = fread(buf, 1, want, f);
+        if (got == 0) { fclose(f); return 1; }
+        for (size_t i = 0; i < got; ++i) {
+            crc ^= buf[i];
+            for (int b = 0; b < 8; ++b)
+                crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(crc & 1u)));
+        }
+        left -= got;
+    }
+    fclose(f);
+    *out = crc ^ 0xFFFFFFFFu;
+    return 0;
+}
+
+#define CVM_SEAL_MAGIC_LE 0x314D5243u   /* 'C','R','M','1' */
+
 static int write_bin(const char *path,
                      const uint32_t *code, uint32_t code_count,
                      const uint8_t *data, uint32_t data_size,
@@ -5008,6 +5033,7 @@ static int write_bin(const char *path,
                      const struct cli_region *regions, int region_count,
                      const uint8_t *rom, uint32_t rom_size,
                      const uint8_t *meta, uint32_t meta_size,
+                     int seal,
                      uint32_t entry)
 {
     FILE *f = fopen(path, "wb");
@@ -5076,7 +5102,8 @@ static int write_bin(const char *path,
                            + (funcs_size         > 0 ? 1u : 0u)
                            + (regions_size       > 0 ? 1u : 0u)
                            + (rom_size           > 0 ? 1u : 0u)
-                           + (meta_size          > 0 ? 1u : 0u);
+                           + (meta_size          > 0 ? 1u : 0u)
+                           + (seal               ? 1u : 0u);
     uint32_t table_off = 24;
     uint32_t code_off  = table_off + section_count * 16;
     uint32_t code_size = code_count * 4u;
@@ -5094,6 +5121,9 @@ static int write_bin(const char *path,
     uint32_t meta_off    = meta_size > 0
                          ? code_off + code_size + data_size + imports_size
                                     + funcs_size + regions_size + rom_size : 0;
+    /* The seal payload (12 B) goes last; its CRC covers everything before it. */
+    uint32_t seal_off    = code_off + code_size + data_size + imports_size
+                         + funcs_size + regions_size + rom_size + meta_size;
 
     uint8_t hdr[24] = {0};
     hdr[0] = 'C'; hdr[1] = 'V'; hdr[2] = 'M'; hdr[3] = '1';
@@ -5175,6 +5205,14 @@ static int write_bin(const char *path,
         put_u32_le(sec + 12, 0u);
         fwrite(sec, sizeof(sec), 1, f);
     }
+    if (seal) {
+        memset(sec, 0, sizeof(sec));
+        put_u32_le(sec + 0,  CVM_SEC_SEAL);
+        put_u32_le(sec + 4,  seal_off);
+        put_u32_le(sec + 8,  12u);
+        put_u32_le(sec + 12, 0u);
+        fwrite(sec, sizeof(sec), 1, f);
+    }
 
     for (uint32_t i = 0; i < code_count; ++i) {
         uint8_t b[4];
@@ -5188,6 +5226,13 @@ static int write_bin(const char *path,
     if (regions_size > 0) fwrite(regions_buf, 1, regions_size, f);
     if (rom_size > 0)     fwrite(rom, 1, rom_size, f);
     if (meta_size > 0)    fwrite(meta, 1, meta_size, f);
+    if (seal) {                                    /* magic + version + crc(=0) */
+        uint8_t s[12];
+        put_u32_le(s + 0, CVM_SEAL_MAGIC_LE);
+        put_u32_le(s + 4, 1u);
+        put_u32_le(s + 8, 0u);                     /* patched below */
+        fwrite(s, sizeof s, 1, f);
+    }
     free(imports_buf);
     free(funcs_buf);
     free(regions_buf);
@@ -5197,6 +5242,23 @@ static int write_bin(const char *path,
     if (err) {
         fprintf(stderr, "translator: write failed for '%s'\n", path);
         return 1;
+    }
+
+    /* Compute the seal's CRC over [0, seal_off) and patch it into the payload. */
+    if (seal) {
+        uint32_t crc = 0;
+        if (crc32_file_prefix(path, seal_off, &crc) != 0) {
+            fprintf(stderr, "translator: seal CRC read failed for '%s'\n", path);
+            return 1;
+        }
+        FILE *pf = fopen(path, "rb+");
+        if (!pf) { fprintf(stderr, "translator: seal patch open failed\n"); return 1; }
+        uint8_t c[4]; put_u32_le(c, crc);
+        if (fseek(pf, (long)(seal_off + 8), SEEK_SET) != 0 ||
+            fwrite(c, sizeof c, 1, pf) != 1) {
+            fclose(pf); fprintf(stderr, "translator: seal patch write failed\n"); return 1;
+        }
+        fclose(pf);
     }
     return 0;
 }
@@ -5218,6 +5280,7 @@ static void usage(void) {
             "                       (default rw). Repeatable.\n"
             "  --rom=FILE           Bake FILE's bytes into the .bin as read-only\n"
             "  --meta=FILE          Append FILE as a host-only CVM_SEC_META blob\n"
+            "  --seal               Append an integrity seal (magic + crc32)\n"
             "                       cartridge ROM (e.g. a game WAD). The program\n"
             "                       reads it via cvm_sys_rom_base/cvm_sys_rom_size.\n");
 }
@@ -5432,6 +5495,7 @@ int main(int argc, char **argv) {
     int         stack_reserve_set = 0;
     const char *rom_path = NULL;
     const char *meta_path = NULL;
+    int         seal_flag = 0;
     struct cli_region cli_regions[MAX_CLI_REGIONS];
     int         cli_region_count = 0;
 
@@ -5479,6 +5543,8 @@ int main(int argc, char **argv) {
             rom_path = argv[i] + 6;
         } else if (strncmp(argv[i], "--meta=", 7) == 0) {
             meta_path = argv[i] + 7;
+        } else if (strcmp(argv[i], "--seal") == 0) {
+            seal_flag = 1;
         } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
             fprintf(stderr, "translator: unknown option '%s'\n", argv[i]);
             return 2;
@@ -5672,6 +5738,7 @@ int main(int argc, char **argv) {
                           cli_regions, cli_region_count,
                           rom_buf, rom_size,
                           meta_buf, meta_size,
+                          seal_flag,
                           entry_off) != 0)
             {
                 rc = 1;

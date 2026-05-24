@@ -10,6 +10,14 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **Integrity seal section (`CVM_SEC_SEAL`).** `cvm-translate --seal` appends a
+  12-byte seal — magic `'C','R','M','1'`, version, and a CRC-32 of all preceding
+  file bytes — as the last section. New public `cvm_crc32()` and
+  `cvm_seal_check()` (1 = sealed & valid, 0 = unsealed, -1 = corrupt). The loader
+  ignores the section; a host verifies it before running. Lets a launcher both
+  identify valid cartridges (cheap magic via `cvm_peek_section`) and reject
+  corrupt/tampered ones (CRC at load).
+
 - **Source locations (`file:line`) in translator diagnostics.** `cvm-cc` now
   compiles each TU with `-gline-tables-only`, and the translator reads the
   current instruction's debug location, so every rejection prints

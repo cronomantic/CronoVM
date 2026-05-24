@@ -17,7 +17,7 @@
 
 #define CVM_HEADER_SIZE   24u
 #define CVM_SECTION_SIZE  16u
-#define CVM_MAX_SEC_TYPE  11u   /* includes CVM_SEC_META (host-only, ignored by loader) */
+#define CVM_MAX_SEC_TYPE  12u   /* includes CVM_SEC_META/SEAL (host-only, ignored by loader) */
 #define CVM_REGION_ENTRY_SIZE 28u   /* name[16] + size + direction + flags */
 
 /* --- Optional self-time profiler (build with -DCVM_PROFILE) ---------------
@@ -248,6 +248,28 @@ int cvm_peek_section(const void *bytes, size_t len, enum cvm_section_type type,
     return 0;
 }
 
+uint32_t cvm_crc32(const void *data, size_t len) {
+    const uint8_t *p = (const uint8_t *)data;
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= p[i];
+        for (int b = 0; b < 8; ++b)
+            crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(crc & 1u)));
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
+int cvm_seal_check(const void *bytes, size_t len) {
+    const unsigned char *seal = NULL;
+    uint32_t sz = 0;
+    int r = cvm_peek_section(bytes, len, CVM_SEC_SEAL, &seal, &sz);
+    if (r != 1) return r < 0 ? -1 : 0;          /* absent (0) or malformed (-1) */
+    if (sz < 12 || read_u32_le(seal) != CVM_SEAL_MAGIC) return -1;
+    uint32_t stored = read_u32_le(seal + 8);
+    size_t   seal_off = (size_t)(seal - (const unsigned char *)bytes);
+    return (cvm_crc32(bytes, seal_off) == stored) ? 1 : -1;
+}
+
 int cvm_load_ex(const void *bytes, size_t len, struct cvm_image *out,
                 const cvm_allocator_t *allocator)
 {
@@ -346,6 +368,7 @@ int cvm_load_ex(const void *bytes, size_t len, struct cvm_image *out,
             rom_size = size;
             break;
         case CVM_SEC_META:   /* host-only metadata; range already validated, not loaded */
+        case CVM_SEC_SEAL:   /* host-only integrity seal; verified by cvm_seal_check */
         case CVM_SEC_DEBUG:
         default:
             break;

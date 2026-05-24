@@ -101,6 +101,7 @@ struct cli {
     const char *stack_reserve;  /* --stack-reserve=, raw string */
     const char *rom;            /* --rom=, raw string (pass-through) */
     const char *meta;           /* --meta=, raw string (pass-through) */
+    int         seal;           /* --seal: append an integrity seal */
     const char *regions[MAX_REGIONS];
     int         region_count;
     const char *include_dirs[MAX_INCLUDE_DIRS];
@@ -131,6 +132,7 @@ static void usage(FILE *f) {
         "  --region=NAME:SIZE[:DIR]   host-shared region; DIR is r/w/rw\n"
         "  --rom=FILE                 bake FILE as read-only cartridge ROM\n"
         "  --meta=FILE                append FILE as a host-only metadata blob\n"
+        "  --seal                     append an integrity seal (magic + crc32)\n"
         "                             (default rw); repeatable up to %d\n"
         "\n"
         "Pass-through to clang:\n"
@@ -351,6 +353,8 @@ static int parse_argv(int argc, char **argv, struct cli *cli) {
             cli->rom = a;
         } else if (strncmp(a, "--meta=", 7) == 0) {
             cli->meta = a;
+        } else if (strcmp(a, "--seal") == 0) {
+            cli->seal = 1;
         } else if (strncmp(a, "--region=", 9) == 0) {
             if (cli->region_count >= MAX_REGIONS) {
                 fprintf(stderr, "cvm-cc: too many --region (max %d)\n",
@@ -627,6 +631,7 @@ int main(int argc, char **argv) {
         if (cli.stack_reserve) targv[n++] = (char *)cli.stack_reserve;
         if (cli.rom)           targv[n++] = (char *)cli.rom;
         if (cli.meta)          targv[n++] = (char *)cli.meta;
+        if (cli.seal)          targv[n++] = (char *)"--seal";
         for (int k = 0; k < cli.region_count; ++k)
             targv[n++] = (char *)cli.regions[k];
         targv[n] = NULL;

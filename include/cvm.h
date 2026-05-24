@@ -82,7 +82,15 @@ enum cvm_section_type {
                                   * into the heap). The host reads it from the
                                   * file with cvm_peek_section() — typically
                                   * before running, e.g. to populate a browser. */
+    CVM_SEC_SEAL          = 12,  /* integrity seal, appended last. Payload (12 B):
+                                  * magic 'C','R','M','1', u32 version, u32 crc32
+                                  * of all preceding file bytes [0, seal_off). The
+                                  * loader ignores it; the host verifies it with
+                                  * cvm_seal_check() before running a cart. */
 };
+
+/* Seal magic ('C','R','M','1' little-endian) and result of cvm_seal_check. */
+#define CVM_SEAL_MAGIC 0x314D5243u
 
 enum cvm_region_dir {
     CVM_REGION_R  = 1,   /* host writes, VM reads (input, textures) */
@@ -474,6 +482,16 @@ const char *cvm_strerror(int result);
  * Does not allocate. */
 int cvm_peek_section(const void *bytes, size_t len, enum cvm_section_type type,
                      const unsigned char **out_ptr, uint32_t *out_size);
+
+/* CRC-32 (IEEE, poly 0xEDB88320) of a buffer. */
+uint32_t cvm_crc32(const void *data, size_t len);
+
+/* Verify a binary's integrity seal (CVM_SEC_SEAL). Returns:
+ *    1 — sealed and the crc32 matches (good cartridge),
+ *    0 — no seal section present,
+ *   -1 — sealed but the magic/crc don't match (corrupt/tampered) or malformed.
+ * The seal covers all file bytes before the seal payload. */
+int cvm_seal_check(const void *bytes, size_t len);
 
 /* ---------------------------------------------------------------------------
  * Pluggable allocator. Embedded targets often have no `malloc`, custom
