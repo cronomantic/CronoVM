@@ -868,6 +868,8 @@ static int cvm_exec_at(struct cvm_image *img,
         [CVM_OP_FSQRT]   = &&L_FSQRT,
         [CVM_OP_QDIV1616] = &&L_QDIV1616,
         [CVM_OP_QDIV6432] = &&L_QDIV6432,
+        [CVM_OP_SETJMP]   = &&L_SETJMP,
+        [CVM_OP_LONGJMP]  = &&L_LONGJMP,
     };
 
 #  define DISPATCH() do {                                  \
@@ -1143,6 +1145,33 @@ static int cvm_exec_at(struct cvm_image *img,
                                     | (uint32_t)R[b]) / (uint32_t)R[c]);
         DISPATCH();
 
+    L_SETJMP: {
+        uint32_t env = (uint32_t)R[b];
+        if (env > mem_size || mem_size - env < 12u) return CVM_E_BAD_ADDR;
+        uint32_t cur_sp = (uint32_t)R[CVM_REG_SP];
+        uint32_t dest   = a;
+        memcpy(heap + env + 0u, &pc, 4);       /* pc = the resume point */
+        memcpy(heap + env + 4u, &cur_sp, 4);
+        memcpy(heap + env + 8u, &dest, 4);
+        R[a] = 0;
+        DISPATCH();
+    }
+    L_LONGJMP: {
+        uint32_t env = (uint32_t)R[a];
+        if (env > mem_size || mem_size - env < 12u) return CVM_E_BAD_ADDR;
+        uint32_t jpc, jsp, jdst;
+        memcpy(&jpc,  heap + env + 0u, 4);
+        memcpy(&jsp,  heap + env + 4u, 4);
+        memcpy(&jdst, heap + env + 8u, 4);
+        if (jpc >= code_count)        return CVM_E_BAD_PC;
+        if (jdst >= CVM_REG_COUNT)    return CVM_E_BAD_ADDR;
+        int32_t v = R[b];
+        R[jdst]       = (v != 0) ? v : 1;      /* longjmp(env,0) appears as 1 */
+        R[CVM_REG_SP] = (int32_t)jsp;
+        pc            = jpc;
+        DISPATCH();
+    }
+
 #  undef DISPATCH
 
 #else  /* !CVM_THREADED — switch fallback for MSVC */
@@ -1400,6 +1429,32 @@ static int cvm_exec_at(struct cvm_image *img,
             R[a] = (int32_t)(uint32_t)(((((uint64_t)(uint32_t)R[a]) << 32)
                                         | (uint32_t)R[b]) / (uint32_t)R[c]);
             break;
+        case CVM_OP_SETJMP: {
+            uint32_t env = (uint32_t)R[b];
+            if (env > mem_size || mem_size - env < 12u) return CVM_E_BAD_ADDR;
+            uint32_t cur_sp = (uint32_t)R[CVM_REG_SP];
+            uint32_t dest   = a;
+            memcpy(heap + env + 0u, &pc, 4);
+            memcpy(heap + env + 4u, &cur_sp, 4);
+            memcpy(heap + env + 8u, &dest, 4);
+            R[a] = 0;
+            break;
+        }
+        case CVM_OP_LONGJMP: {
+            uint32_t env = (uint32_t)R[a];
+            if (env > mem_size || mem_size - env < 12u) return CVM_E_BAD_ADDR;
+            uint32_t jpc, jsp, jdst;
+            memcpy(&jpc,  heap + env + 0u, 4);
+            memcpy(&jsp,  heap + env + 4u, 4);
+            memcpy(&jdst, heap + env + 8u, 4);
+            if (jpc >= code_count)     return CVM_E_BAD_PC;
+            if (jdst >= CVM_REG_COUNT) return CVM_E_BAD_ADDR;
+            int32_t v = R[b];
+            R[jdst]       = (v != 0) ? v : 1;
+            R[CVM_REG_SP] = (int32_t)jsp;
+            pc            = jpc;
+            break;
+        }
         default:
             return CVM_E_BAD_OPCODE;
         }

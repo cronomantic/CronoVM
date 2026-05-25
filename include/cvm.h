@@ -372,6 +372,25 @@ enum cvm_opcode {
      * `cvm_qdiv_64_32(hi, lo, divisor)`. Operands are unsigned magnitudes —
      * callers (e.g. DOOM's CVM_CrossDiv) apply the sign themselves. */
     CVM_OP_QDIV6432 = 0x39,
+
+    /* Non-local jumps — C setjmp/longjmp. The register file and pc are interpreter
+     * locals and the call stack lives in the heap (CALL pushes only the return
+     * PC), so a jmp_buf only needs to capture {resume pc, SP, dest reg}; the
+     * translator's calling convention has already spilled the setjmp-caller's
+     * live values to its frame, which SP restores. jmp_buf layout in heap (the
+     * libc setjmp.h matches): [0]=u32 resume pc, [4]=u32 SP, [8]=u32 dest reg.
+     *
+     * SETJMP A=dest, B=reg holding jmp_buf addr: save {pc (already the next
+     * instruction = the resume point), SP, A} into the buf; R[A]=0; fall through.
+     * The translator lowers a `setjmp(env)` call to this (result in R[A]). */
+    CVM_OP_SETJMP  = 0x3A,
+
+    /* LONGJMP A=reg holding jmp_buf addr, B=value reg: reload {pc, SP, dest} from
+     * the buf, set R[dest]=value (mapped to 1 if 0, per C), restore SP and jump
+     * to pc — execution resumes right after the matching SETJMP with R[dest] =
+     * value, where the caller reloads its spilled locals from the restored frame.
+     * The translator lowers a `longjmp(env, val)` call to this. */
+    CVM_OP_LONGJMP = 0x3B,
 };
 
 #define CVM_REG_COUNT 256

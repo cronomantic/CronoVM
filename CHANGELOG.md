@@ -10,6 +10,16 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **`setjmp`/`longjmp` (opcodes `SETJMP` 0x3A, `LONGJMP` 0x3B).** Real non-local
+  jumps. A `jmp_buf` captures `{resume pc, SP, dest reg}` in the heap; `longjmp`
+  restores SP+pc and writes the value to the saved dest register, resuming right
+  after `setjmp` (0 on the direct call, the longjmp value — mapped to 1 if 0 —
+  on return). Cheap because the register file/pc are interpreter locals and the
+  call stack lives in the heap, so the convention's existing caller-saved spills
+  cover the live state across the jump. The translator lowers `setjmp`/`longjmp`
+  calls to the opcodes (no library body). New e2e fixture `setjmp.c`. Surfaced by
+  the Quake port (Host_Error recovery).
+
 - **Integrity seal section (`CVM_SEC_SEAL`).** `cvm-translate --seal` appends a
   12-byte seal — magic `'C','R','M','1'`, version, and a CRC-32 of all preceding
   file bytes — as the last section. New public `cvm_crc32()` and

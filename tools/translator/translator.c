@@ -4233,6 +4233,26 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 }
                 if (!name) goto user_call_lowering;
 
+                /* setjmp/longjmp -> dedicated non-local-jump opcodes. The libc
+                 * only DECLARES them (no body), so a normal call would fail
+                 * "extern not supported"; instead we capture/restore {pc, sp,
+                 * dest reg} in the jmp_buf. clang marks setjmp returns_twice, so
+                 * the IR already keeps values live across it in memory. */
+                if (strcmp(name, "setjmp") == 0 || strcmp(name, "_setjmp") == 0) {
+                    uint8_t env = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                    uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                    if (cg->had_error) break;
+                    cg_emit(cg, enc_r(CVM_OP_SETJMP, dst, env, 0));
+                    break;
+                }
+                if (strcmp(name, "longjmp") == 0 || strcmp(name, "_longjmp") == 0) {
+                    uint8_t env = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                    uint8_t val = cg_reg_for(cg, LLVMGetOperand(i, 1));
+                    if (cg->had_error) break;
+                    cg_emit(cg, enc_r(CVM_OP_LONGJMP, env, val, 0));
+                    break;
+                }
+
                 /* llvm.abs.i32(%x, _is_int_min_poison)
                  *   abs(x) = (x<0) ? -x : x
                  *

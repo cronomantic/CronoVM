@@ -158,7 +158,7 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
              dispatch_table const_gep reg_pressure float_mem struct_init reg_reuse
              narrow_ops narrow_cmp mem_intrin long_branch switch_dispatch
              switch_table switch_neg_table spill_loop vararg globptr lower_intrin fsh_narrow unreachable
-             spill_many spill_crossblock spill_call phi_loop_exit ctpop)
+             spill_many spill_crossblock spill_call phi_loop_exit ctpop setjmp)
     set(_src ${_fixture_dir}/${name}.c)
     set(_bc  ${_fixture_out}/${name}.bc)
     # -ffreestanding turns off __STDC_HOSTED__, so clang's bundled
@@ -216,7 +216,7 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
              narrow_ops narrow_cmp mem_intrin
              long_branch switch_dispatch switch_table switch_neg_table
              spill_loop vararg globptr lower_intrin fsh_narrow unreachable
-             spill_many spill_crossblock spill_call phi_loop_exit ctpop)
+             spill_many spill_crossblock spill_call phi_loop_exit ctpop setjmp)
     set(_bc  ${_fixture_out}/${name}.bc)
     set(_bin ${_fixture_out}/${name}.bin)
     add_custom_command(
@@ -304,6 +304,10 @@ add_test(NAME e2e_mulh       COMMAND test_e2e ${_fixture_out}/mulh.bin  0 0)
 add_test(NAME e2e_qdiv       COMMAND test_e2e ${_fixture_out}/qdiv.bin  0 0)
 add_test(NAME e2e_qdiv6432   COMMAND test_e2e ${_fixture_out}/qdiv6432.bin  0 0)
 add_test(NAME e2e_xor_i1     COMMAND test_e2e ${_fixture_out}/xor_i1.bin 0 0)
+# setjmp/longjmp: setjmp->0, deep() longjmps back with n+5 (counter==1).
+# n=0 -> 6 ; n=10 -> 16. Exercises CVM_OP_SETJMP/LONGJMP + SP unwind.
+add_test(NAME e2e_setjmp     COMMAND test_e2e ${_fixture_out}/setjmp.bin  6  0)
+add_test(NAME e2e_setjmp10   COMMAND test_e2e ${_fixture_out}/setjmp.bin 16 10)
 add_test(NAME e2e_float_basic COMMAND test_e2e ${_fixture_out}/float_basic.bin 0 0)
 add_test(NAME e2e_fsqrt       COMMAND test_e2e ${_fixture_out}/fsqrt.bin       0 0)
 add_test(NAME e2e_i64_basic   COMMAND test_e2e ${_fixture_out}/i64_basic.bin   0 0)
