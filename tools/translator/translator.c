@@ -514,20 +514,26 @@ static int serialize_constant(const struct cg_globals *g, LLVMValueRef c,
         return 0;
     }
     if (LLVMIsAConstantFP(c)) {
-        /* Only float (binary32) is in the subset; the type-subset check
-         * upstream rejects anything else, but assert here so a bad caller
-         * can't slip a double past us. */
-        if (LLVMGetTypeKind(ty) != LLVMFloatTypeKind || sz != 4) return 1;
         LLVMBool lossy = 0;
         double   d     = LLVMConstRealGetDouble(c, &lossy);
-        float    f     = (float)d;
-        uint32_t bits;
-        memcpy(&bits, &f, sizeof bits);
-        out[off + 0] = (uint8_t)(bits      );
-        out[off + 1] = (uint8_t)(bits >>  8);
-        out[off + 2] = (uint8_t)(bits >> 16);
-        out[off + 3] = (uint8_t)(bits >> 24);
-        return 0;
+        if (LLVMGetTypeKind(ty) == LLVMFloatTypeKind && sz == 4) {
+            float    f = (float)d;
+            uint32_t bits;
+            memcpy(&bits, &f, sizeof bits);
+            for (uint32_t b = 0; b < 4; ++b)
+                out[off + b] = (uint8_t)(bits >> (b * 8));
+            return 0;
+        }
+        /* f64 global (the soft-f64 runtime reads doubles as their native 8-byte
+         * IEEE-754 little-endian image, so store exactly that). */
+        if (LLVMGetTypeKind(ty) == LLVMDoubleTypeKind && sz == 8) {
+            uint64_t bits;
+            memcpy(&bits, &d, sizeof bits);
+            for (uint32_t b = 0; b < 8; ++b)
+                out[off + b] = (uint8_t)(bits >> (b * 8));
+            return 0;
+        }
+        return 1;
     }
     if (LLVMIsAFunction(c)) {
         /* A function value embedded in a constant initialiser — typically
@@ -4351,6 +4357,37 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     if (cg->had_error) break;
                     cg_emit(cg, enc_r(CVM_OP_FMUL, tmp, a, b));
                     cg_emit(cg, enc_r(CVM_OP_FADD, dst, tmp, cc));
+                    break;
+                }
+
+                /* llvm.fabs.f32(x) = clear the sign bit. Floats share the
+                 * integer register file (bitcast f32<->i32 is free), so fabs is
+                 * just AND with 0x7FFFFFFF. clang emits it from fabsf/fabs on
+                 * float (e.g. the SDK math.h fabsf). */
+                if (strcmp(name, "llvm.fabs.f32") == 0) {
+                    uint8_t x    = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                    uint8_t dst  = cg->regs[cg_lookup(cg, i)];
+                    uint8_t mask = cg_alloc_reg(cg);
+                    if (cg->had_error) break;
+                    cg_emit_load_const32(cg, mask, 0x7FFFFFFF);
+                    cg_emit(cg, enc_r(CVM_OP_AND, dst, x, mask));
+                    break;
+                }
+
+                /* llvm.copysign.f32(x, y) = (x & 0x7FFFFFFF) | (y & 0x80000000) */
+                if (strcmp(name, "llvm.copysign.f32") == 0) {
+                    uint8_t x     = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                    uint8_t y     = cg_reg_for(cg, LLVMGetOperand(i, 1));
+                    uint8_t dst   = cg->regs[cg_lookup(cg, i)];
+                    uint8_t mabs  = cg_alloc_reg(cg);
+                    uint8_t msgn  = cg_alloc_reg(cg);
+                    uint8_t tx    = cg_alloc_reg(cg);
+                    if (cg->had_error) break;
+                    cg_emit_load_const32(cg, mabs, 0x7FFFFFFF);
+                    cg_emit_load_const32(cg, msgn, (int32_t)0x80000000);
+                    cg_emit(cg, enc_r(CVM_OP_AND, tx,  x, mabs));
+                    cg_emit(cg, enc_r(CVM_OP_AND, dst, y, msgn));
+                    cg_emit(cg, enc_r(CVM_OP_OR,  dst, dst, tx));
                     break;
                 }
 
