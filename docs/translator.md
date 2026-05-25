@@ -80,7 +80,7 @@ The subset is deliberately narrow. If your C code uses anything outside it,
 the translator rejects with a clear message; that's a feature, not a bug.
 Diagnostics carry the source `file:line` of the offending instruction (cvm-cc
 builds with `-gline-tables-only`), e.g.
-`translator: game.c:42: in 'frame': unsupported intrinsic 'llvm.fabs.f32'`.
+`translator: game.c:42: in 'frame': unsupported intrinsic 'llvm.sin.f32'`.
 
 ### Types accepted
 
@@ -132,12 +132,24 @@ the gap is what's still being implemented:
   memory). `sext` from a narrow source emits an explicit sign-extension
   via `MOVI scratch, (32-w); SHL dst, src, scratch; SAR dst, dst,
   scratch` — three instructions per narrow signed load
-- intrinsic calls: `llvm.abs.i32`, `llvm.smax.i32`, `llvm.smin.i32`,
-  `llvm.umax.i32`, `llvm.umin.i32`; `llvm.memcpy.*`, `llvm.memset.*`,
-  `llvm.memmove.*` (lowered to single `MEMCPY`/`MEMSET`/`MEMMOVE`
-  opcodes — the i1 isvolatile operand is metadata and ignored;
-  length must be i32, since i64 size_t isn't in the subset);
-  `llvm.lifetime.start/end` (no-ops)
+- intrinsic calls:
+  - integer min/max/abs: `llvm.abs.i32`, `llvm.smax.i32`, `llvm.smin.i32`,
+    `llvm.umax.i32`, `llvm.umin.i32`
+  - bit counts: `llvm.ctlz.i32`, `llvm.cttz.i32`, `llvm.ctpop.i32` (small
+    loops — no dedicated opcode); funnel shifts `llvm.fshl.iN` / `llvm.fshr.iN`
+  - byte swaps: `llvm.bswap.i16`, `llvm.bswap.i32` (shift/mask/or)
+  - f32 math: `llvm.fmuladd.f32` (→ `FMUL`+`FADD`), `llvm.fabs.f32`
+    (AND `0x7FFFFFFF`), `llvm.copysign.f32`
+  - f64 math: `llvm.fmuladd.f64`/`llvm.fma.f64`, `llvm.fabs.f64`,
+    `llvm.copysign.f64`, `llvm.sqrt.f64` (see the f64 section)
+  - block memory: `llvm.memcpy.*`, `llvm.memset.*`, `llvm.memmove.*`
+    (lowered to single `MEMCPY`/`MEMSET`/`MEMMOVE` opcodes — the i1
+    isvolatile operand is metadata and ignored; length must be i32, since
+    i64 `size_t` isn't in the subset)
+  - lifetime markers: `llvm.lifetime.start/end` (no-ops)
+- non-local jumps: `setjmp` / `longjmp` calls lower to the `SETJMP` / `LONGJMP`
+  opcodes (no library body needed). The `jmp_buf` captures `{resume pc, SP,
+  dest reg}`; see the ISA reference.
 - syscall calls: any `cvm_sys_*` function call lowers to `SYSCALL`
 - user calls: direct calls to functions defined in the same module
   lower to `CALL imm24`, with caller-saved spill, R0..R7+stack arg
@@ -240,7 +252,10 @@ Lowered `f64` operations:
 - `fneg` → inline `xor` of the sign bit (no call)
 - `sitofp` / `uitofp` / `fpext` (→ `double`) → `__cvm_f_from_{i32,u32,f32}` (sret)
 - `fptosi` / `fptoui` / `fptrunc` (`double` →) → `__cvm_f_to_{i32,u32,f32}`
-- `double` constant / `load` / `store` → materialised / two-word, like `i64`
+- `double` constant / `load` / `store` → materialised / two-word, like `i64`.
+  `double` (and `float`) **global initialisers** are serialised into the DATA
+  section as their native little-endian IEEE-754 image (8 / 4 bytes), so the
+  soft-float runtime reads them directly.
 - `llvm.fmuladd.f64` / `llvm.fma.f64` → two runtime calls (`fmul` then `fadd`),
   with the intermediate product written to the result's own slot. clang's
   default `-ffp-contract=on` synthesises `fmuladd` from `a*b±c`, so this is the

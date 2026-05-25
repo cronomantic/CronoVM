@@ -17,8 +17,24 @@ version bump; breaks are called out explicitly under **Breaking**.
   on return). Cheap because the register file/pc are interpreter locals and the
   call stack lives in the heap, so the convention's existing caller-saved spills
   cover the live state across the jump. The translator lowers `setjmp`/`longjmp`
-  calls to the opcodes (no library body). New e2e fixture `setjmp.c`. Surfaced by
-  the Quake port (Host_Error recovery).
+  calls to the opcodes (no library body). New e2e fixture `setjmp.c`. (First
+  exercised by a C program using `setjmp`/`longjmp` for error recovery.)
+
+- **More intrinsic lowerings.** The translator now lowers `llvm.fabs.f32`
+  (AND `0x7FFFFFFF`), `llvm.copysign.f32`, `llvm.bswap.i16` / `llvm.bswap.i32`
+  (shift/mask/or), and `llvm.cttz.i32` (count-trailing-zeros loop, like the
+  existing `ctlz`). These previously errored as "unsupported intrinsic"; clang
+  emits them from `fabsf`/`copysignf`, byte-swap idioms, and power-of-two `log2`.
+
+- **f64 / f32 global initialisers.** `serialize_constant` writes a `double`
+  `ConstantFP` global as its native 8-byte IEEE-754 little-endian image (f32 as
+  4 bytes), matching how the soft-float runtime reads doubles from memory.
+  Previously only f32 constants were serialised, so any `double` global was
+  rejected "unsupported initializer shape".
+
+- **`cvm-cc -D<macro>[=val]`.** The driver now accepts and forwards `-D` to
+  clang (was rejected as an unknown option), so a build can predefine macros —
+  e.g. selecting an optional libc feature.
 
 - **Integrity seal section (`CVM_SEC_SEAL`).** `cvm-translate --seal` appends a
   12-byte seal — magic `'C','R','M','1'`, version, and a CRC-32 of all preceding
