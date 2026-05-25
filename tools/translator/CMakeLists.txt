@@ -34,9 +34,25 @@ message(STATUS "Found LLVM ${LLVM_VERSION} (${LLVM_CONFIG_EXE})")
 # the C++ headers, so the shim gets us back to portable territory.
 enable_language(CXX)
 
+# Add LLVM's include dir to a target. An LLVM install's includedir can sit
+# inside a prefix that also ships a libc (e.g. msys2's /ucrt64/include). Added
+# as -isystem it is searched BEFORE the default system dirs, so libc++'s
+# `#include_next <stddef.h>` finds that prefix's libc instead of the
+# toolchain's own — which breaks the Clang build (GCC's libstdc++ is lenient,
+# so GCC never noticed). Use -idirafter on GNU/Clang so LLVM's headers are
+# searched AFTER the default system dirs (toolchain headers win; LLVM headers
+# are unique to that dir so they're still found); -isystem elsewhere (MSVC).
+function(cvm_add_llvm_includes tgt)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(${tgt} PRIVATE -idirafter "${LLVM_INCDIR}")
+    else()
+        target_include_directories(${tgt} SYSTEM PRIVATE "${LLVM_INCDIR}")
+    endif()
+endfunction()
+
 add_executable(cvm-translate translator.c llvm_c_compat.cpp)
 target_include_directories(cvm-translate PRIVATE ${CVM_SOURCE_ROOT}/include)
-target_include_directories(cvm-translate SYSTEM PRIVATE ${LLVM_INCDIR})
+cvm_add_llvm_includes(cvm-translate)
 target_link_directories(cvm-translate PRIVATE ${LLVM_LIBDIR})
 target_link_libraries(cvm-translate PRIVATE ${LLVM_LIBS})
 target_compile_features(cvm-translate PRIVATE cxx_std_17)
@@ -85,7 +101,7 @@ if(CVM_BUILD_FUZZER)
         add_executable(cvm-translate-fuzz
             translator.c llvm_c_compat.cpp fuzz_translate.c)
         target_include_directories(cvm-translate-fuzz PRIVATE ${CVM_SOURCE_ROOT}/include)
-        target_include_directories(cvm-translate-fuzz SYSTEM PRIVATE ${LLVM_INCDIR})
+        cvm_add_llvm_includes(cvm-translate-fuzz)
         target_link_directories(cvm-translate-fuzz PRIVATE ${LLVM_LIBDIR})
         target_link_libraries(cvm-translate-fuzz PRIVATE ${LLVM_LIBS})
         target_compile_features(cvm-translate-fuzz PRIVATE cxx_std_17)
@@ -105,7 +121,7 @@ if(CVM_BUILD_FUZZER)
     add_executable(cvm-translate-fuzz-replay
         translator.c llvm_c_compat.cpp fuzz_translate.c)
     target_include_directories(cvm-translate-fuzz-replay PRIVATE ${CVM_SOURCE_ROOT}/include)
-    target_include_directories(cvm-translate-fuzz-replay SYSTEM PRIVATE ${LLVM_INCDIR})
+    cvm_add_llvm_includes(cvm-translate-fuzz-replay)
     target_link_directories(cvm-translate-fuzz-replay PRIVATE ${LLVM_LIBDIR})
     target_link_libraries(cvm-translate-fuzz-replay PRIVATE ${LLVM_LIBS})
     target_compile_features(cvm-translate-fuzz-replay PRIVATE cxx_std_17)
