@@ -158,7 +158,7 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
              dispatch_table const_gep reg_pressure float_mem struct_init reg_reuse
              narrow_ops narrow_cmp mem_intrin long_branch switch_dispatch
              switch_table switch_neg_table spill_loop vararg globptr lower_intrin fsh_narrow unreachable
-             spill_many spill_crossblock spill_call phi_loop_exit ctpop setjmp)
+             spill_many spill_crossblock spill_call phi_loop_exit ctpop setjmp dup_operand)
     set(_src ${_fixture_dir}/${name}.c)
     set(_bc  ${_fixture_out}/${name}.bc)
     # -ffreestanding turns off __STDC_HOSTED__, so clang's bundled
@@ -216,7 +216,7 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
              narrow_ops narrow_cmp mem_intrin
              long_branch switch_dispatch switch_table switch_neg_table
              spill_loop vararg globptr lower_intrin fsh_narrow unreachable
-             spill_many spill_crossblock spill_call phi_loop_exit ctpop setjmp)
+             spill_many spill_crossblock spill_call phi_loop_exit ctpop setjmp dup_operand)
     set(_bc  ${_fixture_out}/${name}.bc)
     set(_bin ${_fixture_out}/${name}.bin)
     add_custom_command(
@@ -308,6 +308,12 @@ add_test(NAME e2e_xor_i1     COMMAND test_e2e ${_fixture_out}/xor_i1.bin 0 0)
 # n=0 -> 6 ; n=10 -> 16. Exercises CVM_OP_SETJMP/LONGJMP + SP unwind.
 add_test(NAME e2e_setjmp     COMMAND test_e2e ${_fixture_out}/setjmp.bin  6  0)
 add_test(NAME e2e_setjmp10   COMMAND test_e2e ${_fixture_out}/setjmp.bin 16 10)
+# dup_operand: a value reused across an instruction's operand slots (x*x) is
+# freed to the reg pool once, not twice — else a counted loop's exit icmp drew
+# the same register as the counter increment and clobbered it (infinite loop).
+# n*n+13: 4->29, 0->13.
+add_test(NAME e2e_dup_operand  COMMAND test_e2e ${_fixture_out}/dup_operand.bin 29 4)
+add_test(NAME e2e_dup_operand0 COMMAND test_e2e ${_fixture_out}/dup_operand.bin 13 0)
 add_test(NAME e2e_float_basic COMMAND test_e2e ${_fixture_out}/float_basic.bin 0 0)
 add_test(NAME e2e_fsqrt       COMMAND test_e2e ${_fixture_out}/fsqrt.bin       0 0)
 add_test(NAME e2e_i64_basic   COMMAND test_e2e ${_fixture_out}/i64_basic.bin   0 0)

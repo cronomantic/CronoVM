@@ -1011,6 +1011,15 @@ static uint8_t cg_alloc_reg(struct cg *cg) {
 }
 
 static void cg_free_reg(struct cg *cg, uint8_t r) {
+    /* Never push a register that's already pooled. A value used in several
+     * operand slots of ONE instruction (e.g. `x*x` -> fmuladd(x, x, _), or any
+     * `f(a, a)`) reaches the per-operand free loop once per occurrence; without
+     * this guard its register would be pooled twice, and two later defs could
+     * then both draw the SAME register and clobber each other (observed as an
+     * infinite loop when the second def was a loop's exit `icmp` overwriting the
+     * counter increment). Dedup keeps the pool a set. */
+    for (int i = 0; i < cg->free_list_count; ++i)
+        if (cg->free_list[i] == r) return;
     if (cg->free_list_count
         < (int)(sizeof(cg->free_list) / sizeof(cg->free_list[0])))
     {

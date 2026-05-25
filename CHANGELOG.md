@@ -8,6 +8,18 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Register pool double-free when a value fills several operand slots of one
+  instruction** (e.g. `x*x` → `llvm.fmuladd.f32(x, x, acc)`, or any `f(a, a)`).
+  The per-operand register-free loop reached such a value once per occurrence
+  and pooled its register twice; two later defs could then draw the SAME
+  register and clobber each other. In a counted loop this manifested as an
+  **infinite loop** — the exit `icmp` was assigned the register still holding
+  the loop counter's increment (also the back-edge phi source), so the counter
+  never advanced. Fix: `cg_free_reg` now keeps the free pool a set (no
+  duplicates). New e2e fixture `dup_operand.c`.
+
 ### Added
 
 - **`setjmp`/`longjmp` (opcodes `SETJMP` 0x3A, `LONGJMP` 0x3B).** Real non-local
