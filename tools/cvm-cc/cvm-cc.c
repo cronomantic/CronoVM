@@ -84,6 +84,7 @@
 
 #define MAX_REGIONS         64
 #define MAX_INCLUDE_DIRS    32
+#define MAX_DEFINES         32
 #define MAX_INPUTS         256   /* a multi-file port (e.g. Crispy) is ~100+ TUs */
 
 struct cli {
@@ -106,6 +107,8 @@ struct cli {
     int         region_count;
     const char *include_dirs[MAX_INCLUDE_DIRS];
     int         include_count;
+    const char *defines[MAX_DEFINES];   /* -D<macro>[=val], passed to clang */
+    int         define_count;
 
     int lto;        /* --lto: run opt default<O2> on the (linked) module */
     int keep_bc;
@@ -137,6 +140,7 @@ static void usage(FILE *f) {
         "\n"
         "Pass-through to clang:\n"
         "  -I <dir>                   extra include dir (repeatable)\n"
+        "  -D<macro>[=val]            predefine a macro (repeatable)\n"
         "  -O0|-O1|-O2|-O3|-Os        optimisation level (default -O1)\n"
         "\n"
         "Link-time optimisation:\n"
@@ -343,6 +347,14 @@ static int parse_argv(int argc, char **argv, struct cli *cli) {
                 return 2;
             }
             cli->include_dirs[cli->include_count++] = argv[++i];
+        } else if (strncmp(a, "-D", 2) == 0 && a[2] != '\0') {
+            /* -D<macro>[=val] (glued), forwarded verbatim to clang. Lets a build
+             * select a libc feature (e.g. CVM_LIBC_ENABLE_F64 -> the f64 atof). */
+            if (cli->define_count >= MAX_DEFINES) {
+                fprintf(stderr, "cvm-cc: too many -D (max %d)\n", MAX_DEFINES);
+                return 2;
+            }
+            cli->defines[cli->define_count++] = a;
         } else if (strncmp(a, "-O", 2) == 0 && a[2] != '\0') {
             cli->opt_level = a + 2;
         } else if (strncmp(a, "--heap-reserve=", 15) == 0) {
@@ -405,7 +417,7 @@ static int compile_c_to_bc(const struct cli *cli, const char *clang,
     char rtinc[1024];
     snprintf(rtinc, sizeof rtinc, "-I%s", cli->runtime_dir);
 
-    char *cargv[16 + 2 * MAX_INCLUDE_DIRS];
+    char *cargv[16 + 2 * MAX_INCLUDE_DIRS + MAX_DEFINES];
     int   n = 0;
     cargv[n++] = (char *)clang;
     cargv[n++] = (char *)"--target=i386-elf";
@@ -421,6 +433,8 @@ static int compile_c_to_bc(const struct cli *cli, const char *clang,
         cargv[n++] = (char *)"-I";
         cargv[n++] = (char *)cli->include_dirs[k];
     }
+    for (int k = 0; k < cli->define_count; ++k)
+        cargv[n++] = (char *)cli->defines[k];
     cargv[n++] = (char *)"-c";
     cargv[n++] = (char *)input;
     cargv[n++] = (char *)"-o";

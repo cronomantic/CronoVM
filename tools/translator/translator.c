@@ -4391,6 +4391,85 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     break;
                 }
 
+                /* llvm.bswap.i16(x) = (x<<8 & 0xFF00) | (x>>8 & 0x00FF).
+                 * clang folds the BigShort/LittleShort byte-swap idioms (PAK/WAD
+                 * big-endian fields) into this; lower with shift+mask+or so the
+                 * engine's byte swaps work without a volatile-array workaround. */
+                if (strcmp(name, "llvm.bswap.i16") == 0) {
+                    uint8_t x   = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                    uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                    uint8_t t1  = cg_alloc_reg(cg);
+                    uint8_t t2  = cg_alloc_reg(cg);
+                    uint8_t k8  = cg_alloc_reg(cg);
+                    uint8_t kff = cg_alloc_reg(cg);
+                    if (cg->had_error) break;
+                    cg_emit_load_const32(cg, k8, 8);
+                    cg_emit_load_const32(cg, kff, 0xFF);
+                    cg_emit(cg, enc_r(CVM_OP_AND, t1, x, kff));   /* t1 = x & 0xFF      */
+                    cg_emit(cg, enc_r(CVM_OP_SHL, t1, t1, k8));   /* t1 <<= 8           */
+                    cg_emit(cg, enc_r(CVM_OP_SHR, t2, x, k8));    /* t2 = (u)x >> 8     */
+                    cg_emit(cg, enc_r(CVM_OP_AND, t2, t2, kff));  /* t2 &= 0xFF         */
+                    cg_emit(cg, enc_r(CVM_OP_OR,  dst, t1, t2));
+                    break;
+                }
+
+                /* llvm.bswap.i32(x) = full 4-byte reverse.
+                 *   (x>>24) | ((x>>8)&0xFF00) | ((x<<8)&0xFF0000) | (x<<24) */
+                if (strcmp(name, "llvm.bswap.i32") == 0) {
+                    uint8_t x    = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                    uint8_t dst  = cg->regs[cg_lookup(cg, i)];
+                    uint8_t b0   = cg_alloc_reg(cg);
+                    uint8_t b1   = cg_alloc_reg(cg);
+                    uint8_t b2   = cg_alloc_reg(cg);
+                    uint8_t b3   = cg_alloc_reg(cg);
+                    uint8_t k8   = cg_alloc_reg(cg);
+                    uint8_t k24  = cg_alloc_reg(cg);
+                    uint8_t m1   = cg_alloc_reg(cg);
+                    uint8_t m2   = cg_alloc_reg(cg);
+                    if (cg->had_error) break;
+                    cg_emit_load_const32(cg, k8, 8);
+                    cg_emit_load_const32(cg, k24, 24);
+                    cg_emit_load_const32(cg, m1, 0x0000FF00);
+                    cg_emit_load_const32(cg, m2, 0x00FF0000);
+                    cg_emit(cg, enc_r(CVM_OP_SHR, b0, x, k24));   /* b0 = (u)x>>24 (low byte) */
+                    cg_emit(cg, enc_r(CVM_OP_SHR, b1, x, k8));    /* b1 = (u)x>>8             */
+                    cg_emit(cg, enc_r(CVM_OP_AND, b1, b1, m1));   /* b1 &= 0xFF00             */
+                    cg_emit(cg, enc_r(CVM_OP_SHL, b2, x, k8));    /* b2 = x<<8                */
+                    cg_emit(cg, enc_r(CVM_OP_AND, b2, b2, m2));   /* b2 &= 0xFF0000           */
+                    cg_emit(cg, enc_r(CVM_OP_SHL, b3, x, k24));   /* b3 = x<<24 (top byte)    */
+                    cg_emit(cg, enc_r(CVM_OP_OR,  dst, b0, b1));
+                    cg_emit(cg, enc_r(CVM_OP_OR,  dst, dst, b2));
+                    cg_emit(cg, enc_r(CVM_OP_OR,  dst, dst, b3));
+                    break;
+                }
+
+                /* llvm.cttz.i32(%x, is_zero_undef) — count trailing zeros. No
+                 * CTTZ opcode; lower to a loop counting low zero bits (result
+                 * 32 for x==0, matching the is_zero_undef=false semantics).
+                 * clang folds power-of-two log2 idioms (e.g. the renderer's
+                 * MaskForNum) into this. Mirrors the ctlz loop. */
+                if (strcmp(name, "llvm.cttz.i32") == 0) {
+                    uint8_t src = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                    uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                    uint8_t x   = cg_alloc_reg(cg);
+                    uint8_t n   = cg_alloc_reg(cg);
+                    uint8_t one = cg_alloc_reg(cg);
+                    uint8_t t   = cg_alloc_reg(cg);
+                    if (cg->had_error) break;
+                    cg_emit(cg, enc_r  (CVM_OP_MOV,  x, src, 0));     /* 0 */
+                    cg_emit(cg, enc_i16(CVM_OP_MOVI, n, 0));          /* 1 */
+                    cg_emit(cg, enc_i16(CVM_OP_MOVI, one, 1));        /* 2 */
+                    cg_emit(cg, enc_br (CVM_OP_BEQ, x, cg->zero_reg, 5)); /* 3: x==0 -> n=32 */
+                    cg_emit(cg, enc_r  (CVM_OP_AND, t, x, one));      /* 4: loop top */
+                    cg_emit(cg, enc_br (CVM_OP_BNE, t, cg->zero_reg, 4)); /* 5: low bit set -> done */
+                    cg_emit(cg, enc_r  (CVM_OP_SHR, x, x, one));      /* 6 */
+                    cg_emit(cg, enc_r  (CVM_OP_ADD, n, n, one));      /* 7 */
+                    cg_emit(cg, enc_i24(CVM_OP_JMP, -5));             /* 8: back to 4 */
+                    cg_emit(cg, enc_i16(CVM_OP_MOVI, n, 32));         /* 9: x==0 case */
+                    cg_emit(cg, enc_r  (CVM_OP_MOV, dst, n, 0));      /* 10: done */
+                    break;
+                }
+
                 /* Funnel-shift intrinsics — clang -O1 emits these for the
                  * canonical multi-precision shift pattern
                  *   `(a << n) | (b >> (32 - n))`.
