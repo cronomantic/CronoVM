@@ -36,6 +36,10 @@ uint64_t  cvm_prof_total  = 0;       /* total instructions executed           */
  * hot leaf. Off (no attribution) when watch == 0xFFFFFFFF. */
 uint32_t  cvm_prof_watch  = 0xFFFFFFFFu;
 uint64_t *cvm_prof_caller = NULL;   /* [cvm_prof_len] calls into the watched fn */
+/* Debug instruction cap: when >0, execution returns cleanly once cvm_prof_total
+ * reaches it. Lets a profiling run break out of a runaway/infinite loop and dump
+ * the dominant (spinning) function. 0 = no cap. Set by the host before running. */
+uint64_t  cvm_prof_cap    = 0;
 
 void cvm_profile_reset(uint32_t func_count) {
     uint32_t n = func_count ? func_count : 1u;
@@ -54,7 +58,9 @@ void cvm_profile_reset(uint32_t func_count) {
  * declared inside cvm_exec_at, so they only ever expand there. */
 #ifdef CVM_PROFILE
 #  define PROF_TICK()    do { if (prof_cur < cvm_prof_len) cvm_prof_counts[prof_cur]++; \
-                              cvm_prof_total++; } while (0)
+                              cvm_prof_total++; \
+                              if (cvm_prof_cap && cvm_prof_total >= cvm_prof_cap) return CVM_OK; \
+                            } while (0)
 #  define PROF_CALL(fid) do { if (prof_sp < CVM_PROF_DEPTH) prof_stack[prof_sp++] = prof_cur; \
                               if ((uint32_t)(fid) == cvm_prof_watch && prof_cur < cvm_prof_len) \
                                   cvm_prof_caller[prof_cur]++; \
