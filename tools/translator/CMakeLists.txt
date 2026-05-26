@@ -158,7 +158,8 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
              dispatch_table const_gep reg_pressure float_mem struct_init reg_reuse
              narrow_ops narrow_cmp mem_intrin long_branch switch_dispatch
              switch_table switch_neg_table spill_loop vararg globptr lower_intrin fsh_narrow unreachable
-             spill_many spill_crossblock spill_call phi_loop_exit ctpop setjmp dup_operand)
+             spill_many spill_crossblock spill_call phi_loop_exit ctpop setjmp dup_operand
+             sitofp_narrow)
     set(_src ${_fixture_dir}/${name}.c)
     set(_bc  ${_fixture_out}/${name}.bc)
     # -ffreestanding turns off __STDC_HOSTED__, so clang's bundled
@@ -216,7 +217,8 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
              narrow_ops narrow_cmp mem_intrin
              long_branch switch_dispatch switch_table switch_neg_table
              spill_loop vararg globptr lower_intrin fsh_narrow unreachable
-             spill_many spill_crossblock spill_call phi_loop_exit ctpop setjmp dup_operand)
+             spill_many spill_crossblock spill_call phi_loop_exit ctpop setjmp dup_operand
+             sitofp_narrow)
     set(_bc  ${_fixture_out}/${name}.bc)
     set(_bin ${_fixture_out}/${name}.bin)
     add_custom_command(
@@ -323,6 +325,10 @@ add_test(NAME e2e_i64_basic   COMMAND test_e2e ${_fixture_out}/i64_basic.bin   0
 add_test(NAME e2e_i64_slice   COMMAND test_e2e ${_fixture_out}/i64_slice.bin    0 0)
 add_test(NAME e2e_i64_slice1  COMMAND test_e2e ${_fixture_out}/i64_slice.bin    1 1)
 add_test(NAME e2e_f64_basic   COMMAND test_e2e ${_fixture_out}/f64_basic.bin   0 0)
+# sitofp_narrow: `sitofp iN` (N<32) must sign-extend first (narrow loads/trunc
+# zero-extend). n=4 sums halved int16/int8 conversions = -290; the pre-fix bug
+# read every negative input huge-positive (this blanked the Quake 3D view).
+add_test(NAME e2e_sitofp_narrow COMMAND test_e2e ${_fixture_out}/sitofp_narrow.bin -290 4)
 # (cvm-cc's end-to-end test is registered in tools/cvm-cc/CMakeLists.txt
 # so the cvm-cc target exists when the test is being defined.)
 add_test(NAME e2e_two_funcs  COMMAND test_e2e ${_fixture_out}/two_funcs.bin 13 7 5)

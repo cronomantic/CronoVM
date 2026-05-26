@@ -2004,7 +2004,8 @@ static void cg_shift_imm(struct cg *cg, uint8_t cv, uint8_t dst,
 static void cg_emit_runtime_call(struct cg *cg, LLVMValueRef i,
                                  const char *name, LLVMValueRef *wide_args,
                                  int n_wide, LLVMValueRef scalar_arg,
-                                 int ret_slot, uint8_t dst_reg);
+                                 int ret_slot, uint8_t dst_reg,
+                                 unsigned scalar_sext_w);
 
 /* `select` of a wide (i64/f64) value: result = cond ? a : b, both 64-bit.
  * Same branch shape as the i32 select but copying two words. `i` is the
@@ -2143,7 +2144,7 @@ static void cg_emit_i64_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
                          : (op == LLVMURem) ? "__cvm_umod64" : "__cvm_smod64";
         LLVMValueRef a2[2] = { LLVMGetOperand(i, 0), LLVMGetOperand(i, 1) };
         cg_emit_runtime_call(cg, i, name, a2, 2, NULL,
-                             (int)cg->i64_slot[idx], 0);
+                             (int)cg->i64_slot[idx], 0, 0);
         break;
     }
     case LLVMLShr: case LLVMShl: case LLVMAShr: {
@@ -2156,7 +2157,7 @@ static void cg_emit_i64_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
                              : (op == LLVMLShr) ? "__cvm_shr64" : "__cvm_sar64";
             LLVMValueRef a2[2] = { LLVMGetOperand(i, 0), amt_v };
             cg_emit_runtime_call(cg, i, name, a2, 2, NULL,
-                                 (int)cg->i64_slot[idx], 0);
+                                 (int)cg->i64_slot[idx], 0, 0);
             return;
         }
         unsigned n = (unsigned)(LLVMConstIntGetZExtValue(amt_v) & 63u);
@@ -2784,12 +2785,17 @@ static int cg_f64_operand_to_regs(struct cg *cg, LLVMValueRef v, uint8_t base) {
  *   ret_slot    : >=0 -> sret result written to this frame slot (callee void);
  *                 <0  -> i32 result returned in R0
  *   dst_reg     : when ret_slot<0, the register that receives R0
+ *   scalar_sext_w : if in [1,31], sign-extend the scalar arg from that bit
+ *                 width to 32 bits (narrow loads/consts are zero-extended, so a
+ *                 signed conversion like `sitofp i16` would otherwise see the
+ *                 unsigned value). 0 / >=32 means leave the scalar as-is.
  * Argument register layout: [sret ptr if ret_slot>=0] then the wide pairs,
  * then the scalar — filling R0,R1,... in order. */
 static void cg_emit_runtime_call(struct cg *cg, LLVMValueRef i, const char *name,
                              LLVMValueRef *wide_args, int n_wide,
                              LLVMValueRef scalar_arg,
-                             int ret_slot, uint8_t dst_reg) {
+                             int ret_slot, uint8_t dst_reg,
+                             unsigned scalar_sext_w) {
     int callee_idx = cg_func_by_name(cg, name);
     if (callee_idx < 0) {
         ERR(cg->fn_name,
@@ -2834,6 +2840,15 @@ static void cg_emit_runtime_call(struct cg *cg, LLVMValueRef i, const char *name
             uint8_t s = cg_reg_for(cg, scalar_arg);
             if (cg->had_error) return;
             if (s != r) cg_emit(cg, enc_r(CVM_OP_MOV, r, s, 0));
+        }
+        /* Sign-extend a narrow signed scalar (e.g. `sitofp i16`) in place: the
+         * value arrived zero-extended, so without this __cvm_f_from_i32 would
+         * read i16 -2008 as +63528. */
+        if (scalar_sext_w >= 1 && scalar_sext_w < 32) {
+            int16_t shift = (int16_t)(32u - scalar_sext_w);
+            cg_emit(cg, enc_i16(CVM_OP_MOVI, (uint8_t)CG_REG_SCRATCH, shift));
+            cg_emit(cg, enc_r(CVM_OP_SHL, r, r, (uint8_t)CG_REG_SCRATCH));
+            cg_emit(cg, enc_r(CVM_OP_SAR, r, r, (uint8_t)CG_REG_SCRATCH));
         }
         r += 1;
     }
@@ -2933,7 +2948,7 @@ static void cg_emit_f64_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
                          : (op == LLVMFSub) ? "__cvm_fsub"
                          : (op == LLVMFMul) ? "__cvm_fmul" : "__cvm_fdiv";
         LLVMValueRef a2[2] = { LLVMGetOperand(i, 0), LLVMGetOperand(i, 1) };
-        cg_emit_runtime_call(cg, i, name, a2, 2, NULL, slot, 0);
+        cg_emit_runtime_call(cg, i, name, a2, 2, NULL, slot, 0, 0);
         break;
     }
     case LLVMFNeg: {
@@ -2948,13 +2963,22 @@ static void cg_emit_f64_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
     case LLVMSIToFP: case LLVMUIToFP: {
         const char *name = (op == LLVMSIToFP) ? "__cvm_f_from_i32"
                                               : "__cvm_f_from_u32";
-        cg_emit_runtime_call(cg, i, name, NULL, 0, LLVMGetOperand(i, 0), slot, 0);
+        LLVMValueRef opnd = LLVMGetOperand(i, 0);
+        unsigned sw = 0;
+        if (op == LLVMSIToFP) {
+            LLVMTypeRef t = LLVMTypeOf(opnd);
+            if (LLVMGetTypeKind(t) == LLVMIntegerTypeKind) {
+                unsigned w = LLVMGetIntTypeWidth(t);
+                if (w < 32) sw = w;   /* narrow signed -> needs sign-extension */
+            }
+        }
+        cg_emit_runtime_call(cg, i, name, NULL, 0, opnd, slot, 0, sw);
         break;
     }
     case LLVMFPExt: {
         /* float -> double. The f32 operand is one word (in a register). */
         cg_emit_runtime_call(cg, i, "__cvm_f_from_f32", NULL, 0,
-                         LLVMGetOperand(i, 0), slot, 0);
+                         LLVMGetOperand(i, 0), slot, 0, 0);
         break;
     }
     case LLVMLoad: {
@@ -2995,10 +3019,10 @@ static void cg_emit_f64_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
              * matching the soft runtime's existing truncating-mul accuracy and
              * the relaxed contract of fmuladd. */
             LLVMValueRef mul[2] = { LLVMGetOperand(i, 0), LLVMGetOperand(i, 1) };
-            cg_emit_runtime_call(cg, i, "__cvm_fmul", mul, 2, NULL, slot, 0);
+            cg_emit_runtime_call(cg, i, "__cvm_fmul", mul, 2, NULL, slot, 0, 0);
             if (cg->had_error) break;
             LLVMValueRef add[2] = { i, LLVMGetOperand(i, 2) };
-            cg_emit_runtime_call(cg, i, "__cvm_fadd", add, 2, NULL, slot, 0);
+            cg_emit_runtime_call(cg, i, "__cvm_fadd", add, 2, NULL, slot, 0, 0);
             break;
         }
         /* `llvm.sqrt.f64` (clang with -fno-math-errno) or a plain `sqrt` call
@@ -3007,7 +3031,7 @@ static void cg_emit_f64_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
          * soft sqrt helper. */
         if (strcmp(cname, "llvm.sqrt.f64") == 0 || strcmp(cname, "sqrt") == 0) {
             LLVMValueRef a1[1] = { LLVMGetOperand(i, 0) };
-            cg_emit_runtime_call(cg, i, "__cvm_fsqrt", a1, 1, NULL, slot, 0);
+            cg_emit_runtime_call(cg, i, "__cvm_fsqrt", a1, 1, NULL, slot, 0, 0);
             break;
         }
         if (strcmp(cname, "llvm.fabs.f64") == 0) {
@@ -3440,7 +3464,7 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     uint8_t dst = cg->regs[cg_lookup(cg, i)];
                     LLVMValueRef a2[2] = { LLVMGetOperand(i, 0),
                                            LLVMGetOperand(i, 1) };
-                    cg_emit_runtime_call(cg, i, fn, a2, 2, NULL, -1, dst);
+                    cg_emit_runtime_call(cg, i, fn, a2, 2, NULL, -1, dst, 0);
                     if (cg->had_error) break;
                     if (negate) {
                         uint8_t one_r = cg_alloc_reg(cg);
@@ -3545,7 +3569,7 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                  * is a no-op clang never emits). Soft-float runtime call. */
                 uint8_t dst = cg->regs[cg_lookup(cg, i)];
                 LLVMValueRef a1[1] = { LLVMGetOperand(i, 0) };
-                cg_emit_runtime_call(cg, i, "__cvm_f_to_f32", a1, 1, NULL, -1, dst);
+                cg_emit_runtime_call(cg, i, "__cvm_f_to_f32", a1, 1, NULL, -1, dst, 0);
                 break;
             }
 
@@ -3560,11 +3584,33 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     const char *fn = (op == LLVMFPToSI) ? "__cvm_f_to_i32"
                                                         : "__cvm_f_to_u32";
                     LLVMValueRef a1[1] = { LLVMGetOperand(i, 0) };
-                    cg_emit_runtime_call(cg, i, fn, a1, 1, NULL, -1, dst);
+                    cg_emit_runtime_call(cg, i, fn, a1, 1, NULL, -1, dst, 0);
                     break;
                 }
                 uint8_t src = cg_reg_for(cg, LLVMGetOperand(i, 0));
                 uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                /* `sitofp iN` (N<32) on a narrow operand: the value sits
+                 * zero-extended in its register (LDB/LDH zero-extend), so
+                 * I2F_S would read e.g. i16 -2008 as +63528. Sign-extend it
+                 * first via the SHL/SAR pair (as the SExt lowering does).
+                 * UIToFP is correct as-is — zero-extension IS the unsigned
+                 * value. */
+                if (op == LLVMSIToFP) {
+                    LLVMTypeRef sty = LLVMTypeOf(LLVMGetOperand(i, 0));
+                    if (LLVMGetTypeKind(sty) == LLVMIntegerTypeKind) {
+                        unsigned w = LLVMGetIntTypeWidth(sty);
+                        if (w < 32) {
+                            int16_t shift = (int16_t)(32u - w);
+                            cg_emit(cg, enc_i16(CVM_OP_MOVI,
+                                                (uint8_t)CG_REG_SCRATCH, shift));
+                            cg_emit(cg, enc_r(CVM_OP_SHL, dst, src,
+                                              (uint8_t)CG_REG_SCRATCH));
+                            cg_emit(cg, enc_r(CVM_OP_SAR, dst, dst,
+                                              (uint8_t)CG_REG_SCRATCH));
+                            src = dst;   /* convert from the sign-extended reg */
+                        }
+                    }
+                }
                 uint8_t cv;
                 switch (op) {
                 case LLVMSIToFP: cv = CVM_OP_I2F_S; break;
