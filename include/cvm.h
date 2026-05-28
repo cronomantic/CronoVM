@@ -123,6 +123,7 @@ enum cvm_result {
     CVM_E_NULL_FUNC_PTR,    /* CALL/CALLR targeted the reserved slot 0 */
     CVM_E_BAD_REGION,       /* malformed CVM_SEC_HOST_REGION section */
     CVM_E_NO_SUCH_REGION,   /* cvm_image_get_region on an unknown name */
+    CVM_E_BAD_CORO_STATE,   /* CORO_SWAP target is RUNNING or DEAD */
 };
 
 /* ---------------------------------------------------------------------------
@@ -391,6 +392,18 @@ enum cvm_opcode {
      * value, where the caller reloads its spilled locals from the restored frame.
      * The translator lowers a `longjmp(env, val)` call to this. */
     CVM_OP_LONGJMP = 0x3B,
+
+    /* CORO_SWAP A=reg holding &from, B=reg holding &to: atomic context swap.
+     * Operates on 16-byte records {u32 pc, u32 sp, u32 dest, u32 status} —
+     * the first 3 words match jmp_buf, the 4th adds status (CORO_FRESH=0,
+     * CORO_RUNNING=1, CORO_SUSPENDED=2, CORO_DEAD=3). Saves {next pc, SP, A}
+     * into `from` with status=SUSPENDED. If `to.status == FRESH`, treats
+     * `to.pc` as a function index (FUNCS lookup); else as a raw PC. Sets
+     * R[to.dest] = from (the swap initiator), restores SP, jumps to PC,
+     * marks to.status = RUNNING. Traps CVM_E_BAD_CORO_STATE on swap to
+     * RUNNING/DEAD, CVM_E_BAD_ADDR on bad buf or self-swap. The translator
+     * lowers `__cvm_coro_swap_raw(from, to)` to this. */
+    CVM_OP_CORO_SWAP = 0x3C,
 };
 
 #define CVM_REG_COUNT 256

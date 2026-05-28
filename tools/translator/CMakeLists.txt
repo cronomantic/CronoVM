@@ -159,7 +159,7 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
              narrow_ops narrow_cmp mem_intrin long_branch switch_dispatch
              switch_table switch_neg_table spill_loop vararg globptr lower_intrin fsh_narrow unreachable
              spill_many spill_crossblock spill_call phi_loop_exit ctpop setjmp dup_operand
-             sitofp_narrow)
+             sitofp_narrow coro_basic coro_pingpong)
     set(_src ${_fixture_dir}/${name}.c)
     set(_bc  ${_fixture_out}/${name}.bc)
     # -ffreestanding turns off __STDC_HOSTED__, so clang's bundled
@@ -218,7 +218,7 @@ foreach(name add pick fib abs max divmod bitops counter sum_global
              long_branch switch_dispatch switch_table switch_neg_table
              spill_loop vararg globptr lower_intrin fsh_narrow unreachable
              spill_many spill_crossblock spill_call phi_loop_exit ctpop setjmp dup_operand
-             sitofp_narrow)
+             sitofp_narrow coro_basic coro_pingpong)
     set(_bc  ${_fixture_out}/${name}.bc)
     set(_bin ${_fixture_out}/${name}.bin)
     add_custom_command(
@@ -310,6 +310,16 @@ add_test(NAME e2e_xor_i1     COMMAND test_e2e ${_fixture_out}/xor_i1.bin 0 0)
 # n=0 -> 6 ; n=10 -> 16. Exercises CVM_OP_SETJMP/LONGJMP + SP unwind.
 add_test(NAME e2e_setjmp     COMMAND test_e2e ${_fixture_out}/setjmp.bin  6  0)
 add_test(NAME e2e_setjmp10   COMMAND test_e2e ${_fixture_out}/setjmp.bin 16 10)
+# Coroutine swap (CVM_OP_CORO_SWAP). worker sets g_value=42 then swaps back.
+# vm_main(n) returns 42+n. Exercises FRESH (FUNCS lookup) + SUSPENDED (saved PC).
+add_test(NAME e2e_coro_basic COMMAND test_e2e ${_fixture_out}/coro_basic.bin 49 7)
+add_test(NAME e2e_coro_basic0 COMMAND test_e2e ${_fixture_out}/coro_basic.bin 42 0)
+# Ping-pong: 3 coros (main, A, B). A bumps, A->B, B bumps, B->A, A bumps, A->main.
+# counter ends at 3; vm_main returns 3+n. Exercises multiple FRESH transitions
+# and many SUSPENDED resumes without losing live SSA regs (live SSA values must
+# be spilled+restored around the call-style protocol). n=5 -> 8.
+add_test(NAME e2e_coro_pingpong  COMMAND test_e2e ${_fixture_out}/coro_pingpong.bin 8 5)
+add_test(NAME e2e_coro_pingpong0 COMMAND test_e2e ${_fixture_out}/coro_pingpong.bin 3 0)
 # dup_operand: a value reused across an instruction's operand slots (x*x) is
 # freed to the reg pool once, not twice — else a counted loop's exit icmp drew
 # the same register as the counter increment and clobbered it (infinite loop).

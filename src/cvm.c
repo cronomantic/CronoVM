@@ -876,6 +876,7 @@ static int cvm_exec_at(struct cvm_image *img,
         [CVM_OP_QDIV6432] = &&L_QDIV6432,
         [CVM_OP_SETJMP]   = &&L_SETJMP,
         [CVM_OP_LONGJMP]  = &&L_LONGJMP,
+        [CVM_OP_CORO_SWAP] = &&L_CORO_SWAP,
     };
 
 #  define DISPATCH() do {                                  \
@@ -1177,6 +1178,46 @@ static int cvm_exec_at(struct cvm_image *img,
         pc            = jpc;
         DISPATCH();
     }
+    L_CORO_SWAP: {
+        uint32_t from = (uint32_t)R[a];
+        uint32_t to   = (uint32_t)R[b];
+        if (from > mem_size || mem_size - from < 16u) return CVM_E_BAD_ADDR;
+        if (to   > mem_size || mem_size - to   < 16u) return CVM_E_BAD_ADDR;
+        if (from == to) return CVM_E_BAD_ADDR;       /* self-swap = bug */
+        uint32_t jstat;
+        memcpy(&jstat, heap + to + 12u, 4);
+        if (jstat != 0u && jstat != 2u) return CVM_E_BAD_CORO_STATE;
+        uint32_t jpc, jsp, jdst;
+        memcpy(&jpc,  heap + to + 0u, 4);
+        memcpy(&jsp,  heap + to + 4u, 4);
+        memcpy(&jdst, heap + to + 8u, 4);
+        if (jstat == 0u) {
+            /* CORO_FRESH — jpc is a function index, FUNCS lookup; jdst is
+             * where the entry fn expects its arg0 (ABI: R0). */
+            if (jpc == 0u)              return CVM_E_NULL_FUNC_PTR;
+            if (jpc >= func_count)      return CVM_E_BAD_FUNC_INDEX;
+            jpc = func_offsets[jpc];
+            if (jdst >= CVM_REG_COUNT)  return CVM_E_BAD_ADDR;
+        }
+        if (jpc >= code_count)         return CVM_E_BAD_PC;
+        uint32_t cur_sp     = (uint32_t)R[CVM_REG_SP];
+        uint32_t dest_a     = a;
+        uint32_t suspended  = 2u;
+        uint32_t running    = 1u;
+        memcpy(heap + from +  0u, &pc,        4);
+        memcpy(heap + from +  4u, &cur_sp,    4);
+        memcpy(heap + from +  8u, &dest_a,    4);
+        memcpy(heap + from + 12u, &suspended, 4);
+        memcpy(heap + to   + 12u, &running,   4);
+        /* FRESH resume: hand `from` to the entry fn in its arg0 reg. */
+        /* SUSPENDED resume: no register clobber — caller-saved regs are
+         * preserved across the swap, no returns_twice needed at the call
+         * site. "Who resumed us" lives in to->resumer (cart-side). */
+        if (jstat == 0u) R[jdst] = (int32_t)from;
+        R[CVM_REG_SP] = (int32_t)jsp;
+        pc            = jpc;
+        DISPATCH();
+    }
 
 #  undef DISPATCH
 
@@ -1457,6 +1498,40 @@ static int cvm_exec_at(struct cvm_image *img,
             if (jdst >= CVM_REG_COUNT) return CVM_E_BAD_ADDR;
             int32_t v = R[b];
             R[jdst]       = (v != 0) ? v : 1;
+            R[CVM_REG_SP] = (int32_t)jsp;
+            pc            = jpc;
+            break;
+        }
+        case CVM_OP_CORO_SWAP: {
+            uint32_t from = (uint32_t)R[a];
+            uint32_t to   = (uint32_t)R[b];
+            if (from > mem_size || mem_size - from < 16u) return CVM_E_BAD_ADDR;
+            if (to   > mem_size || mem_size - to   < 16u) return CVM_E_BAD_ADDR;
+            if (from == to) return CVM_E_BAD_ADDR;
+            uint32_t jstat;
+            memcpy(&jstat, heap + to + 12u, 4);
+            if (jstat != 0u && jstat != 2u) return CVM_E_BAD_CORO_STATE;
+            uint32_t jpc, jsp, jdst;
+            memcpy(&jpc,  heap + to + 0u, 4);
+            memcpy(&jsp,  heap + to + 4u, 4);
+            memcpy(&jdst, heap + to + 8u, 4);
+            if (jstat == 0u) {
+                if (jpc == 0u)              return CVM_E_NULL_FUNC_PTR;
+                if (jpc >= func_count)      return CVM_E_BAD_FUNC_INDEX;
+                jpc = func_offsets[jpc];
+                if (jdst >= CVM_REG_COUNT)  return CVM_E_BAD_ADDR;
+            }
+            if (jpc >= code_count)         return CVM_E_BAD_PC;
+            uint32_t cur_sp     = (uint32_t)R[CVM_REG_SP];
+            uint32_t dest_a     = a;
+            uint32_t suspended  = 2u;
+            uint32_t running    = 1u;
+            memcpy(heap + from +  0u, &pc,        4);
+            memcpy(heap + from +  4u, &cur_sp,    4);
+            memcpy(heap + from +  8u, &dest_a,    4);
+            memcpy(heap + from + 12u, &suspended, 4);
+            memcpy(heap + to   + 12u, &running,   4);
+            if (jstat == 0u) R[jdst] = (int32_t)from;
             R[CVM_REG_SP] = (int32_t)jsp;
             pc            = jpc;
             break;

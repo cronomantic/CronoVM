@@ -4313,6 +4313,16 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     cg_emit(cg, enc_r(CVM_OP_LONGJMP, env, val, 0));
                     break;
                 }
+                /* __cvm_coro_swap_raw(from, to) falls through to the full
+                 * call-lowering protocol — which spills caller-saved SSA
+                 * regs (live across the call) and lands args in R0/R1
+                 * exactly like a real call. At step 4 (where CALL would
+                 * be emitted) the protocol substitutes CORO_SWAP R0, R1
+                 * instead, since this function has no body. Without the
+                 * spill protocol, a caller's SSA reg that survives the
+                 * swap would be clobbered by the callee's register usage
+                 * (the VM register file is shared across coroutines —
+                 * CORO_SWAP only saves/restores PC+SP+status). */
 
                 /* llvm.abs.i32(%x, _is_int_min_poison)
                  *   abs(x) = (x<0) ? -x : x
@@ -4929,8 +4939,9 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 int callee_idx = -1;
                 uint8_t callee_reg = 0;
                 int is_indirect = (callee_fn == NULL);
+                int is_coro_swap = (name && strcmp(name, "__cvm_coro_swap_raw") == 0);
 
-                if (!is_indirect) {
+                if (!is_indirect && !is_coro_swap) {
                     callee_idx = cg_func_lookup(cg, callee_fn);
                     if (callee_idx < 0) {
                         if (name && strncmp(name, "llvm.", 5) == 0)
@@ -5088,6 +5099,11 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                         if (cg->had_error) break;
                     }
                     cg_emit(cg, enc_r(CVM_OP_CALLR, callee_reg, 0, 0));
+                } else if (is_coro_swap) {
+                    /* args landed in R0 (from) and R1 (to) via the standard
+                     * arg-placement step above. CORO_SWAP saves current as
+                     * SUSPENDED into R0's pointee, restores R1's pointee. */
+                    cg_emit(cg, enc_r(CVM_OP_CORO_SWAP, 0, 1, 0));
                 } else {
                     cg_emit(cg, enc_i24(CVM_OP_CALL, callee_idx + 1));
                 }
