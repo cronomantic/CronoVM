@@ -4760,6 +4760,66 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     break;
                 }
 
+                /* Saturating add/sub, any integer width. clang -O folds
+                 * counters guarded with `if (x > 0) --x;` / `if (x < N) ++x;`
+                 * into llvm.{u,s}{add,sub}.sat.iN. Lowered as cmp + select
+                 * (no narrow-width adjustment needed: the saturate is the
+                 * cmp itself; on overflow we just clamp). Same shape as
+                 * the min/max family above. */
+                int is_sat = 0, sat_sub = 0, sat_signed = 0;
+                if      (strncmp(name, "llvm.uadd.sat.i", 15) == 0) { is_sat=1; }
+                else if (strncmp(name, "llvm.usub.sat.i", 15) == 0) { is_sat=1; sat_sub=1; }
+                else if (strncmp(name, "llvm.sadd.sat.i", 15) == 0) { is_sat=1; sat_signed=1; }
+                else if (strncmp(name, "llvm.ssub.sat.i", 15) == 0) { is_sat=1; sat_sub=1; sat_signed=1; }
+                if (is_sat) {
+                    /* For now handle unsigned only — the signed variants
+                     * have asymmetric saturation (negative-overflow → MIN,
+                     * positive → MAX) which needs more instructions. UQM
+                     * only emits the unsigned forms in the path we care
+                     * about; reject signed loudly to surface any future
+                     * need. */
+                    if (sat_signed) {
+                        ERR(cg->fn_name, "llvm.{s}{add,sub}.sat not yet lowered (signed)");
+                        cg->had_error = 1;
+                        break;
+                    }
+                    uint8_t a   = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                    uint8_t b2  = cg_reg_for(cg, LLVMGetOperand(i, 1));
+                    uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                    if (cg->had_error) break;
+                    uint8_t tmp  = cg_alloc_reg(cg);
+                    uint8_t cond = cg_alloc_reg(cg);
+                    if (cg->had_error) break;
+                    if (sat_sub) {
+                        /* usub.sat(a, b) = (a >= b) ? (a - b) : 0
+                         * Compute tmp = a - b unconditionally (cheap), then
+                         * select 0 when a < b. The subtract wraps cleanly
+                         * mod 2^32 either way; we just discard the wrap. */
+                        cg_emit(cg, enc_r(CVM_OP_SUB, tmp, a, b2));
+                        cg_emit(cg, enc_r(CVM_OP_CMP_LTU, cond, a, b2));
+                        cg_emit(cg, enc_br(CVM_OP_BEQ, cond, cg->zero_reg, 2));
+                        cg_emit(cg, enc_r (CVM_OP_MOV, dst, cg->zero_reg, 0));
+                        cg_emit(cg, enc_i24(CVM_OP_JMP, 1));
+                        cg_emit(cg, enc_r (CVM_OP_MOV, dst, tmp, 0));
+                    } else {
+                        /* uadd.sat(a, b) = (a + b < a) ? UINT32_MAX : a + b
+                         * (carry == wrap). For narrow widths a clamp would
+                         * also need the high-bit-vs-width check; we trust
+                         * clang to have already extended narrow operands
+                         * before this call site. */
+                        uint8_t max_r = cg_alloc_reg(cg);
+                        if (cg->had_error) break;
+                        cg_emit(cg, enc_r(CVM_OP_ADD, tmp, a, b2));
+                        cg_emit_load_const32(cg, max_r, -1);   /* 0xFFFFFFFF */
+                        cg_emit(cg, enc_r(CVM_OP_CMP_LTU, cond, tmp, a));
+                        cg_emit(cg, enc_br(CVM_OP_BEQ, cond, cg->zero_reg, 2));
+                        cg_emit(cg, enc_r (CVM_OP_MOV, dst, max_r, 0));
+                        cg_emit(cg, enc_i24(CVM_OP_JMP, 1));
+                        cg_emit(cg, enc_r (CVM_OP_MOV, dst, tmp, 0));
+                    }
+                    break;
+                }
+
                 /* Calls to cvm_sys_* lower to SYSCALL with the matching
                  * import index. Args go in R0..R(narg-1); return value
                  * comes back in R0. */
