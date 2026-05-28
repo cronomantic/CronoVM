@@ -8,6 +8,41 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ## [Unreleased]
 
+### Added
+
+- **Cooperative-coroutine primitive `CVM_OP_CORO_SWAP` (opcode `0x3C`)**.
+  Atomic save+load of a 16-byte execution-context record
+  `{u32 pc, u32 sp, u32 dest, u32 status}` at heap addresses passed in
+  `R[A]` (from) and `R[B]` (to). On first resume of a fresh coroutine
+  (`status == CORO_FRESH`) the opcode reads `pc` as a function index and
+  does a `FUNCS` lookup so the entry can be set up from cart C code with
+  no extra VM primitive; on subsequent resumes (`status == CORO_SUSPENDED`)
+  it uses `pc` as a raw program counter. Lets a cart implement any
+  cooperative concurrency model (libco-style schedulers, Lua-style
+  yield-with-value generators, async/await desugaring) on top of three
+  small SDK functions — `cron_coro_init` / `cron_coro_swap` /
+  `cron_coro_yield` (declared in Cronopio's `sdk/include/coro.h`).
+  - On `FRESH` resume the opcode writes `R[to.dest] = to` so the entry fn
+    receives the new coroutine pointer as its arg0 (`to.dest` is
+    conventionally 0 = R0 per ABI). On `SUSPENDED` resume the register
+    file is preserved intact, so the cart's caller-saved regs survive
+    the swap without needing `returns_twice` at the call site. "Who
+    resumed me" is recoverable from the cart-managed `to->resumer` field
+    (the SDK's `cron_coro_swap` wrapper sets it just before the opcode).
+  - Critical correctness detail: the translator routes
+    `__cvm_coro_swap_raw(from, to)` through the **full user-call lowering
+    protocol** (caller-saved SSA-reg spill to the cart's frame, arg
+    placement in `R0`/`R1`) and substitutes `CORO_SWAP R0, R1` for the
+    `CALL` at emission time. The VM register file is **shared across
+    coroutines** (the opcode only saves PC/SP/status, not the regs); the
+    spill protocol is what makes register lifetimes correct across a
+    yield.
+  - New error code `CVM_E_BAD_CORO_STATE` (issued when a `CORO_SWAP`
+    target has `status` ∈ {`CORO_RUNNING`, `CORO_DEAD`} — illegal
+    re-entrancy or resumer chasing a finished coro). New e2e tests:
+    `e2e_coro_basic` and `e2e_coro_pingpong` (4 cases, all green). Spec
+    in [`docs/isa.md`](docs/isa.md).
+
 ### Fixed
 
 - **Register pool double-free when a value fills several operand slots of one

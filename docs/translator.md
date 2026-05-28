@@ -150,6 +150,17 @@ the gap is what's still being implemented:
 - non-local jumps: `setjmp` / `longjmp` calls lower to the `SETJMP` / `LONGJMP`
   opcodes (no library body needed). The `jmp_buf` captures `{resume pc, SP,
   dest reg}`; see the ISA reference.
+- cooperative coroutines: a call to the by-name primitive
+  `__cvm_coro_swap_raw(from, to)` lowers to the `CORO_SWAP` opcode
+  (atomic save+load of a 16-byte execution-context record). Unlike
+  `setjmp`/`longjmp`, the call is **not** intercepted before the user-call
+  lowering — it falls through the full call protocol (caller-saved SSA
+  spill to the cart's frame, arg placement in R0/R1) and only the final
+  `CALL` emission is replaced by `CORO_SWAP R0, R1`. This is essential:
+  the VM register file is shared across coroutines, so the spill protocol
+  is what keeps the cart's live SSA regs valid across a yield. The SDK
+  ships the cart-facing wrappers in `sdk/include/coro.h`
+  (`cron_coro_init` / `cron_coro_swap` / `cron_coro_yield`).
 - syscall calls: any `cvm_sys_*` function call lowers to `SYSCALL`
 - user calls: direct calls to functions defined in the same module
   lower to `CALL imm24`, with caller-saved spill, R0..R7+stack arg
