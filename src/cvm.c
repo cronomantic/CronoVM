@@ -1209,11 +1209,15 @@ static int cvm_exec_at(struct cvm_image *img,
         memcpy(heap + from +  8u, &dest_a,    4);
         memcpy(heap + from + 12u, &suspended, 4);
         memcpy(heap + to   + 12u, &running,   4);
-        /* FRESH resume: hand `from` to the entry fn in its arg0 reg. */
+        /* FRESH resume: hand the new coroutine pointer (`to`) to the entry
+         * fn in its arg0 reg. The trampoline / user-supplied entry takes
+         * `cron_coro_t *self` so it can read self->fn(self->arg). The swap
+         * initiator is still recoverable as to->resumer (the cart-side
+         * cron_coro_swap wrapper sets it just before the opcode fires). */
         /* SUSPENDED resume: no register clobber — caller-saved regs are
          * preserved across the swap, no returns_twice needed at the call
-         * site. "Who resumed us" lives in to->resumer (cart-side). */
-        if (jstat == 0u) R[jdst] = (int32_t)from;
+         * site. */
+        if (jstat == 0u) R[jdst] = (int32_t)to;
         R[CVM_REG_SP] = (int32_t)jsp;
         pc            = jpc;
         DISPATCH();
@@ -1531,7 +1535,7 @@ static int cvm_exec_at(struct cvm_image *img,
             memcpy(heap + from +  8u, &dest_a,    4);
             memcpy(heap + from + 12u, &suspended, 4);
             memcpy(heap + to   + 12u, &running,   4);
-            if (jstat == 0u) R[jdst] = (int32_t)from;
+            if (jstat == 0u) R[jdst] = (int32_t)to;
             R[CVM_REG_SP] = (int32_t)jsp;
             pc            = jpc;
             break;

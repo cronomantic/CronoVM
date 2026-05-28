@@ -31,11 +31,13 @@ static cron_coro_t worker_coro;
 static uint8_t     worker_stack[8192];
 static int         g_value;
 
-/* Worker entry — receives the swap initiator (== &main_coro) in R0 per ABI
- * (CORO_SWAP sets R[to.dest] = from; we set to.dest = 0). */
-static void worker_fn(cron_coro_t *resumer) {
+/* Worker entry — receives the coroutine itself in R0 (CORO_SWAP on FRESH
+ * sets R[to.dest] = to, with dest = 0 = ABI arg0). The "who resumed me"
+ * info lives in self->resumer, set by the cron_coro_swap wrapper before
+ * the opcode (we mirror that here with a direct write). */
+static void worker_fn(cron_coro_t *self) {
     g_value = 42;
-    __cvm_coro_swap_raw(&worker_coro, resumer);
+    __cvm_coro_swap_raw(self, self->resumer);
     /* unreachable: when main runs us again it would have to re-CORO_SWAP us
      * but we already swapped out cleanly here. Falling off the end would
      * pop the trap sentinel and fault CVM_E_BAD_PC. */
@@ -54,7 +56,10 @@ int vm_main(int n) {
     worker_coro.status = 0;          /* CORO_FRESH */
 
     /* main_coro is freshly-zeroed; the first save into it populates pc/sp/
-     * dest/status from the running cart context. No init needed. */
+     * dest/status from the running cart context. No init needed.
+     * Set the resumer link cart-side (the opcode doesn't touch field 32);
+     * the SDK's cron_coro_swap wrapper would do this automatically. */
+    worker_coro.resumer = &main_coro;
     __cvm_coro_swap_raw(&main_coro, &worker_coro);
     /* resumed here when worker swaps back. Volatile read of g_value forces
      * a real memory load (defeats clang's i1+select optimization that

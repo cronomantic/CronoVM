@@ -398,9 +398,11 @@ enum cvm_opcode {
      * the first 3 words match jmp_buf, the 4th adds status (CORO_FRESH=0,
      * CORO_RUNNING=1, CORO_SUSPENDED=2, CORO_DEAD=3). Saves {next pc, SP, A}
      * into `from` with status=SUSPENDED. If `to.status == FRESH`, treats
-     * `to.pc` as a function index (FUNCS lookup); else as a raw PC. Sets
-     * R[to.dest] = from (the swap initiator), restores SP, jumps to PC,
-     * marks to.status = RUNNING. Traps CVM_E_BAD_CORO_STATE on swap to
+     * `to.pc` as a function index (FUNCS lookup); else as a raw PC. On
+     * FRESH resume only, sets R[to.dest] = to so the entry fn gets the
+     * new coroutine pointer as its arg0 (to.dest is conventionally 0 = R0
+     * per ABI). On SUSPENDED resume the register file is preserved intact.
+     * Restores SP, jumps to PC, marks to.status = RUNNING. Traps CVM_E_BAD_CORO_STATE on swap to
      * RUNNING/DEAD, CVM_E_BAD_ADDR on bad buf or self-swap. The translator
      * lowers `__cvm_coro_swap_raw(from, to)` to this. */
     CVM_OP_CORO_SWAP = 0x3C,

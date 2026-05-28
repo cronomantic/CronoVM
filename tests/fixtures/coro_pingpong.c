@@ -40,16 +40,19 @@ static inline void cron_coro_swap(cron_coro_t *from, cron_coro_t *to) {
     __cvm_coro_swap_raw(from, to);
 }
 
-static void a_fn(cron_coro_t *resumer) {
+static void a_fn(cron_coro_t *self) {
+    /* Capture the FIRST resumer (main) — self->resumer gets overwritten
+     * when b later swaps back to us. */
+    cron_coro_t *main_caller = self->resumer;
     counter++;                       /* 1 */
-    cron_coro_swap(&a_coro, &b_coro);
+    cron_coro_swap(self, &b_coro);   /* a -> b */
     counter++;                       /* 3, after b returns to us */
-    cron_coro_swap(&a_coro, resumer);
+    cron_coro_swap(self, main_caller);
 }
 
-static void b_fn(cron_coro_t *resumer) {
+static void b_fn(cron_coro_t *self) {
     counter++;                       /* 2 */
-    cron_coro_swap(&b_coro, resumer);
+    cron_coro_swap(self, self->resumer);  /* b -> a */
 }
 
 static void init_coro(cron_coro_t *c, void (*fn)(void *), uint8_t *stack, uint32_t stack_sz) {
