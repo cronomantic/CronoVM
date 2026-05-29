@@ -433,6 +433,19 @@ struct cg_func {
     uint32_t     frame_size;
 };
 
+/* A function's FUNCS-table slot (== its pointer value). Function k lives at
+ * slot (k+1)<<1, so:
+ *   - slot 0 is the reserved null-function-pointer trap (a NULL fn-ptr is 0);
+ *   - every real function-pointer value is EVEN. The C++ Itanium member-
+ *     function-pointer ABI reserves the LOW BIT of the pointer field as the
+ *     "virtual" flag (it assumes real code addresses are >=2-aligned); a small
+ *     odd index would be misread as a virtual member pointer. Keeping function
+ *     pointers 2-aligned makes pmf dispatch (and any 2-alignment assumption)
+ *     correct. The FUNCS table is sized to match (odd slots stay 0 = trap).
+ * CALL/CALLR and the runtime FUNCS[slot] lookup are unchanged — only the slot
+ * numbering (and hence the table size) differs. */
+#define CVM_FN_SLOT(fidx) (((uint32_t)(fidx) + 1u) << 1)
+
 static int serialize_function_index(const struct cg_globals *g,
                                     LLVMValueRef fn,
                                     uint8_t *out, uint32_t off)
@@ -442,11 +455,7 @@ static int serialize_function_index(const struct cg_globals *g,
     for (int i = 0; i < g->func_count; ++i)
         if (g->funcs[i].value == fn) { fidx = i; break; }
     if (fidx < 0) return 1;
-    /* Function "address" = its FUNCS-table index + 1, written as a 32-bit
-     * LE integer. CALLR Rd reads R[d] and looks up FUNCS[R[d]] at run
-     * time; FUNCS[0] is the reserved null-function-pointer slot, so user
-     * functions live at FUNCS[1..N] and a NULL fn-ptr is naturally 0. */
-    uint32_t enc = (uint32_t)fidx + 1u;
+    uint32_t enc = CVM_FN_SLOT(fidx);
     out[off + 0] = (uint8_t)(enc);
     out[off + 1] = (uint8_t)(enc >> 8);
     out[off + 2] = (uint8_t)(enc >> 16);
@@ -502,6 +511,16 @@ static int serialize_constant(const struct cg_globals *g, LLVMValueRef c,
     LLVMTypeRef ty = LLVMTypeOf(c);
     uint32_t sz = (uint32_t)LLVMABISizeOfType(g->td, ty);
     if (off + sz > cap) return 1;
+
+    /* A pointer<->int reinterpret / bitcast in a constant initialiser — e.g. a
+     * C++ member-function-pointer field `ptrtoint(@fn to i32)` in a const pmf
+     * table. Unwrap and serialize the underlying value (a function -> its
+     * FUNCS slot). Both sides are pointer-width, so the byte layout matches. */
+    if (LLVMIsAConstantExpr(c)) {
+        LLVMOpcode cop = LLVMGetConstOpcode(c);
+        if (cop == LLVMPtrToInt || cop == LLVMIntToPtr || cop == LLVMBitCast)
+            return serialize_constant(g, LLVMGetOperand(c, 0), out, off, cap);
+    }
 
     if (LLVMIsAConstantAggregateZero(c) || LLVMIsAConstantPointerNull(c)) {
         /* out is calloc/zeroed already; nothing to write. */
@@ -1231,7 +1250,7 @@ static uint8_t cg_reg_for(struct cg *cg, LLVMValueRef v) {
         }
         uint8_t r = cg_alloc_reg(cg);
         if (cg->had_error) return 0;
-        cg_emit_load_const32(cg, r, fidx + 1);
+        cg_emit_load_const32(cg, r, (int32_t)CVM_FN_SLOT(fidx));
         cg->funcs_referenced = 1;
         return r;
     }
@@ -2863,7 +2882,7 @@ static void cg_emit_runtime_call(struct cg *cg, LLVMValueRef i, const char *name
         r += 1;
     }
 
-    cg_emit(cg, enc_i24(CVM_OP_CALL, callee_idx + 1));
+    cg_emit(cg, enc_i24(CVM_OP_CALL, (int32_t)CVM_FN_SLOT(callee_idx)));
     cg->has_calls = 1;
 
     if (cg_emit_restore(cg, &set)) { cg->had_error = 1; return; }
@@ -3218,7 +3237,7 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
      * alloca pointers materialised just below remain valid. */
     if (func_idx == cg->entry_func_idx && cg->ctor_count > 0) {
         for (int c = 0; c < cg->ctor_count; ++c)
-            cg_emit(cg, enc_i24(CVM_OP_CALL, cg->ctor_idx[c] + 1));
+            cg_emit(cg, enc_i24(CVM_OP_CALL, (int32_t)CVM_FN_SLOT(cg->ctor_idx[c])));
         cg->has_calls = 1;
     }
 
@@ -5286,7 +5305,7 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                      * SUSPENDED into R0's pointee, restores R1's pointee. */
                     cg_emit(cg, enc_r(CVM_OP_CORO_SWAP, 0, 1, 0));
                 } else {
-                    cg_emit(cg, enc_i24(CVM_OP_CALL, callee_idx + 1));
+                    cg_emit(cg, enc_i24(CVM_OP_CALL, (int32_t)CVM_FN_SLOT(callee_idx)));
                 }
                 cg->has_calls = 1;
 
@@ -5451,17 +5470,21 @@ static int write_bin(const char *path,
         }
     }
 
-    /* Build FUNCS payload (u32[N+1] of entry offsets). Slot 0 is reserved
-     * as the null-function-pointer trap target; the interpreter rejects
-     * any CALL/CALLR with fid==0 before reading FUNCS, so the value here
-     * is unused — we leave it 0. User function k lives at FUNCS[k+1]. */
+    /* Build FUNCS payload of entry offsets. Slot 0 is reserved as the null-
+     * function-pointer trap target; the interpreter rejects any CALL/CALLR with
+     * fid==0 before reading FUNCS, so its value is unused (left 0). User
+     * function k lives at FUNCS[(k+1)<<1] (see CVM_FN_SLOT): pointer values are
+     * even so they don't collide with the C++ pmf virtual low-bit. The table is
+     * sized to the highest slot used; odd slots stay 0 (= trap if mis-called).
+     * func_count is derived by the loader as funcs_size/4. */
     uint8_t  *funcs_buf  = NULL;
     uint32_t  funcs_size = 0;
     if (emit_funcs && func_count > 0) {
-        funcs_size = (uint32_t)(func_count + 1) * 4u;
+        uint32_t slots = CVM_FN_SLOT(func_count - 1) + 1u;  /* highest slot + 1 */
+        funcs_size = slots * 4u;
         funcs_buf  = (uint8_t *)calloc(1, funcs_size);
         for (int k = 0; k < func_count; ++k)
-            put_u32_le(funcs_buf + (size_t)(k + 1) * 4u, funcs[k].entry_offset);
+            put_u32_le(funcs_buf + (size_t)CVM_FN_SLOT(k) * 4u, funcs[k].entry_offset);
     }
 
     /* Build HOST_REGION payload: u32 region_count followed by 28-byte
