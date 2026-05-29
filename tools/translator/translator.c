@@ -4324,22 +4324,41 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                  * (the VM register file is shared across coroutines —
                  * CORO_SWAP only saves/restores PC+SP+status). */
 
-                /* llvm.abs.i32(%x, _is_int_min_poison)
+                /* llvm.abs.iN(%x, _is_int_min_poison)  (N = 8/16/32)
                  *   abs(x) = (x<0) ? -x : x
                  *
+                 *   [if N<32: sign-extend x to 32 bits first]
                  *   CMP_LT cond, x, zero
                  *   SUB    neg, zero, x
                  *   BEQ    cond, zero, +2   ; x>=0 ? skip true branch
                  *   MOV    dst, neg
                  *   JMP    +1
                  *   MOV    dst, x
-                 */
-                if (strcmp(name, "llvm.abs.i32") == 0) {
+                 *
+                 * Narrow widths (i8/i16) live in 32-bit regs possibly NOT
+                 * sign-extended, so CMP_LT/SUB would interpret the value wrong
+                 * (same class of bug as the sitofp-narrow miscompile). Sign-
+                 * extend via SHL/SAR (as in cg_icmp_operand / the SExt lowering)
+                 * before the abs. clang emits abs.i16 for e.g. UQM grpinfo.c's
+                 * BuildGroups dx/dy distance math. */
+                {
+                    int abs_bits = (strncmp(name, "llvm.abs.i", 10) == 0)
+                                       ? atoi(name + 10) : 0;
+                    if (abs_bits == 8 || abs_bits == 16 || abs_bits == 32) {
                     uint8_t x    = cg_reg_for(cg, LLVMGetOperand(i, 0));
                     uint8_t dst  = cg->regs[cg_lookup(cg, i)];
                     uint8_t cond = cg_alloc_reg(cg);
                     uint8_t neg  = cg_alloc_reg(cg);
                     if (cg->had_error) break;
+                    if (abs_bits < 32) {
+                        uint8_t sx = cg_alloc_reg(cg);
+                        int16_t shift = (int16_t)(32u - (unsigned)abs_bits);
+                        if (cg->had_error) break;
+                        cg_emit(cg, enc_i16(CVM_OP_MOVI, (uint8_t)CG_REG_SCRATCH, shift));
+                        cg_emit(cg, enc_r(CVM_OP_SHL, sx, x, (uint8_t)CG_REG_SCRATCH));
+                        cg_emit(cg, enc_r(CVM_OP_SAR, sx, sx, (uint8_t)CG_REG_SCRATCH));
+                        x = sx;
+                    }
                     cg_emit(cg, enc_r (CVM_OP_CMP_LT, cond, x, cg->zero_reg));
                     cg_emit(cg, enc_r (CVM_OP_SUB, neg, cg->zero_reg, x));
                     cg_emit(cg, enc_br(CVM_OP_BEQ, cond, cg->zero_reg, 2));
@@ -4347,6 +4366,7 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     cg_emit(cg, enc_i24(CVM_OP_JMP, 1));
                     cg_emit(cg, enc_r (CVM_OP_MOV, dst, x, 0));
                     break;
+                    }
                 }
 
                 /* llvm.ctlz.i32(%x, is_zero_undef) — count leading zeros.

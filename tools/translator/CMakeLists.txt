@@ -151,7 +151,7 @@ set(_fixture_dir ${CVM_SOURCE_ROOT}/tests/fixtures)
 set(_fixture_out ${CMAKE_CURRENT_BINARY_DIR})
 
 set(_fixture_targets "")
-foreach(name add pick fib abs max divmod bitops counter sum_global
+foreach(name add pick fib abs abs16 max divmod bitops counter sum_global
              alloc_sum free_list regions mulh qdiv qdiv6432 xor_i1 float_basic fsqrt
              i64_basic f64_basic i64_slice two_funcs
              fib_recursive many_args alloca_swap fnptr fnptr_export
@@ -210,7 +210,7 @@ endif()
 
 # Emit each .bin via the translator. Depends on cvm-translate + the .bc.
 set(_emit_targets "")
-foreach(name add pick fib abs max divmod bitops counter sum_global
+foreach(name add pick fib abs abs16 max divmod bitops counter sum_global
              mulh qdiv qdiv6432 xor_i1 float_basic fsqrt i64_basic f64_basic
              i64_slice two_funcs fib_recursive many_args
              alloca_swap fnptr fnptr_export dispatch_table const_gep reg_pressure float_mem struct_init reg_reuse
@@ -292,6 +292,12 @@ add_test(NAME e2e_fib_10     COMMAND test_e2e ${_fixture_out}/fib.bin     55  10
 add_test(NAME e2e_fib_0      COMMAND test_e2e ${_fixture_out}/fib.bin      0  0)
 add_test(NAME e2e_abs_neg    COMMAND test_e2e ${_fixture_out}/abs.bin      7  -7)
 add_test(NAME e2e_abs_pos    COMMAND test_e2e ${_fixture_out}/abs.bin     42  42)
+# llvm.abs.i16 (clang folds the i16 select). abs16(a,b) = |(short)(a-b)|.
+# _trunc is the discriminator: 30000-(-30000)=60000 wraps to short -5536, so a
+# lowering missing the sign-extension would return the wrong value.
+add_test(NAME e2e_abs16_pos   COMMAND test_e2e ${_fixture_out}/abs16.bin    15  20 5)
+add_test(NAME e2e_abs16_neg   COMMAND test_e2e ${_fixture_out}/abs16.bin     7   7 14)
+add_test(NAME e2e_abs16_trunc COMMAND test_e2e ${_fixture_out}/abs16.bin  5536  30000 -30000)
 add_test(NAME e2e_max_lhs    COMMAND test_e2e ${_fixture_out}/max.bin      7  7 3)
 add_test(NAME e2e_max_rhs    COMMAND test_e2e ${_fixture_out}/max.bin      7  3 7)
 add_test(NAME e2e_divmod     COMMAND test_e2e ${_fixture_out}/divmod.bin 302  17 5)
@@ -463,7 +469,7 @@ add_test(NAME e2e_spill_call_2     COMMAND test_e2e ${_fixture_out}/spill_call.b
 add_test(NAME e2e_spill_call_4     COMMAND test_e2e ${_fixture_out}/spill_call.bin     37326068 4)
 set_tests_properties(
     e2e_add e2e_pick_true e2e_pick_false e2e_fib_10 e2e_fib_0
-    e2e_abs_neg e2e_abs_pos e2e_max_lhs e2e_max_rhs
+    e2e_abs_neg e2e_abs_pos e2e_abs16_pos e2e_abs16_neg e2e_abs16_trunc e2e_max_lhs e2e_max_rhs
     e2e_divmod e2e_bitops e2e_counter e2e_sum_global e2e_alloc_sum
     e2e_free_list e2e_regions e2e_allocator e2e_mulh e2e_qdiv e2e_xor_i1 e2e_float_basic
     e2e_fsqrt e2e_i64_basic e2e_f64_basic e2e_i64_slice e2e_i64_slice1
