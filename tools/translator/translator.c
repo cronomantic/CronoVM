@@ -776,6 +776,16 @@ struct cg {
     int             func_cap;
 
     int has_calls;          /* did codegen ever emit a CALL? */
+
+    /* Global constructors (C++ static-init / __attribute__((constructor))).
+     * Parsed from @llvm.global_ctors (priority-sorted) into FUNCS indices; the
+     * entry function (entry_func_idx) gets a CALL to each emitted at the top of
+     * its body, before any user code, so global objects are initialised before
+     * main runs. entry_func_idx is -1 when not applicable. */
+    int  entry_func_idx;
+    int *ctor_idx;
+    int  ctor_count;
+
     int funcs_referenced;   /* was any function's address taken as a value?
                              * Such a pointer is a FUNCS index, so the table
                              * must be emitted even when no CALL/CALLR exists
@@ -3198,6 +3208,19 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
         word += (unsigned)nw;
     }
     cg_emit(cg, enc_i16(CVM_OP_MOVI, cg->zero_reg, 0));
+
+    /* Global constructors: at the very top of the entry function's body —
+     * after the prologue set zero_reg, but BEFORE allocas are materialised and
+     * before any user code — call each global ctor so C++ static objects (and
+     * C __attribute__((constructor))) are initialised before main runs. Safe
+     * to clobber registers here: no SSA value is live yet (the entry takes no
+     * params — enforced in main()), and the CALL/RET pair preserves SP, so the
+     * alloca pointers materialised just below remain valid. */
+    if (func_idx == cg->entry_func_idx && cg->ctor_count > 0) {
+        for (int c = 0; c < cg->ctor_count; ++c)
+            cg_emit(cg, enc_i24(CVM_OP_CALL, cg->ctor_idx[c] + 1));
+        cg->has_calls = 1;
+    }
 
     /* Materialise alloca pointers: each %p = SP + alloca_offset. SP doesn't
      * move within the body except inside CALL sequences, but those sequences
@@ -5851,6 +5874,46 @@ static int module_runtime_needs(LLVMModuleRef mod) {
     return need;
 }
 
+/* Parse @llvm.global_ctors into cg->ctor_idx[] (FUNCS indices), sorted by
+ * priority ascending. Each array element is a { i32 priority, ptr fn, ptr data }
+ * struct constant. Empty/absent list -> no ctors. clang emits this for C++
+ * static initialisation and C __attribute__((constructor)). */
+static void cg_collect_global_ctors(struct cg *cg, LLVMModuleRef mod) {
+    LLVMValueRef gc = LLVMGetNamedGlobal(mod, "llvm.global_ctors");
+    if (!gc) return;
+    LLVMValueRef init = LLVMGetInitializer(gc);
+    if (!init) return;
+    unsigned n = LLVMGetNumOperands(init);   /* array elements (0 if zeroinit) */
+    if (n == 0) return;
+    cg->ctor_idx = (int *)malloc(sizeof(int) * n);
+    int *prio = (int *)malloc(sizeof(int) * n);
+    if (!cg->ctor_idx || !prio) { free(cg->ctor_idx); free(prio); cg->ctor_idx = NULL; return; }
+    for (unsigned i = 0; i < n; ++i) {
+        LLVMValueRef e = LLVMGetOperand(init, i);     /* {i32, ptr, ptr} */
+        if (!e) continue;
+        LLVMValueRef pv = LLVMGetOperand(e, 0);       /* priority */
+        LLVMValueRef fv = LLVMGetOperand(e, 1);       /* ctor function */
+        if (!fv) continue;
+        while (fv && LLVMIsAConstantExpr(fv) &&
+               LLVMGetConstOpcode(fv) == LLVMBitCast)
+            fv = LLVMGetOperand(fv, 0);               /* strip pre-opaque bitcast */
+        if (!fv || !LLVMIsAFunction(fv)) continue;
+        int fi = cg_func_lookup(cg, fv);
+        if (fi < 0) continue;                          /* decl-only -> skip */
+        int pr = pv ? (int)LLVMConstIntGetZExtValue(pv) : 65535;
+        int pos = cg->ctor_count;                      /* stable insertion sort */
+        while (pos > 0 && prio[pos - 1] > pr) {
+            prio[pos] = prio[pos - 1];
+            cg->ctor_idx[pos] = cg->ctor_idx[pos - 1];
+            --pos;
+        }
+        prio[pos] = pr;
+        cg->ctor_idx[pos] = fi;
+        cg->ctor_count++;
+    }
+    free(prio);
+}
+
 int main(int argc, char **argv) {
     const char *input  = NULL;
     const char *output = NULL;
@@ -6014,6 +6077,22 @@ int main(int argc, char **argv) {
         if (rc == 0 && main_idx < 0) {
             ERR(NULL, "internal: no entry function selected");
             rc = 1;
+        }
+
+        /* Global constructors run before the entry. They are injected at the
+         * top of the entry's body (cg_function), which is only register-safe
+         * when the entry takes no arguments — true for C++ carts (int main
+         * (void)). An entry WITH params + global ctors would need arg-spill
+         * around the ctor calls; reject it loudly rather than miscompile. */
+        if (rc == 0) {
+            cg.entry_func_idx = main_idx;
+            cg_collect_global_ctors(&cg, mod);
+            if (cg.ctor_count > 0 &&
+                LLVMCountParams(cg.funcs[main_idx].value) != 0) {
+                ERR(NULL, "global constructors with a parameterised entry "
+                          "function are not supported");
+                rc = 1;
+            }
         }
 
         /* Pass 2: emit code for each definition in declaration order.

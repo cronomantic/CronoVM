@@ -1,23 +1,20 @@
 #!/usr/bin/env bash
 # Differential conformance runner for the CronoVM translator.
 #
-# For each fixture tests/conformance/conf_*.c:
-#   1. Build it on the VM    (cvm-cc fixture.c -> fixture.bin)
-#   2. Build it natively     (clang fixture.c driver.c -> native oracle)
+# For each fixture tests/conformance/conf_*.{c,cpp}:
+#   1. Build it on the VM    (cvm-cc; C++ is pre-compiled to .bc by clang -x c++
+#                             and linked with the C++ ABI runtime cvm_cxxrt)
+#   2. Build it natively     (clang / clang++ -> the oracle)
 #   3. Run native -> the expected int32 checksum
 #   4. Run the VM bin via test_e2e and compare to the native checksum
 #
-# Outcomes per fixture:
-#   PASS       — VM result == native result (intrinsic/op lowered correctly)
-#   GAP        — cvm-cc failed to translate (unlowered construct)
-#   MISCOMPILE — VM translated but returned a different value than native
+# Every fixture exports `conf_main`; vm_entry.c (a real `main` tail-calling it)
+# pins the VM entry deterministically. Fixtures use only fixed-width types + an
+# int32 checksum, so host-64 and VM-32 agree bit-for-bit.
 #
-# The native build is the ORACLE: fixtures use only fixed-width types + an
-# int32 checksum, so host-64 and VM-32 agree bit-for-bit. Exits non-zero if any
-# fixture is GAP or MISCOMPILE.
+# Outcomes: PASS / GAP (cvm-cc failed to translate) / MISCOMPILE (wrong value).
 #
-# Usage: run_conformance.sh <cvm-cc> <test_e2e> <clang> [fixture.c ...]
-#   With no fixture args, runs every tests/conformance/conf_*.c.
+# Usage: run_conformance.sh <cvm-cc> <test_e2e> <clang> [fixture ...]
 set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,43 +23,59 @@ E2E="${2:?missing test_e2e path}"
 CLANG="${3:?missing clang path}"
 shift 3
 
+# Derive clang++ (C++ driver: links the host C++ runtime for the native oracle).
+CLANGXX="$(dirname "$CLANG")/clang++"
+[[ -x "$CLANGXX" || -x "$CLANGXX.exe" ]] || CLANGXX="clang++"
+
+CXXVM=(-x c++ --target=i386-elf -ffreestanding -fno-exceptions -fno-rtti
+       -emit-llvm -gline-tables-only -O1)
+
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+# Pre-compile the C++ ABI runtime to bitcode (operator new/delete, __cxa_*).
+"$CLANG" "${CXXVM[@]}" -c "$HERE/cvm_cxxrt.cpp" -o "$TMP/cxxrt.bc" 2>/dev/null
+
 fixtures=( "$@" )
 if [[ ${#fixtures[@]} -eq 0 ]]; then
-  fixtures=( "$HERE"/conf_*.c )
+  fixtures=( "$HERE"/conf_*.c "$HERE"/conf_*.cpp )
 fi
 
 pass=0 gap=0 mis=0
 for src in "${fixtures[@]}"; do
-  name="$(basename "$src" .c)"
+  [[ -e "$src" ]] || continue
+  name="$(basename "$src")"; name="${name%.*}"
   bin="$TMP/$name.bin"
   nat="$TMP/$name.exe"
 
-  # 1+2: VM translate (capture the gap message) + native oracle build.
-  vmlog="$("$CVMCC" "$src" -o "$bin" 2>&1)"; vmrc=$?
+  if [[ "$src" == *.cpp ]]; then
+    # VM: clang -x c++ -> .bc, then cvm-cc links fixture + cxxrt + entry shim.
+    vmlog="$("$CLANG" "${CXXVM[@]}" -c "$src" -o "$TMP/$name.bc" 2>&1)"
+    if [[ $? -ne 0 ]]; then
+      printf 'GAP        %-22s (clang++ -> bc failed)\n' "$name"; gap=$((gap+1)); continue
+    fi
+    vmlog="$("$CVMCC" "$TMP/$name.bc" "$TMP/cxxrt.bc" "$HERE/vm_entry.c" -o "$bin" 2>&1)"; vmrc=$?
+    natcmd=("$CLANGXX" -O1 -x c++ "$src" -x c "$HERE/driver.c" -o "$nat")
+  else
+    vmlog="$("$CVMCC" "$src" "$HERE/vm_entry.c" -o "$bin" 2>&1)"; vmrc=$?
+    natcmd=("$CLANG" -O1 "$src" "$HERE/driver.c" -o "$nat")
+  fi
+
   if [[ $vmrc -ne 0 ]]; then
-    msg="$(printf '%s\n' "$vmlog" | grep -iE "not yet lowered|outside the supported|unsupported" | head -1)"
-    printf 'GAP        %-22s %s\n' "$name" "${msg:-(cvm-cc exit $vmrc)}"
-    gap=$((gap+1)); continue
+    msg="$(printf '%s\n' "$vmlog" | grep -iE "not yet lowered|outside the supported|unsupported|callee has no" | head -1)"
+    printf 'GAP        %-22s %s\n' "$name" "${msg:-(cvm-cc exit $vmrc)}"; gap=$((gap+1)); continue
   fi
-  if ! "$CLANG" -O1 "$src" "$HERE/driver.c" -o "$nat" 2>"$TMP/nat.err"; then
+  if ! "${natcmd[@]}" 2>"$TMP/nat.err"; then
     printf 'GAP        %-22s (native oracle build failed)\n' "$name"
-    cat "$TMP/nat.err"; gap=$((gap+1)); continue
+    grep -iv deprecated "$TMP/nat.err" | head -3; gap=$((gap+1)); continue
   fi
 
-  # 3: native checksum.
   expected="$("$nat")"
-
-  # 4: VM run vs oracle.
   if "$E2E" "$bin" "$expected" >/dev/null 2>&1; then
-    printf 'PASS       %-22s %s\n' "$name" "$expected"
-    pass=$((pass+1))
+    printf 'PASS       %-22s %s\n' "$name" "$expected"; pass=$((pass+1))
   else
     got="$("$E2E" "$bin" "$expected" 2>&1 | grep -oE "returned -?[0-9]+" | head -1)"
-    printf 'MISCOMPILE %-22s native=%s vm=%s\n' "$name" "$expected" "${got:-?}"
-    mis=$((mis+1))
+    printf 'MISCOMPILE %-22s native=%s vm=%s\n' "$name" "$expected" "${got:-?}"; mis=$((mis+1))
   fi
 done
 
