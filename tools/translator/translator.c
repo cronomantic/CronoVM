@@ -4377,12 +4377,21 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     break;
                 }
 
-                /* llvm.ctpop.i32(%x) — population count (set bits). No POPCNT
+                /* llvm.ctpop.iN(%x) — population count (set bits). No POPCNT
                  * opcode, so lower with Kernighan's loop (one iteration per set
                  * bit): n=0; while (x) { x &= x-1; n++; }. clang folds power-of-
                  * two tests `x & (x-1)` into a ctpop compare, so this shows up
-                 * in ordinary code (e.g. DOOM's texture-height pow2 check). */
-                if (strcmp(name, "llvm.ctpop.i32") == 0) {
+                 * in ordinary code (e.g. DOOM's texture-height pow2 check, and
+                 * stb_image's PNG depth handling for the i8 form). Narrow widths
+                 * (i8/i16) live in 32-bit regs possibly sign-extended, so mask
+                 * to the value width first or phantom high bits get counted. */
+                {
+                    uint32_t cpop_mask = 0;
+                    int cpop_match = 0;
+                    if (strcmp(name, "llvm.ctpop.i32") == 0) { cpop_match = 1; cpop_mask = 0; }
+                    else if (strcmp(name, "llvm.ctpop.i16") == 0) { cpop_match = 1; cpop_mask = 0xFFFF; }
+                    else if (strcmp(name, "llvm.ctpop.i8") == 0)  { cpop_match = 1; cpop_mask = 0xFF; }
+                if (cpop_match) {
                     uint8_t src = cg_reg_for(cg, LLVMGetOperand(i, 0));
                     uint8_t dst = cg->regs[cg_lookup(cg, i)];
                     uint8_t x   = cg_alloc_reg(cg);
@@ -4391,6 +4400,12 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     uint8_t t   = cg_alloc_reg(cg);
                     if (cg->had_error) break;
                     cg_emit(cg, enc_r  (CVM_OP_MOV,  x, src, 0));
+                    if (cpop_mask) {
+                        uint8_t m = cg_alloc_reg(cg);
+                        if (cg->had_error) break;
+                        cg_emit_load_const32(cg, m, (int32_t)cpop_mask);
+                        cg_emit(cg, enc_r(CVM_OP_AND, x, x, m));  /* mask to width */
+                    }
                     cg_emit(cg, enc_i16(CVM_OP_MOVI, n, 0));
                     cg_emit(cg, enc_i16(CVM_OP_MOVI, one, 1));
                     /* loop: while (x != 0) { x &= x-1; n++; } */
@@ -4401,6 +4416,7 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     cg_emit(cg, enc_i24(CVM_OP_JMP, -5));                 /* loop back */
                     cg_emit(cg, enc_r  (CVM_OP_MOV, dst, n, 0));          /* dst = n   */
                     break;
+                }
                 }
 
                 /* llvm.fmuladd.f32(a, b, c) = a*b + c. clang emits it for
@@ -4505,6 +4521,48 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     cg_emit(cg, enc_r(CVM_OP_OR,  dst, b0, b1));
                     cg_emit(cg, enc_r(CVM_OP_OR,  dst, dst, b2));
                     cg_emit(cg, enc_r(CVM_OP_OR,  dst, dst, b3));
+                    break;
+                }
+
+                /* llvm.bitreverse.i16(x) — reverse the 16 bit positions. clang
+                 * folds hand-written bit-reversal idioms into this (e.g.
+                 * stb_image's stbi__bitreverse16 in the zlib/PNG decoder). Lower
+                 * with the classic swap network:
+                 *   x = ((x&0xAAAA)>>1)|((x&0x5555)<<1);
+                 *   x = ((x&0xCCCC)>>2)|((x&0x3333)<<2);
+                 *   x = ((x&0xF0F0)>>4)|((x&0x0F0F)<<4);
+                 *   x = ((x&0xFF00)>>8)|((x&0x00FF)<<8);
+                 * All intermediate values stay within the low 16 bits. */
+                if (strcmp(name, "llvm.bitreverse.i16") == 0) {
+                    static const struct { uint32_t hi, lo; int sh; } steps[4] = {
+                        { 0xAAAA, 0x5555, 1 },
+                        { 0xCCCC, 0x3333, 2 },
+                        { 0xF0F0, 0x0F0F, 4 },
+                        { 0xFF00, 0x00FF, 8 },
+                    };
+                    uint8_t src = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                    uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                    uint8_t x   = cg_alloc_reg(cg);
+                    uint8_t t   = cg_alloc_reg(cg);
+                    uint8_t mh  = cg_alloc_reg(cg);
+                    uint8_t ml  = cg_alloc_reg(cg);
+                    uint8_t sh  = cg_alloc_reg(cg);
+                    uint8_t k16 = cg_alloc_reg(cg);
+                    int s;
+                    if (cg->had_error) break;
+                    cg_emit_load_const32(cg, k16, 0xFFFF);
+                    cg_emit(cg, enc_r(CVM_OP_AND, x, src, k16));  /* x = src & 0xFFFF */
+                    for (s = 0; s < 4; ++s) {
+                        cg_emit_load_const32(cg, mh, (int32_t)steps[s].hi);
+                        cg_emit_load_const32(cg, ml, (int32_t)steps[s].lo);
+                        cg_emit_load_const32(cg, sh, steps[s].sh);
+                        cg_emit(cg, enc_r(CVM_OP_AND, t, x, mh));  /* t = x & hi    */
+                        cg_emit(cg, enc_r(CVM_OP_SHR, t, t, sh));  /* t >>= sh      */
+                        cg_emit(cg, enc_r(CVM_OP_AND, x, x, ml));  /* x &= lo       */
+                        cg_emit(cg, enc_r(CVM_OP_SHL, x, x, sh));  /* x <<= sh      */
+                        cg_emit(cg, enc_r(CVM_OP_OR,  x, x, t));   /* x = x | t     */
+                    }
+                    cg_emit(cg, enc_r(CVM_OP_MOV, dst, x, 0));
                     break;
                 }
 
