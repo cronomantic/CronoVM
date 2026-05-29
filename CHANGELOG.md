@@ -10,6 +10,21 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **C++ exceptions (`try` / `catch` / `throw`)**. `cvm-cc` no longer forces
+  `-fno-exceptions`; the translator lowers the Itanium EH instructions
+  (`invoke` / `landingpad` / `resume` / `llvm.eh.typeid.for`) onto the VM's
+  `SETJMP`/`LONGJMP` opcodes — there is no DWARF unwinder. Each `invoke` becomes
+  a per-landingpad descriptor (the catch type-info list, emitted into DATA) on a
+  thread-local frame chain plus a `SETJMP`; `__cxa_throw` walks the chain and
+  `longjmp`s into the matching frame. The exception runtime (the unwinder +
+  `__cxa_throw`/`begin_catch`/`end_catch`/`rethrow`/`allocate_exception` and
+  `std::terminate`) lives in `runtime/lib/cvm_cxxrt.cpp`, auto-linked for any C++
+  input. Supports typed catch, catch-by-base (most-derived-first clause order),
+  `catch (...)`, non-trivial destructors run as cleanups during unwinding,
+  `throw;` (rethrow), and propagation across functions with no handler of their
+  own. Not supported: dynamic exception specifications (`throw()` filter
+  clauses) and the MSVC/SEH model. With RTTI already done, this clears the last
+  C++ language blocker for engines like Exult.
 - **Cooperative-coroutine primitive `CVM_OP_CORO_SWAP` (opcode `0x3C`)**.
   Atomic save+load of a 16-byte execution-context record
   `{u32 pc, u32 sp, u32 dest, u32 status}` at heap addresses passed in
@@ -45,6 +60,15 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Fixed
 
+- **Data offset 0 aliased the null pointer.** Globals were laid out starting at
+  data offset 0, and since VM pointers are heap offsets, the first global had
+  address 0 — indistinguishable from a null pointer. This was a latent ambiguity
+  (`if (&global)` / null compares) and a concrete C++ exceptions bug: a
+  `catch (T&)` clause whose type-info happened to land at address 0 looked exactly
+  like the catch-all / cleanup sentinel and silently swallowed every exception.
+  The translator now reserves an 8-byte guard at data offset 0 so address 0 means
+  only "null". **Behaviour change:** global addresses shift by the guard size, so
+  carts must be rebuilt against this version (output is otherwise unchanged).
 - **Reference allocator (`runtime/lib/cvm_alloc.h`) was O(n²) for
   allocation-heavy workloads.** `cvm_malloc` did a first-fit walk over EVERY
   block from the heap start on each call, and `cvm_free` scanned the WHOLE

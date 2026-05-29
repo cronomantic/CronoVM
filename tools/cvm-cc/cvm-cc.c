@@ -122,7 +122,7 @@ static void usage(FILE *f) {
         "\n"
         "Driver around clang + llvm-link + cvm-translate. Each .c is compiled\n"
         "with clang --target=i386-elf -emit-llvm -O<level> to bitcode; .cpp/.cc/\n"
-        ".cxx are compiled as C++ (-x c++ -fno-exceptions -fno-rtti) and the C++\n"
+        ".cxx are compiled as C++ (-x c++) and the C++\n"
         "ABI runtime (cvm_cxxrt) is auto-linked; .bc inputs skip clang. Multiple\n"
         "inputs are llvm-link'd into one module (true multi-file linking —\n"
         "file-local statics don't collide), then translated. (C++ note: the\n"
@@ -173,7 +173,7 @@ static int has_suffix(const char *s, const char *suf) {
     return sl >= tl && memcmp(s + sl - tl, suf, tl) == 0;
 }
 
-/* A C++ source input (compiled with clang -x c++ -fno-exceptions -fno-rtti).
+/* A C++ source input (compiled with clang -x c++).
  * .C is intentionally omitted — on case-insensitive filesystems it aliases the
  * C extension .c. */
 static int is_cpp_src(const char *s) {
@@ -434,16 +434,15 @@ static int compile_c_to_bc(const struct cli *cli, const char *clang,
     cargv[n++] = (char *)clang;
     cargv[n++] = (char *)"--target=i386-elf";
     cargv[n++] = (char *)"-ffreestanding";
-    /* C++ inputs: force the C++ frontend and disable EXCEPTIONS — the one ABI
-     * piece the VM doesn't support yet (invoke/landingpad/_Unwind_*). RTTI IS
-     * supported (cvm_cxxrt provides __dynamic_cast + the type_info abi vtables;
-     * the translator serialises the type_info objects), so it stays enabled —
-     * dynamic_cast works; typeid is untested. Global ctors + operator new/
-     * delete + __cxa_* are all handled. */
+    /* C++ inputs: force the C++ frontend. Exceptions AND RTTI are both
+     * supported now — cvm_cxxrt provides the C++ exception runtime (the
+     * setjmp/longjmp unwinder + __cxa_*) and __dynamic_cast + the type_info abi
+     * vtables; the translator lowers invoke/landingpad/resume and serialises
+     * the type_info objects + per-landingpad catch descriptors. typeid is
+     * untested. Global ctors + operator new/delete + __cxa_* are all handled. */
     if (is_cpp_src(input)) {
         cargv[n++] = (char *)"-x";
         cargv[n++] = (char *)"c++";
-        cargv[n++] = (char *)"-fno-exceptions";
     }
     cargv[n++] = (char *)"-emit-llvm";
     /* Line tables only: enough for the translator to report file:line on

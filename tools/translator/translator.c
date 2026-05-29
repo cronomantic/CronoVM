@@ -147,6 +147,7 @@ static int cg_type_is_i64(LLVMTypeRef t);
 static int cg_type_is_f64(LLVMTypeRef t);
 static int cg_type_is_wide(LLVMTypeRef t);
 static int cg_wide_const_words(LLVMValueRef v, uint32_t *lo, uint32_t *hi);
+static int cg_is_eh_value(LLVMValueRef v);   /* C++ EH {ptr,i32} pad value */
 
 static const char *type_kind_name(LLVMTypeKind k) {
     switch (k) {
@@ -254,6 +255,13 @@ static int opcode_in_subset(LLVMOpcode op) {
     case LLVMPtrToInt: case LLVMIntToPtr: case LLVMBitCast:
     case LLVMICmp: case LLVMPHI: case LLVMCall: case LLVMSelect:
     case LLVMExtractValue: case LLVMInsertValue:
+    /* C++ exception handling (Itanium model). We DON'T unwind via DWARF — the
+     * translator lowers `invoke` to a setjmp + a per-landingpad descriptor on a
+     * thread-local frame chain, `__cxa_throw` (in cvm_cxxrt) walks the chain and
+     * longjmps into the matching frame, `landingpad` values come from
+     * __cvm_eh_exc/__cvm_eh_sel, and `resume` calls __cvm_eh_resume. The MSVC EH
+     * model (CatchPad/CleanupPad/…) stays rejected — we only see Itanium IR. */
+    case LLVMInvoke: case LLVMLandingPad: case LLVMResume:
     /* freeze: lowered as identity (pass the operand through). clang emits it
      * to block poison propagation, e.g. around div/rem and the i64 legaliser's
      * volatile operands. Since the VM never exploits UB, identity is correct. */
@@ -278,10 +286,10 @@ static const char *reject_reason(LLVMOpcode op) {
     switch (op) {
     case LLVMFRem:
         return "frem not in the subset (no FREM opcode; call a fmod helper)";
-    case LLVMInvoke: case LLVMResume: case LLVMLandingPad:
     case LLVMCleanupRet: case LLVMCatchRet: case LLVMCatchPad:
     case LLVMCleanupPad: case LLVMCatchSwitch:
-        return "exception-handling instructions not in the subset";
+        return "MSVC/SEH exception model not supported (the Itanium model — "
+               "invoke/landingpad/resume — is)";
     case LLVMAtomicCmpXchg: case LLVMAtomicRMW: case LLVMFence:
         return "atomic / fence operations not in the subset";
     case LLVMExtractElement: case LLVMInsertElement: case LLVMShuffleVector:
@@ -599,8 +607,30 @@ static int cg_collect_globals(struct cg_globals *g, LLVMModuleRef mod) {
 
     /* Pass 1: lay out every global (assign a data offset) WITHOUT serializing.
      * An initializer may take the address of another global, so all offsets
-     * must be known before any initializer is emitted (forward references). */
+     * must be known before any initializer is emitted (forward references).
+     *
+     * Globals start at a small NON-ZERO offset so address 0 is reserved as the
+     * canonical null pointer. VM pointers are heap offsets and a global at
+     * offset O has address O, so without this guard the FIRST global would alias
+     * null (0). That is a latent ambiguity in general (any `if (&global)` or
+     * null compare), and a concrete bug for C++ exceptions: a `catch (T&)` clause
+     * whose type_info lived at address 0 would be indistinguishable from the
+     * catch-all / cleanup sentinel (eh_clause.ti == 0 in cvm_cxxrt), silently
+     * swallowing every exception. Reserving offset 0 makes 0 mean only "null".
+     * The 8-byte guard preserves 8-byte alignment for the first real global. */
     uint32_t cursor = 0;
+    int saw_global = 0;
+    for (LLVMValueRef gv0 = LLVMGetFirstGlobal(mod);
+         gv0; gv0 = LLVMGetNextGlobal(gv0)) {
+        if (LLVMGlobalGetValueType(gv0) && !LLVMIsDeclaration(gv0)) {
+            saw_global = 1; break;
+        }
+    }
+    if (saw_global) {
+        cursor = 8u;
+        cg_data_reserve(g, cursor);
+        if (cursor > g->data_size) g->data_size = cursor;
+    }
     for (LLVMValueRef gv = LLVMGetFirstGlobal(mod);
          gv; gv = LLVMGetNextGlobal(gv))
     {
@@ -687,6 +717,15 @@ struct cg_alloca {
     LLVMValueRef value;
     uint32_t     offset;
 };
+
+/* C++ exception-handling frame layout (must mirror `struct eh_frame` in
+ * runtime/lib/cvm_cxxrt.cpp):  { int jb[4]; const eh_desc *desc; eh_frame *next; }
+ * jb is FIRST so &frame == &frame.jb == the SETJMP buffer. The eh_desc the
+ * translator emits per landingpad is { int n_clauses; int has_cleanup;
+ * const eh_clause *clauses; } and each eh_clause is { const void *ti; }. */
+#define CVM_EH_FRAME_BYTES   24u   /* jb[4]*4 + desc(4) + next(4) */
+#define CVM_EH_FRAME_DESC_OFF 16u  /* byte offset of the `desc` field */
+#define CVM_EH_DESC_BYTES    12u   /* n_clauses(4) + has_cleanup(4) + clauses(4) */
 
 /* Scratch register reserved by the codegen for prologue/epilogue/CALL
  * sequences (frame_size constants, spill addresses, stack-arg pointers).
@@ -874,7 +913,16 @@ struct cg {
                                        * them on overflow). */
     int               val_spill_count;/* number of distinct value-spill slots */
     uint32_t          frame_bytes;    /* alloca_bytes + spill_bytes
-                                       *               + val_spill_bytes */
+                                       *               + val_spill_bytes
+                                       *               (+ eh frame, if invoke) */
+
+    /* C++ exception handling. A function containing any `invoke` reserves one
+     * shared `cvm_eh_frame` (24 bytes: int jb[4]; desc; next) at the TOP of its
+     * frame — invokes execute sequentially within an activation (one is on the
+     * chain at a time), so they reuse the same slot. `fn_has_invoke` gates the
+     * reservation; `eh_frame_off` is its SP-relative byte offset. */
+    int               fn_has_invoke;
+    uint32_t          eh_frame_off;
     int               ssa_reg_high;   /* next_reg snapshot after pre-alloc.
                                        * Spilling around CALL only covers
                                        * R8..R(ssa_reg_high-1). Constants
@@ -952,6 +1000,8 @@ static void cg_reset_function_state(struct cg *cg) {
     cg->val_spill_bytes = 0;
     cg->val_spill_count = 0;
     cg->frame_bytes = 0;
+    cg->fn_has_invoke = 0;
+    cg->eh_frame_off = 0;
     cg->ssa_reg_high = 8;
     cg->zero_reg = 0;
     cg->cur_block = NULL;
@@ -1671,6 +1721,9 @@ static void cg_emit_phi_moves(struct cg *cg,
          inst && LLVMGetInstructionOpcode(inst) == LLVMPHI;
          inst = LLVMGetNextInstruction(inst))
     {
+        /* An EH-pad {ptr,i32} phi carries no register (its value lives in the
+         * runtime's in-flight-exception globals); it needs no move. */
+        if (cg_is_eh_value(inst)) continue;
         unsigned n = LLVMCountIncoming(inst);
         for (unsigned k = 0; k < n; ++k) {
             if (LLVMGetIncomingBlock(inst, k) != from) continue;
@@ -1779,8 +1832,15 @@ static void cg_emit_phi_moves(struct cg *cg,
  * value that edge still needs (the lost-copy problem: a loop back-edge writes
  * the induction phi register that the loop-exit edge reads). */
 static int cg_block_has_phi(LLVMBasicBlockRef bb) {
-    LLVMValueRef inst = LLVMGetFirstInstruction(bb);
-    return inst && LLVMGetInstructionOpcode(inst) == LLVMPHI;
+    for (LLVMValueRef inst = LLVMGetFirstInstruction(bb);
+         inst && LLVMGetInstructionOpcode(inst) == LLVMPHI;
+         inst = LLVMGetNextInstruction(inst)) {
+        /* EH-pad phis carry no moves (see cg_emit_phi_moves), so they don't
+         * make an edge "have moves". A block whose only phis are EH-pad phis
+         * must not trigger the move-isolation path. */
+        if (!cg_is_eh_value(inst)) return 1;
+    }
+    return 0;
 }
 
 static int icmp_to_op(LLVMIntPredicate p, int *swap_out) {
@@ -1905,8 +1965,47 @@ static int cg_type_is_wide(LLVMTypeRef t) {
  * caller-save spill point, like an LLVMCall). f64 arithmetic/comparison/
  * conversion ops call into cvm_float64_rt; i64 div/rem call into cvm_int64_rt.
  * Inline ops (fneg, i64 add/sub/mul/logic/shifts, f32 ops) do not count. */
+/* The landingpad result type is the literal struct { ptr, i32 } (exception
+ * object + selector). clang threads it through phis/selects for shared cleanup
+ * and rethrow blocks, so we recognise it by shape. */
+static int cg_type_is_eh_pad(LLVMTypeRef t) {
+    if (LLVMGetTypeKind(t) != LLVMStructTypeKind) return 0;
+    if (LLVMCountStructElementTypes(t) != 2) return 0;
+    return LLVMGetTypeKind(LLVMStructGetTypeAtIndex(t, 0)) == LLVMPointerTypeKind
+        && LLVMGetTypeKind(LLVMStructGetTypeAtIndex(t, 1)) == LLVMIntegerTypeKind;
+}
+
+/* An "EH pad value": a landingpad's {ptr,i32} result, OR a phi/select that
+ * merges such results (clang produces these for shared cleanup / rethrow). They
+ * are NEVER materialised in registers — extractvalue reads the in-flight
+ * exception through __cvm_eh_exc/__cvm_eh_sel (the globals the unwinder set),
+ * and `resume` re-raises it. So they get no SSA register, no spill slot, and no
+ * phi moves; they exist only as a marker that downstream extractvalue/resume
+ * should consult the runtime. */
+static int cg_is_eh_value(LLVMValueRef v) {
+    if (!v || !LLVMIsAInstruction(v)) return 0;
+    LLVMOpcode op = LLVMGetInstructionOpcode(v);
+    if (op == LLVMLandingPad) return 1;
+    if ((op == LLVMPHI || op == LLVMSelect) && cg_type_is_eh_pad(LLVMTypeOf(v)))
+        return 1;
+    return 0;
+}
+
+/* True if `i` is `extractvalue <eh-pad>, {0|1}` — the exception object (idx 0)
+ * or selector (idx 1), lowered to a CALL into __cvm_eh_exc / __cvm_eh_sel (and
+ * so a caller-save spill point). */
+static int cg_is_landingpad_extract(LLVMValueRef i) {
+    return cg_is_eh_value(LLVMGetOperand(i, 0));
+}
+
 static int cg_op_is_runtime_call(LLVMValueRef i, LLVMOpcode op) {
     switch (op) {
+    /* EH: `resume` -> __cvm_eh_resume; `extractvalue %landingpad` ->
+     * __cvm_eh_exc/__cvm_eh_sel. Both emit a CALL, so they spill like one. */
+    case LLVMResume:
+        return 1;
+    case LLVMExtractValue:
+        return cg_is_landingpad_extract(i);
     case LLVMFAdd: case LLVMFSub: case LLVMFMul: case LLVMFDiv:
         return cg_type_is_f64(LLVMTypeOf(i));
     case LLVMSIToFP: case LLVMUIToFP: case LLVMFPExt:
@@ -2448,7 +2547,11 @@ static void cg_pre_alloc_function(struct cg *cg, LLVMValueRef fn) {
                 int idx = cg->map_count - 1;
                 cg->i64_slot[idx] = (uint16_t)cg->val_spill_count;
                 cg->val_spill_count += 2;
-            } else if (LLVMGetTypeKind(ty) != LLVMVoidTypeKind) {
+            } else if (LLVMGetTypeKind(ty) != LLVMVoidTypeKind
+                       && !cg_is_eh_value(i)) {
+                /* EH-pad values (landingpad / phi / select of {ptr,i32}) carry
+                 * no register — extractvalue reads __cvm_eh_exc/sel. Treat like
+                 * void: no allocation, no map entry, so cg_lookup returns -1. */
                 cg_assign(cg, i, (uint8_t)CG_REG_SPILLED); /* placeholder */
                 int idx = cg->map_count - 1;
                 dst_reg = cg_pre_alloc_def(cg, idx);
@@ -2692,8 +2795,13 @@ static void cg_compute_call_liveouts(struct cg *cg) {
 
             /* Snapshot before applying i's effects: `live` here is the set
              * of registers live at the program point AFTER i has executed.
-             * f64 ops that lower to a soft-float CALL are spill points too. */
-            if (op == LLVMCall || cg_op_is_runtime_call(i, op)) {
+             * f64 ops that lower to a soft-float CALL are spill points too.
+             * An `invoke` is a terminator: this snapshot (taken first in the
+             * backward walk) equals bb_live_out — the values live across the
+             * call on EITHER edge, which the invoke lowering spills so they
+             * survive both the call and a potential longjmp into the landingpad. */
+            if (op == LLVMCall || op == LLVMInvoke
+                || cg_op_is_runtime_call(i, op)) {
                 if (cg->call_live_count == cg->call_live_cap) {
                     cg->call_live_cap = cg->call_live_cap
                                         ? cg->call_live_cap * 2 : 16;
@@ -3104,6 +3212,329 @@ static void cg_emit_f64_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
     }
 }
 
+/* --- C++ exception-handling lowering ------------------------------------- */
+
+/* Resolve an EH runtime helper (cvm_cxxrt) by name to its FUNCS index, erroring
+ * loudly if it isn't in the module. These helpers have external "C" linkage, so
+ * they survive per-TU -O1, llvm-link and even --lto (no internalize). */
+static int cg_eh_func_idx(struct cg *cg, const char *name) {
+    int idx = cg_func_by_name(cg, name);
+    if (idx < 0) {
+        ERR(cg->fn_name,
+            "C++ EH: runtime helper '%s' is not in the module — is cvm_cxxrt "
+            "linked? (cvm-cc auto-links it for any C++ input)", name);
+        cg->had_error = 1;
+    }
+    return idx;
+}
+
+/* Emit a no-argument CALL to EH helper `name`, with caller-save spill/restore of
+ * `set` (NULL = none, for noreturn helpers). If dst_reg >= 0, the helper's R0
+ * return is MOV'd there after the restore (dst must be excluded from `set`, or
+ * the restore would overwrite it). Returns nonzero on error. */
+static int cg_emit_eh_call0(struct cg *cg, const char *name,
+                            int dst_reg, const cg_bits *set) {
+    int idx = cg_eh_func_idx(cg, name);
+    if (idx < 0) return 1;
+    if (set && cg_emit_spill(cg, set)) return 1;
+    cg_emit(cg, enc_i24(CVM_OP_CALL, (int32_t)CVM_FN_SLOT(idx)));
+    cg->has_calls = 1;
+    if (set && cg_emit_restore(cg, set)) return 1;
+    if (dst_reg >= 0 && dst_reg != 0)
+        cg_emit(cg, enc_r(CVM_OP_MOV, (uint8_t)dst_reg, 0, 0));
+    return 0;
+}
+
+/* Find the `landingpad` that heads basic block `bb` (it is the first non-phi
+ * instruction of an invoke's unwind successor). Returns NULL if none. */
+static LLVMValueRef cg_block_landingpad(LLVMBasicBlockRef bb) {
+    for (LLVMValueRef i = LLVMGetFirstInstruction(bb); i;
+         i = LLVMGetNextInstruction(i)) {
+        LLVMOpcode op = LLVMGetInstructionOpcode(i);
+        if (op == LLVMPHI) continue;
+        return (op == LLVMLandingPad) ? i : NULL;
+    }
+    return NULL;
+}
+
+/* Emit a static eh_desc + eh_clause[] for landingpad `lp` into the DATA section
+ * and return the desc's data offset (== its runtime address — DATA is the first
+ * heap section, so a global at offset O has address O). The translator resolves
+ * every type_info pointer at translate time; no runtime relocation. Layout:
+ *   eh_clause[n] = { const void *ti }   (ti = type_info data offset, 0 = catch-all)
+ *   eh_desc      = { int n_clauses; int has_cleanup; const eh_clause *clauses }
+ * Returns -1 on error (e.g. a filter / exception-spec clause, unsupported). */
+static long cg_emit_eh_desc(struct cg *cg, LLVMValueRef lp) {
+    struct cg_globals *g = cg->globals;
+    int n = (int)LLVMGetNumClauses(lp);
+    int has_cleanup = LLVMIsCleanup(lp) ? 1 : 0;
+
+    uint32_t clauses_off = g->data_size;
+    cg_data_reserve(g, clauses_off + (uint32_t)n * 4u);
+    g->data_size = clauses_off + (uint32_t)n * 4u;
+    for (int k = 0; k < n; ++k) {
+        LLVMValueRef cv = LLVMGetClause(lp, k);
+        uint32_t slot = clauses_off + (uint32_t)k * 4u;
+        /* catch(...) is `catch ptr null` -> ti stays 0 (data is zeroed). */
+        if (LLVMIsAConstantPointerNull(cv) || LLVMIsAConstantAggregateZero(cv))
+            continue;
+        /* A typed catch clause's operand is a type_info global (or a bitcast of
+         * one); serialize its data offset into the slot. A `filter` clause
+         * (dynamic exception spec) is a ConstantArray of type_infos — not a
+         * single global, so serialize_global_ptr fails and we reject it. */
+        if (serialize_global_ptr(g, cv, g->data_bytes, slot, 4) != 0) {
+            ERR(cg->fn_name,
+                "C++ EH: unsupported landingpad clause (dynamic exception "
+                "specification / filter, or non-global type_info)");
+            cg->had_error = 1;
+            return -1;
+        }
+    }
+
+    uint32_t desc_off = g->data_size;
+    cg_data_reserve(g, desc_off + CVM_EH_DESC_BYTES);
+    g->data_size = desc_off + CVM_EH_DESC_BYTES;
+    uint8_t *d = g->data_bytes;          /* re-fetch: the reserve may realloc */
+    uint32_t cp = (n > 0) ? clauses_off : 0u;
+    uint32_t fields[3] = { (uint32_t)n, (uint32_t)has_cleanup, cp };
+    for (int f = 0; f < 3; ++f) {
+        uint32_t v = fields[f];
+        d[desc_off + (uint32_t)f * 4u + 0u] = (uint8_t)(v);
+        d[desc_off + (uint32_t)f * 4u + 1u] = (uint8_t)(v >> 8);
+        d[desc_off + (uint32_t)f * 4u + 2u] = (uint8_t)(v >> 16);
+        d[desc_off + (uint32_t)f * 4u + 3u] = (uint8_t)(v >> 24);
+    }
+    return (long)desc_off;
+}
+
+/* Emit the calling sequence for a user/indirect/coro call instruction `i`
+ * (callee/callee_fn/name precomputed by the dispatch in case LLVMCall). Shared
+ * by plain `call` and by `invoke` (whose EH wrapper calls this for the actual,
+ * possibly-throwing call). Wrapped in do/while(0) so the body's top-level `break`
+ * early-exits (error paths) work unchanged; nested for-loop break/continue keep
+ * targeting their loops. */
+static void cg_emit_user_call(struct cg *cg, LLVMValueRef i,
+                              LLVMValueRef callee, LLVMValueRef callee_fn,
+                              const char *name) {
+    do {
+                /* User-defined call. Direct (callee_fn != NULL): emit
+                 * `CALL imm24` with the callee's index in the module's
+                 * function table. Indirect (callee_fn == NULL): the
+                 * callee is an SSA value of pointer type that holds a
+                 * function index, emit `CALLR Rcallee`. */
+                int callee_idx = -1;
+                uint8_t callee_reg = 0;
+                int is_indirect = (callee_fn == NULL);
+                int is_coro_swap = (name && strcmp(name, "__cvm_coro_swap_raw") == 0);
+
+                if (!is_indirect && !is_coro_swap) {
+                    callee_idx = cg_func_lookup(cg, callee_fn);
+                    if (callee_idx < 0) {
+                        if (name && strncmp(name, "llvm.", 5) == 0)
+                            ERR(cg->fn_name,
+                                "unsupported intrinsic '%s': no lowering for this "
+                                "target. Rewrite the source to avoid it (e.g. take "
+                                "min/max/abs/fabs out-of-line so clang can't fold "
+                                "them into an intrinsic)", name);
+                        else
+                            ERR(cg->fn_name,
+                                "call to '%s': callee has no definition in this "
+                                "module (extern is not supported)", name);
+                        cg->had_error = 1;
+                        break;
+                    }
+                    if (callee_idx >= 0xFFFFFF) {
+                        /* +1 shift for the reserved FUNCS[0] slot must fit
+                         * in CALL's imm24 field. */
+                        ERR(cg->fn_name, "more than 16M user functions");
+                        cg->had_error = 1;
+                        break;
+                    }
+                }
+
+                unsigned narg = LLVMGetNumArgOperands(i);
+                /* A variadic callee takes ALL args on the stack (i386 vararg
+                 * ABI) so its va_start finds them contiguous in memory; a
+                 * normal callee uses the 8-in-regs convention. */
+                LLVMTypeRef call_fty = LLVMGetCalledFunctionType(i);
+                int call_is_vararg = call_fty && LLVMIsFunctionVarArg(call_fty);
+                /* Word-based layout: a 64-bit arg takes two words. For
+                 * scalar-only calls total_words == narg, so this reduces to
+                 * the old per-arg scheme exactly. */
+                unsigned total_words = 0;
+                for (unsigned a = 0; a < narg; ++a)
+                    total_words += (unsigned)cg_arg_words(
+                                       LLVMTypeOf(LLVMGetOperand(i, a)));
+                unsigned n_reg_words = call_is_vararg ? 0u
+                                     : (total_words < 8 ? total_words : 8);
+                unsigned n_stacked_words = total_words - n_reg_words;
+
+                /* Argument lowering is done LAST (after caller-save spill and
+                 * SP adjustment), one argument at a time, so we never need to
+                 * hold many materialised/reloaded args in the emit scratch
+                 * window simultaneously. A spilled SSA argument is loaded
+                 * straight from its frame slot into the destination (R0..R7,
+                 * or a stacked-arg slot), NOT routed through a shared reload
+                 * register — that would overflow the window for a call with
+                 * many spilled args (e.g. DOOM's P_TouchSpecialThing). See
+                 * step 3 below. We only check the arg-count cap here. */
+                if (narg > 256) {
+                    ERR(cg->fn_name,
+                        "call has %u args; codegen cap is 256", narg);
+                    cg->had_error = 1;
+                    break;
+                }
+
+                /* 1. Caller-saved spill, narrowed by liveness analysis.
+                 *    `cg_compute_call_liveouts` precomputed, for each
+                 *    LLVMCall, the set of SSA registers (R8..R(ssa_reg_high
+                 *    -1)) that hold values used after the call returns.
+                 *    Only those registers need to be preserved. The call's
+                 *    own destination register is excluded explicitly: its
+                 *    pre-call contents are garbage from this call's POV
+                 *    (that register is exclusively assigned to the SSA
+                 *    value the call is about to define), and the post-call
+                 *    `MOV dst, R0` writes the actual return value, so a
+                 *    spill/restore round-trip would just shuffle garbage.
+                 *
+                 *    Each spilled reg lands at slot_of[bit] within the
+                 *    spill area (post-allocation compact index, not the
+                 *    raw bit). slot_of[bit] == 0xFF means the analysis
+                 *    didn't see this reg crossing any call, so no slot
+                 *    exists and the spill must be skipped. */
+                cg_bits spill_set;
+                const cg_bits *live = cg_lookup_call_live(cg, i);
+                if (live) {
+                    spill_set = *live;
+                    int my_bit = cg_spill_bit_of(cg, i);
+                    if (my_bit >= 0)
+                        cg_bits_clear_bit(&spill_set, (unsigned)my_bit);
+                } else {
+                    /* Defensive fallback: if liveness wasn't recorded
+                     * for this call (shouldn't happen — every LLVMCall
+                     * is snapshotted), spill the whole ever_spilled set.
+                     * Anything outside it has no slot, so spilling it
+                     * would be a bug anyway. */
+                    spill_set = cg->ever_spilled;
+                    int my_bit = cg_spill_bit_of(cg, i);
+                    if (my_bit >= 0)
+                        cg_bits_clear_bit(&spill_set, (unsigned)my_bit);
+                }
+
+                int spill_count = cg->ssa_reg_high - 8;
+                for (int k = 0; k < spill_count; ++k) {
+                    if (!cg_bits_test(&spill_set, (unsigned)k)) continue;
+                    uint8_t slot = cg->slot_of[k];
+                    if (slot == 0xFFu) continue;     /* no slot reserved */
+                    int32_t off = (int32_t)cg->alloca_bytes + (int32_t)slot * 4;
+                    if (cg_stw_sp_off(cg, off, (uint8_t)(8 + k))) break;
+                }
+                if (cg->had_error) break;
+
+                /* SP drops by this many bytes for stacked-arg words, so a
+                 * value-spill slot at frame offset `off` is reachable at
+                 * [SP_now + sp_bias + off] during the rest of the sequence.
+                 * (The caller-save spill above ran BEFORE this drop, so it
+                 * used the un-biased offsets — correct.) */
+                int32_t sp_bias = (int32_t)(n_stacked_words * 4u);
+
+                /* 2+3. Drop SP for the stacked words, then place every
+                 *      argument WORD at its calling-convention position
+                 *      (R0..R7 for words < n_reg_words, else the stack). A
+                 *      64-bit arg contributes two words (lo, hi). Register and
+                 *      stack placement may interleave safely: reg-arg sources
+                 *      are never R0..R7 and stack stores touch memory, so
+                 *      neither clobbers the other. cg_place_arg_word recycles
+                 *      the emit-scratch window per word. */
+                if (n_stacked_words > 0) {
+                    if (cg_sp_sub(cg, n_stacked_words * 4u)) break;
+                }
+                {
+                    unsigned wp = 0;
+                    for (unsigned a = 0; a < narg && !cg->had_error; ++a) {
+                        LLVMValueRef av = LLVMGetOperand(i, a);
+                        if (cg_type_is_wide(LLVMTypeOf(av))) {
+                            cg_place_arg_word(cg, av, 0, wp,     n_reg_words, sp_bias);
+                            cg_place_arg_word(cg, av, 1, wp + 1, n_reg_words, sp_bias);
+                            wp += 2;
+                        } else {
+                            cg_place_arg_word(cg, av, -1, wp, n_reg_words, sp_bias);
+                            wp += 1;
+                        }
+                    }
+                    if (cg->had_error) break;
+                }
+
+                /* 4. CALL or CALLR. User functions occupy FUNCS[1..N]
+                 *    (index 0 is reserved as the null-fn-ptr trap), so a
+                 *    direct call uses (callee_idx + 1) as the imm24. For an
+                 *    indirect call, reload the (possibly spilled) callee
+                 *    index here, just before CALLR, so it doesn't tie up a
+                 *    register across the arg lowering. */
+                if (is_indirect) {
+                    int cidx = cg_lookup(cg, callee);
+                    if (cidx >= 0 && cg->val_slot[cidx] != CG_NO_SLOT) {
+                        /* spilled callee: reload from its SP-biased slot */
+                        callee_reg = cg_alloc_reg(cg);
+                        if (cg->had_error) break;
+                        int32_t voff = cg_val_slot_off(cg,
+                                          cg->val_slot[cidx]) + sp_bias;
+                        if (cg_ldw_sp_off(cg, callee_reg, voff)) break;
+                    } else {
+                        callee_reg = cg_reg_for(cg, callee);
+                        if (cg->had_error) break;
+                    }
+                    cg_emit(cg, enc_r(CVM_OP_CALLR, callee_reg, 0, 0));
+                } else if (is_coro_swap) {
+                    /* args landed in R0 (from) and R1 (to) via the standard
+                     * arg-placement step above. CORO_SWAP saves current as
+                     * SUSPENDED into R0's pointee, restores R1's pointee. */
+                    cg_emit(cg, enc_r(CVM_OP_CORO_SWAP, 0, 1, 0));
+                } else {
+                    cg_emit(cg, enc_i24(CVM_OP_CALL, (int32_t)CVM_FN_SLOT(callee_idx)));
+                }
+                cg->has_calls = 1;
+
+                /* 5. Pop stacked-arg words (caller cleans). */
+                if (n_stacked_words > 0) {
+                    if (cg_sp_add(cg, n_stacked_words * 4u)) break;
+                }
+
+                /* 6. Restore the same registers we spilled in step 1
+                 *    (and only those; an LDW with no matching STW would
+                 *    load stale spill-area bytes from a previous call
+                 *    site or uninitialised stack memory). slot_of[k]
+                 *    must mirror step 1 exactly, so the same skip-on-
+                 *    0xFF check applies. */
+                for (int k = 0; k < spill_count; ++k) {
+                    if (!cg_bits_test(&spill_set, (unsigned)k)) continue;
+                    uint8_t slot = cg->slot_of[k];
+                    if (slot == 0xFFu) continue;
+                    int32_t off = (int32_t)cg->alloca_bytes + (int32_t)slot * 4;
+                    if (cg_ldw_sp_off(cg, (uint8_t)(8 + k), off)) break;
+                }
+                if (cg->had_error) break;
+
+                /* 7. Take the return value (after restore so it isn't
+                 *    clobbered). A 64-bit return arrives in R0:R1 (lo:hi) and
+                 *    is stored to the result's two frame slots; a scalar
+                 *    return is MOV'd from R0 into its SSA home. */
+                LLVMTypeRef rty = LLVMTypeOf(i);
+                if (cg_type_is_wide(rty)) {
+                    int ridx = cg_lookup(cg, i);
+                    int32_t off = cg_i64_lo_off(cg, ridx);
+                    if (cg_stw_sp_off(cg, off,     0)) break;
+                    if (cg_stw_sp_off(cg, off + 4, 1)) break;
+                } else if (LLVMGetTypeKind(rty) != LLVMVoidTypeKind) {
+                    uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                    if (dst != 0)
+                        cg_emit(cg, enc_r(CVM_OP_MOV, dst, 0, 0));
+                }
+
+                break;
+    } while (0);
+}
+
 static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
     cg_reset_function_state(cg);
     cg->fn_name = value_name(fn);
@@ -3146,6 +3577,24 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
     cg_bits_clear(&cg->ever_spilled);
     for (int i = 0; i < cg->call_live_count; ++i)
         cg_bits_or(&cg->ever_spilled, &cg->call_lives[i].live_after);
+    /* An invoke's helper sequence (`__cvm_eh_push`) must preserve not just the
+     * call's live-after set (already unioned above, via the invoke spill point)
+     * but also the invoke's OWN operands — they must survive `push` so the call
+     * itself can pass them. Those operand registers may not appear in any
+     * live-after set (a value consumed only by the call), so reserve slots for
+     * them too. While here, flag the function as containing an invoke. */
+    for (int b = 0; b < cg->block_count; ++b) {
+        for (LLVMValueRef i = LLVMGetFirstInstruction(cg->blocks[b]); i;
+             i = LLVMGetNextInstruction(i)) {
+            if (LLVMGetInstructionOpcode(i) != LLVMInvoke) continue;
+            cg->fn_has_invoke = 1;
+            unsigned no = LLVMGetNumOperands(i);
+            for (unsigned k = 0; k < no; ++k) {
+                int ob = cg_spill_bit_of(cg, LLVMGetOperand(i, k));
+                if (ob >= 0) cg_bits_set(&cg->ever_spilled, (unsigned)ob);
+            }
+        }
+    }
     memset(cg->slot_of, 0xFF, sizeof cg->slot_of);
     cg->spill_slot_count = 0;
     for (int k = 0; k < spill_count; ++k) {
@@ -3161,6 +3610,14 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
      * Above SP (in the caller's frame): saved-PC, then stacked args/params
      * at SP + frame_bytes + 4 + i*4. */
     cg->frame_bytes = cg->alloca_bytes + cg->spill_bytes + cg->val_spill_bytes;
+    /* The shared EH frame sits ABOVE everything else, so adding it doesn't
+     * shift any alloca/spill/val-spill offset (those are SP-relative from the
+     * low end). Stacked args are at SP + frame_bytes + 4 + i*4, which grows in
+     * lockstep with frame_bytes, so their absolute address is unchanged. */
+    if (cg->fn_has_invoke) {
+        cg->eh_frame_off = cg->frame_bytes;
+        cg->frame_bytes += CVM_EH_FRAME_BYTES;
+    }
     cg->funcs[func_idx].frame_size = cg->frame_bytes;
     if (getenv("CVM_SPILL_DEBUG"))
         fprintf(stderr, "[spill] %s: ssa_high=%d val_spills=%d caller_save=%d\n",
@@ -3296,13 +3753,13 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
              * phi it carries no code at its def site — its slots are written
              * by the incoming-edge moves (cg_emit_phi_moves), so let it fall
              * through to the (empty) PHI case below. */
-            if (op != LLVMPHI && op != LLVMCall
+            if (op != LLVMPHI && op != LLVMCall && op != LLVMInvoke
                 && cg_type_is_i64(LLVMTypeOf(i))) {
                 cg_emit_i64_def(cg, i, op);
                 if (cg->had_error) break;
                 continue;
             }
-            if (op != LLVMPHI && cg_type_is_f64(LLVMTypeOf(i))
+            if (op != LLVMPHI && op != LLVMInvoke && cg_type_is_f64(LLVMTypeOf(i))
                 && (op != LLVMCall || cg_call_is_handled_f64_intrinsic(i))) {
                 cg_emit_f64_def(cg, i, op);
                 if (cg->had_error) break;
@@ -4011,6 +4468,169 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 cg_emit(cg, enc_r(CVM_OP_HALT, 0, 0, 0));
                 break;
 
+            case LLVMInvoke: {
+                /* C++ exception handling, Itanium model, lowered onto the VM's
+                 * SETJMP/LONGJMP opcodes (no DWARF unwinder). For
+                 *   invoke callee(args) to %normal unwind %lpad
+                 * we:
+                 *   1. emit a static eh_desc (the landingpad's catch clauses)
+                 *      into DATA and store its address into frame.desc;
+                 *   2. __cvm_eh_push(&frame)  — link this landing frame;
+                 *   3. r = SETJMP(&frame.jb);
+                 *   4. r==0  -> run the call, __cvm_eh_pop, branch to %normal;
+                 *      r!=0  -> __cxa_throw longjmp'd us here; branch to %lpad.
+                 * One eh_frame is shared per function (eh_frame_off): invokes run
+                 * sequentially within an activation, so only one is live at once.
+                 *
+                 * Spill discipline (the subtle part): LONGJMP restores only PC,
+                 * SP and the SETJMP dest reg — every other register is clobbered.
+                 * So values live into the landingpad must reach it via memory. We
+                 * lean on the caller-save machinery: the actual call (below)
+                 * spills bb_live_out to slots BEFORE it runs, which is on the
+                 * path to any throw; on the unwind path we reload those slots.
+                 * `push` must additionally preserve the invoke's own operands (so
+                 * the call can pass them) — ever_spilled was widened to cover
+                 * them in cg_function. */
+                LLVMValueRef callee    = LLVMGetCalledValue(i);
+                LLVMValueRef callee_fn = LLVMIsAFunction(callee);
+                const char  *iname     = NULL;
+                if (callee_fn) { size_t nl; iname = LLVMGetValueName2(callee_fn, &nl); }
+                LLVMBasicBlockRef normal_bb = LLVMGetNormalDest(i);
+                LLVMBasicBlockRef unwind_bb = LLVMGetUnwindDest(i);
+                LLVMValueRef lp = cg_block_landingpad(unwind_bb);
+                if (!lp) {
+                    ERR(cg->fn_name,
+                        "invoke unwind destination does not begin with a "
+                        "landingpad");
+                    cg->had_error = 1; break;
+                }
+
+                long desc_off = cg_emit_eh_desc(cg, lp);
+                if (cg->had_error) break;
+
+                /* live = bb_live_out minus this invoke's result (the call/pop
+                 * caller-save set); push_set additionally covers the operands. */
+                cg_bits live = cg_call_spill_set(cg, i);
+                cg_bits push_set = live;
+                {
+                    unsigned no = LLVMGetNumOperands(i);
+                    for (unsigned k = 0; k < no; ++k) {
+                        int ob = cg_spill_bit_of(cg, LLVMGetOperand(i, k));
+                        if (ob >= 0) cg_bits_set(&push_set, (unsigned)ob);
+                    }
+                }
+
+                /* 1. frame.desc = &desc */
+                {
+                    uint8_t dr = cg_alloc_reg(cg);
+                    if (cg->had_error) break;
+                    cg_emit_load_const32(cg, dr, (int32_t)desc_off);
+                    if (cg_stw_sp_off(cg,
+                            (int32_t)(cg->eh_frame_off + CVM_EH_FRAME_DESC_OFF),
+                            dr)) break;
+                }
+
+                /* 2. __cvm_eh_push(&frame): spill live+operands, R0=&frame, CALL,
+                 *    restore (so the call below sees valid operand registers). */
+                {
+                    int pidx = cg_eh_func_idx(cg, "__cvm_eh_push");
+                    if (pidx < 0) break;
+                    if (cg_emit_spill(cg, &push_set)) break;
+                    if (cg_addr_sp_plus(cg, (int32_t)cg->eh_frame_off)) break;
+                    cg_emit(cg, enc_r(CVM_OP_MOV, 0, (uint8_t)CG_REG_SCRATCH, 0));
+                    cg_emit(cg, enc_i24(CVM_OP_CALL, (int32_t)CVM_FN_SLOT(pidx)));
+                    cg->has_calls = 1;
+                    if (cg_emit_restore(cg, &push_set)) break;
+                }
+
+                /* 3. r = SETJMP(&frame). 4. branch on r. */
+                uint8_t r = cg_alloc_reg(cg);
+                if (cg->had_error) break;
+                if (cg_addr_sp_plus(cg, (int32_t)cg->eh_frame_off)) break;
+                cg_emit(cg, enc_r(CVM_OP_SETJMP, r, (uint8_t)CG_REG_SCRATCH, 0));
+                /* r==0 (just-armed): skip the next JMP and fall into the normal
+                 * path. r!=0 (longjmp'd back here): take the JMP to the unwind
+                 * glue. The +1 skip is a fixed local offset (always in imm8);
+                 * the JMP to the unwind glue is a local backpatch — safe because
+                 * the normal-path glue (call lowering + phi moves) emits no
+                 * relaxable imm8 branches between it and its target. */
+                cg_emit(cg, enc_br(CVM_OP_BEQ, r, cg->zero_reg, 1));
+                uint32_t jmp_unwind_pos = cg->count;
+                cg_emit(cg, enc_i24(CVM_OP_JMP, 0));   /* -> Lunwind (backpatch) */
+
+                /* --- normal path --- */
+                cg_emit_user_call(cg, i, callee, callee_fn, iname);
+                if (cg->had_error) break;
+                /* Preserve the scalar result across the pop CALL (a wide result
+                 * already lives in frame slots, which pop doesn't touch). Stash
+                 * it in the now-dead jb[0] word of our own eh_frame. */
+                LLVMTypeRef rty = LLVMTypeOf(i);
+                int scalar_res = (LLVMGetTypeKind(rty) != LLVMVoidTypeKind
+                                  && !cg_type_is_wide(rty));
+                uint8_t res_reg = scalar_res ? cg->regs[cg_lookup(cg, i)] : 0;
+                if (scalar_res
+                    && cg_stw_sp_off(cg, (int32_t)cg->eh_frame_off, res_reg))
+                    break;
+                if (cg_emit_eh_call0(cg, "__cvm_eh_pop", -1, &live)) break;
+                if (scalar_res
+                    && cg_ldw_sp_off(cg, res_reg, (int32_t)cg->eh_frame_off))
+                    break;
+                cg_emit_phi_moves(cg, cg->cur_block, normal_bb);
+                if (cg->had_error) break;
+                cg_queue_fixup(cg, cg->count, normal_bb, 8, 24);
+                cg_emit(cg, enc_i24(CVM_OP_JMP, 0));
+
+                /* --- Lunwind: longjmp landed here; registers are garbage --- */
+                {
+                    uint32_t lunwind_pos = cg->count;
+                    int32_t  off = (int32_t)lunwind_pos
+                                 - (int32_t)(jmp_unwind_pos + 1u);
+                    cg->code[jmp_unwind_pos] = enc_i24(CVM_OP_JMP, off);
+                }
+                if (cg_emit_restore(cg, &live)) break;   /* reload spilled live-set */
+                cg_emit_phi_moves(cg, cg->cur_block, unwind_bb);
+                if (cg->had_error) break;
+                cg_queue_fixup(cg, cg->count, unwind_bb, 8, 24);
+                cg_emit(cg, enc_i24(CVM_OP_JMP, 0));
+                break;
+            }
+
+            case LLVMLandingPad:
+                /* No code: the landingpad's {ptr,i32} result is materialised by
+                 * the extractvalues that read it (-> __cvm_eh_exc/__cvm_eh_sel).
+                 * The invoke's unwind glue already reloaded the live registers
+                 * before branching into this block. */
+                break;
+
+            case LLVMResume:
+                /* `resume` continues unwinding the in-flight exception. Nothing
+                 * is live afterwards (it is noreturn). */
+                if (cg_emit_eh_call0(cg, "__cvm_eh_resume", -1, NULL)) break;
+                cg_emit(cg, enc_r(CVM_OP_HALT, 0, 0, 0));  /* unreachable backstop */
+                break;
+
+            case LLVMExtractValue: {
+                /* The only extractvalue we lower is reading a landingpad's two
+                 * result fields: idx 0 = exception object (-> __cvm_eh_exc),
+                 * idx 1 = selector (-> __cvm_eh_sel). Both are CALLs, so they are
+                 * registered runtime-call spill points (cg_op_is_runtime_call). */
+                if (!cg_is_landingpad_extract(i)) {
+                    ERR(cg->fn_name,
+                        "extractvalue: only landingpad results are supported "
+                        "(aggregate values are otherwise scalarised by clang)");
+                    cg->had_error = 1; break;
+                }
+                unsigned        nidx  = LLVMGetNumIndices(i);
+                const unsigned *idxs  = LLVMGetIndices(i);
+                unsigned        which = (nidx >= 1) ? idxs[0] : 0;
+                uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                cg_bits set = cg_call_spill_set(cg, i);
+                const char *helper = (which == 0) ? "__cvm_eh_exc"
+                                                  : "__cvm_eh_sel";
+                if (cg_emit_eh_call0(cg, helper, dst, &set)) break;
+                break;
+            }
+
             case LLVMAlloca:
                 /* No code here: the alloca pointer was materialised in the
                  * prologue. cg_collect_allocas validated that the alloca is
@@ -4334,7 +4954,7 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                         break;
                     }
                 }
-                if (!name) goto user_call_lowering;
+                if (!name) { cg_emit_user_call(cg, i, callee, callee_fn, name); break; }
 
                 /* setjmp/longjmp -> dedicated non-local-jump opcodes. The libc
                  * only DECLARES them (no body), so a normal call would fail
@@ -4353,6 +4973,18 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     uint8_t val = cg_reg_for(cg, LLVMGetOperand(i, 1));
                     if (cg->had_error) break;
                     cg_emit(cg, enc_r(CVM_OP_LONGJMP, env, val, 0));
+                    break;
+                }
+                /* llvm.eh.typeid.for(@T) — the C++ EH "selector" for type T.
+                 * Our runtime's selector convention IS the type_info address
+                 * (g_sel = (int)&T set by the unwinder), and &T == its DATA
+                 * offset, which cg_reg_for materialises for the global operand.
+                 * So the result is simply that address. */
+                if (strncmp(name, "llvm.eh.typeid.for", 18) == 0) {
+                    uint8_t a   = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                    uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                    if (cg->had_error) break;
+                    if (dst != a) cg_emit(cg, enc_r(CVM_OP_MOV, dst, a, 0));
                     break;
                 }
                 /* __cvm_coro_swap_raw(from, to) falls through to the full
@@ -5130,221 +5762,7 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     break;
                 }
 
-            user_call_lowering: ;
-                /* User-defined call. Direct (callee_fn != NULL): emit
-                 * `CALL imm24` with the callee's index in the module's
-                 * function table. Indirect (callee_fn == NULL): the
-                 * callee is an SSA value of pointer type that holds a
-                 * function index, emit `CALLR Rcallee`. */
-                int callee_idx = -1;
-                uint8_t callee_reg = 0;
-                int is_indirect = (callee_fn == NULL);
-                int is_coro_swap = (name && strcmp(name, "__cvm_coro_swap_raw") == 0);
-
-                if (!is_indirect && !is_coro_swap) {
-                    callee_idx = cg_func_lookup(cg, callee_fn);
-                    if (callee_idx < 0) {
-                        if (name && strncmp(name, "llvm.", 5) == 0)
-                            ERR(cg->fn_name,
-                                "unsupported intrinsic '%s': no lowering for this "
-                                "target. Rewrite the source to avoid it (e.g. take "
-                                "min/max/abs/fabs out-of-line so clang can't fold "
-                                "them into an intrinsic)", name);
-                        else
-                            ERR(cg->fn_name,
-                                "call to '%s': callee has no definition in this "
-                                "module (extern is not supported)", name);
-                        cg->had_error = 1;
-                        break;
-                    }
-                    if (callee_idx >= 0xFFFFFF) {
-                        /* +1 shift for the reserved FUNCS[0] slot must fit
-                         * in CALL's imm24 field. */
-                        ERR(cg->fn_name, "more than 16M user functions");
-                        cg->had_error = 1;
-                        break;
-                    }
-                }
-
-                unsigned narg = LLVMGetNumArgOperands(i);
-                /* A variadic callee takes ALL args on the stack (i386 vararg
-                 * ABI) so its va_start finds them contiguous in memory; a
-                 * normal callee uses the 8-in-regs convention. */
-                LLVMTypeRef call_fty = LLVMGetCalledFunctionType(i);
-                int call_is_vararg = call_fty && LLVMIsFunctionVarArg(call_fty);
-                /* Word-based layout: a 64-bit arg takes two words. For
-                 * scalar-only calls total_words == narg, so this reduces to
-                 * the old per-arg scheme exactly. */
-                unsigned total_words = 0;
-                for (unsigned a = 0; a < narg; ++a)
-                    total_words += (unsigned)cg_arg_words(
-                                       LLVMTypeOf(LLVMGetOperand(i, a)));
-                unsigned n_reg_words = call_is_vararg ? 0u
-                                     : (total_words < 8 ? total_words : 8);
-                unsigned n_stacked_words = total_words - n_reg_words;
-
-                /* Argument lowering is done LAST (after caller-save spill and
-                 * SP adjustment), one argument at a time, so we never need to
-                 * hold many materialised/reloaded args in the emit scratch
-                 * window simultaneously. A spilled SSA argument is loaded
-                 * straight from its frame slot into the destination (R0..R7,
-                 * or a stacked-arg slot), NOT routed through a shared reload
-                 * register — that would overflow the window for a call with
-                 * many spilled args (e.g. DOOM's P_TouchSpecialThing). See
-                 * step 3 below. We only check the arg-count cap here. */
-                if (narg > 256) {
-                    ERR(cg->fn_name,
-                        "call has %u args; codegen cap is 256", narg);
-                    cg->had_error = 1;
-                    break;
-                }
-
-                /* 1. Caller-saved spill, narrowed by liveness analysis.
-                 *    `cg_compute_call_liveouts` precomputed, for each
-                 *    LLVMCall, the set of SSA registers (R8..R(ssa_reg_high
-                 *    -1)) that hold values used after the call returns.
-                 *    Only those registers need to be preserved. The call's
-                 *    own destination register is excluded explicitly: its
-                 *    pre-call contents are garbage from this call's POV
-                 *    (that register is exclusively assigned to the SSA
-                 *    value the call is about to define), and the post-call
-                 *    `MOV dst, R0` writes the actual return value, so a
-                 *    spill/restore round-trip would just shuffle garbage.
-                 *
-                 *    Each spilled reg lands at slot_of[bit] within the
-                 *    spill area (post-allocation compact index, not the
-                 *    raw bit). slot_of[bit] == 0xFF means the analysis
-                 *    didn't see this reg crossing any call, so no slot
-                 *    exists and the spill must be skipped. */
-                cg_bits spill_set;
-                const cg_bits *live = cg_lookup_call_live(cg, i);
-                if (live) {
-                    spill_set = *live;
-                    int my_bit = cg_spill_bit_of(cg, i);
-                    if (my_bit >= 0)
-                        cg_bits_clear_bit(&spill_set, (unsigned)my_bit);
-                } else {
-                    /* Defensive fallback: if liveness wasn't recorded
-                     * for this call (shouldn't happen — every LLVMCall
-                     * is snapshotted), spill the whole ever_spilled set.
-                     * Anything outside it has no slot, so spilling it
-                     * would be a bug anyway. */
-                    spill_set = cg->ever_spilled;
-                    int my_bit = cg_spill_bit_of(cg, i);
-                    if (my_bit >= 0)
-                        cg_bits_clear_bit(&spill_set, (unsigned)my_bit);
-                }
-
-                int spill_count = cg->ssa_reg_high - 8;
-                for (int k = 0; k < spill_count; ++k) {
-                    if (!cg_bits_test(&spill_set, (unsigned)k)) continue;
-                    uint8_t slot = cg->slot_of[k];
-                    if (slot == 0xFFu) continue;     /* no slot reserved */
-                    int32_t off = (int32_t)cg->alloca_bytes + (int32_t)slot * 4;
-                    if (cg_stw_sp_off(cg, off, (uint8_t)(8 + k))) break;
-                }
-                if (cg->had_error) break;
-
-                /* SP drops by this many bytes for stacked-arg words, so a
-                 * value-spill slot at frame offset `off` is reachable at
-                 * [SP_now + sp_bias + off] during the rest of the sequence.
-                 * (The caller-save spill above ran BEFORE this drop, so it
-                 * used the un-biased offsets — correct.) */
-                int32_t sp_bias = (int32_t)(n_stacked_words * 4u);
-
-                /* 2+3. Drop SP for the stacked words, then place every
-                 *      argument WORD at its calling-convention position
-                 *      (R0..R7 for words < n_reg_words, else the stack). A
-                 *      64-bit arg contributes two words (lo, hi). Register and
-                 *      stack placement may interleave safely: reg-arg sources
-                 *      are never R0..R7 and stack stores touch memory, so
-                 *      neither clobbers the other. cg_place_arg_word recycles
-                 *      the emit-scratch window per word. */
-                if (n_stacked_words > 0) {
-                    if (cg_sp_sub(cg, n_stacked_words * 4u)) break;
-                }
-                {
-                    unsigned wp = 0;
-                    for (unsigned a = 0; a < narg && !cg->had_error; ++a) {
-                        LLVMValueRef av = LLVMGetOperand(i, a);
-                        if (cg_type_is_wide(LLVMTypeOf(av))) {
-                            cg_place_arg_word(cg, av, 0, wp,     n_reg_words, sp_bias);
-                            cg_place_arg_word(cg, av, 1, wp + 1, n_reg_words, sp_bias);
-                            wp += 2;
-                        } else {
-                            cg_place_arg_word(cg, av, -1, wp, n_reg_words, sp_bias);
-                            wp += 1;
-                        }
-                    }
-                    if (cg->had_error) break;
-                }
-
-                /* 4. CALL or CALLR. User functions occupy FUNCS[1..N]
-                 *    (index 0 is reserved as the null-fn-ptr trap), so a
-                 *    direct call uses (callee_idx + 1) as the imm24. For an
-                 *    indirect call, reload the (possibly spilled) callee
-                 *    index here, just before CALLR, so it doesn't tie up a
-                 *    register across the arg lowering. */
-                if (is_indirect) {
-                    int cidx = cg_lookup(cg, callee);
-                    if (cidx >= 0 && cg->val_slot[cidx] != CG_NO_SLOT) {
-                        /* spilled callee: reload from its SP-biased slot */
-                        callee_reg = cg_alloc_reg(cg);
-                        if (cg->had_error) break;
-                        int32_t voff = cg_val_slot_off(cg,
-                                          cg->val_slot[cidx]) + sp_bias;
-                        if (cg_ldw_sp_off(cg, callee_reg, voff)) break;
-                    } else {
-                        callee_reg = cg_reg_for(cg, callee);
-                        if (cg->had_error) break;
-                    }
-                    cg_emit(cg, enc_r(CVM_OP_CALLR, callee_reg, 0, 0));
-                } else if (is_coro_swap) {
-                    /* args landed in R0 (from) and R1 (to) via the standard
-                     * arg-placement step above. CORO_SWAP saves current as
-                     * SUSPENDED into R0's pointee, restores R1's pointee. */
-                    cg_emit(cg, enc_r(CVM_OP_CORO_SWAP, 0, 1, 0));
-                } else {
-                    cg_emit(cg, enc_i24(CVM_OP_CALL, (int32_t)CVM_FN_SLOT(callee_idx)));
-                }
-                cg->has_calls = 1;
-
-                /* 5. Pop stacked-arg words (caller cleans). */
-                if (n_stacked_words > 0) {
-                    if (cg_sp_add(cg, n_stacked_words * 4u)) break;
-                }
-
-                /* 6. Restore the same registers we spilled in step 1
-                 *    (and only those; an LDW with no matching STW would
-                 *    load stale spill-area bytes from a previous call
-                 *    site or uninitialised stack memory). slot_of[k]
-                 *    must mirror step 1 exactly, so the same skip-on-
-                 *    0xFF check applies. */
-                for (int k = 0; k < spill_count; ++k) {
-                    if (!cg_bits_test(&spill_set, (unsigned)k)) continue;
-                    uint8_t slot = cg->slot_of[k];
-                    if (slot == 0xFFu) continue;
-                    int32_t off = (int32_t)cg->alloca_bytes + (int32_t)slot * 4;
-                    if (cg_ldw_sp_off(cg, (uint8_t)(8 + k), off)) break;
-                }
-                if (cg->had_error) break;
-
-                /* 7. Take the return value (after restore so it isn't
-                 *    clobbered). A 64-bit return arrives in R0:R1 (lo:hi) and
-                 *    is stored to the result's two frame slots; a scalar
-                 *    return is MOV'd from R0 into its SSA home. */
-                LLVMTypeRef rty = LLVMTypeOf(i);
-                if (cg_type_is_wide(rty)) {
-                    int ridx = cg_lookup(cg, i);
-                    int32_t off = cg_i64_lo_off(cg, ridx);
-                    if (cg_stw_sp_off(cg, off,     0)) break;
-                    if (cg_stw_sp_off(cg, off + 4, 1)) break;
-                } else if (LLVMGetTypeKind(rty) != LLVMVoidTypeKind) {
-                    uint8_t dst = cg->regs[cg_lookup(cg, i)];
-                    if (dst != 0)
-                        cg_emit(cg, enc_r(CVM_OP_MOV, dst, 0, 0));
-                }
-
+                cg_emit_user_call(cg, i, callee, callee_fn, name);
                 break;
             }
 

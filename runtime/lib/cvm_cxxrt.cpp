@@ -156,10 +156,14 @@ eh_frame  *g_eh_top = 0;       /* top of the active-landingpad chain */
 void      *g_eh_exc = 0;       /* in-flight exception object */
 const ti_base *g_eh_ti = 0;    /* its type_info */
 int        g_eh_sel = 0;       /* selector handed to the landingpad */
-int        g_eh_handlers = 0;  /* live __cxa_begin_catch nesting */
 
-/* Exception header sits just before the thrown object. */
-struct exc_header { const void *ti; void (*dtor)(void *); };
+/* Exception header sits just before the thrown object. handler_count tracks how
+ * many `catch` handlers are live on this exception (Itanium __cxa semantics, in
+ * the header so a rethrow that transits an intervening cleanup's end_catch is
+ * not freed prematurely): __cxa_rethrow negates it, __cxa_begin_catch undoes the
+ * negation + increments, __cxa_end_catch frees only when it returns to 0 on the
+ * non-rethrown path. */
+struct exc_header { const void *ti; void (*dtor)(void *); int handler_count; };
 inline exc_header *hdr_of(void *obj) { return (exc_header *)obj - 1; }
 
 /* Does a thrown object of type `thrown` match a `catch (Caught)` clause? True
@@ -218,7 +222,7 @@ void *__cxa_allocate_exception(unsigned long size) {
     char *p = (char *)malloc(sizeof(exc_header) + (size ? size : 1));
     if (!p) { for (;;) {} }
     exc_header *h = (exc_header *)p;
-    h->ti = 0; h->dtor = 0;
+    h->ti = 0; h->dtor = 0; h->handler_count = 0;
     return p + sizeof(exc_header);
 }
 void __cxa_free_exception(void *obj) { if (obj) free(hdr_of(obj)); }
@@ -233,21 +237,50 @@ void __cxa_free_exception(void *obj) { if (obj) free(hdr_of(obj)); }
 
 void *__cxa_begin_catch(void *exc) {
     (void)exc;
-    ++g_eh_handlers;
+    if (g_eh_exc) {
+        exc_header *h = hdr_of(g_eh_exc);
+        /* A negative count marks an in-flight rethrow (see __cxa_rethrow): undo
+         * the negation and count this handler. Otherwise just count it. */
+        h->handler_count = (h->handler_count < 0)
+            ? -h->handler_count + 1 : h->handler_count + 1;
+    }
     return g_eh_exc;          /* the (possibly base-adjusted) object */
 }
 void __cxa_end_catch(void) {
-    if (--g_eh_handlers <= 0 && g_eh_exc) {
-        exc_header *h = hdr_of(g_eh_exc);
+    if (!g_eh_exc) return;
+    exc_header *h = hdr_of(g_eh_exc);
+    if (h->handler_count < 0) {
+        /* Rethrown and now transiting an intervening cleanup's end_catch — the
+         * exception is still propagating, so step the count back toward zero but
+         * NEVER free here. */
+        ++h->handler_count;
+    } else if (--h->handler_count == 0) {
         if (h->dtor) h->dtor(g_eh_exc);
         free(h);
-        g_eh_exc = 0; g_eh_ti = 0; g_eh_handlers = 0;
+        g_eh_exc = 0; g_eh_ti = 0;
     }
 }
-[[noreturn]] void __cxa_rethrow(void) { eh_unwind(); }   /* `throw;` */
+/* `throw;` — re-raise the exception currently being handled. Negate its handler
+ * count so the cleanup end_catch this unwind transits does not free it; the next
+ * __cxa_begin_catch undoes the negation. */
+[[noreturn]] void __cxa_rethrow(void) {
+    if (g_eh_exc) {
+        exc_header *h = hdr_of(g_eh_exc);
+        h->handler_count = -h->handler_count;
+    }
+    eh_unwind();
+}
 
 /* Last-resort terminate. The cart has no std::terminate handler chain; trap. */
 void __cvm_eh_terminate(void) { for (;;) {} }
 
 } /* extern "C" */
+
+/* std::terminate — clang routes a noexcept violation and an unhandled exception
+ * through `__clang_call_terminate` (which it emits, defined, in any module with
+ * a terminate landingpad) -> `std::terminate`. clang references it MANGLED and
+ * we have no <exception> header here, so define it by its mangled asm name. The
+ * cart has no terminate-handler chain; trap (same as __cvm_eh_terminate). */
+extern "C" void cvm_std_terminate(void) asm("_ZSt9terminatev");
+extern "C" void cvm_std_terminate(void) { __cvm_eh_terminate(); for (;;) {} }
 

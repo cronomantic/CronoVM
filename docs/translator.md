@@ -113,6 +113,9 @@ the gap is what's still being implemented:
 - comparison and select: `icmp`, `select`
 - aggregates: `extractvalue`, `insertvalue`
 - structural: `phi`, `call`
+- C++ exceptions (Itanium): `invoke`, `landingpad`, `resume` (the MSVC/SEH
+  pads — `catchpad`/`cleanuppad`/`catchswitch`/`catchret`/`cleanupret` — stay
+  rejected; we only see Itanium IR)
 
 ### Instructions currently lowered by codegen
 
@@ -471,12 +474,20 @@ Global addresses are materialised through `MOVI`/`MOVI+MOVHI` as needed,
 so the `DATA` section has no codegen-imposed size cap (only the loader's
 `heap_size + stack_size <= 4 GiB` invariant binds).
 
+The first 8 bytes of `DATA` are a reserved guard, so the lowest real global
+lives at offset 8, never 0. Since a VM pointer is its heap offset, this keeps
+address 0 reserved for the null pointer — otherwise the first global would alias
+null (a problem for any `if (&global)` test, and specifically for C++ `catch`
+clauses, whose type-info pointer at address 0 would be confused with the
+catch-all / cleanup sentinel).
+
 ### Instructions rejected
 
 | Family | Examples | Reason |
 | ------ | -------- | ------ |
 | floating-point | `fadd`, `fmul`, `fcmp`, `sitofp`, ... | deferred to float64 |
-| exceptions | `invoke`, `landingpad`, `resume`, `cleanuppad` | not in subset |
+| MSVC/SEH exceptions | `catchpad`, `cleanuppad`, `catchswitch`, `catchret`, `cleanupret` | only the Itanium model (`invoke`/`landingpad`/`resume`) is supported |
+| EH filter clauses | `landingpad ... filter [...]` | dynamic exception specifications not supported |
 | atomics/fences | `cmpxchg`, `atomicrmw`, `fence` | not in subset |
 | vectors | `extractelement`, `shufflevector`, ... | not in subset |
 | variadic | `va_arg` | not in subset |
