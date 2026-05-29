@@ -4544,22 +4544,24 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     break;
                 }
 
-                /* llvm.bitreverse.i16(x) — reverse the 16 bit positions. clang
-                 * folds hand-written bit-reversal idioms into this (e.g.
+                /* llvm.bitreverse.i8/i16/i32(x) — reverse the N bit positions.
+                 * clang folds hand-written bit-reversal idioms into this (e.g.
                  * stb_image's stbi__bitreverse16 in the zlib/PNG decoder). Lower
-                 * with the classic swap network:
+                 * with the classic swap network — for i16:
                  *   x = ((x&0xAAAA)>>1)|((x&0x5555)<<1);
                  *   x = ((x&0xCCCC)>>2)|((x&0x3333)<<2);
                  *   x = ((x&0xF0F0)>>4)|((x&0x0F0F)<<4);
                  *   x = ((x&0xFF00)>>8)|((x&0x00FF)<<8);
-                 * All intermediate values stay within the low 16 bits. */
-                if (strcmp(name, "llvm.bitreverse.i16") == 0) {
-                    static const struct { uint32_t hi, lo; int sh; } steps[4] = {
-                        { 0xAAAA, 0x5555, 1 },
-                        { 0xCCCC, 0x3333, 2 },
-                        { 0xF0F0, 0x0F0F, 4 },
-                        { 0xFF00, 0x00FF, 8 },
-                    };
+                 * Generalised to any width N (8/16/32): one step per shift
+                 * s = 1,2,4,...,N/2, with the alternating lo/hi masks computed
+                 * for N bits. Source is masked to N bits first (narrow values
+                 * may carry sign-extended high bits in the 32-bit reg). */
+                {
+                    int br_bits = 0;
+                    if      (strcmp(name, "llvm.bitreverse.i8")  == 0) br_bits = 8;
+                    else if (strcmp(name, "llvm.bitreverse.i16") == 0) br_bits = 16;
+                    else if (strcmp(name, "llvm.bitreverse.i32") == 0) br_bits = 32;
+                    if (br_bits) {
                     uint8_t src = cg_reg_for(cg, LLVMGetOperand(i, 0));
                     uint8_t dst = cg->regs[cg_lookup(cg, i)];
                     uint8_t x   = cg_alloc_reg(cg);
@@ -4567,23 +4569,32 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     uint8_t mh  = cg_alloc_reg(cg);
                     uint8_t ml  = cg_alloc_reg(cg);
                     uint8_t sh  = cg_alloc_reg(cg);
-                    uint8_t k16 = cg_alloc_reg(cg);
+                    uint8_t kw  = cg_alloc_reg(cg);
                     int s;
+                    uint32_t width_mask = (br_bits == 32)
+                        ? 0xFFFFFFFFu : ((1u << br_bits) - 1u);
                     if (cg->had_error) break;
-                    cg_emit_load_const32(cg, k16, 0xFFFF);
-                    cg_emit(cg, enc_r(CVM_OP_AND, x, src, k16));  /* x = src & 0xFFFF */
-                    for (s = 0; s < 4; ++s) {
-                        cg_emit_load_const32(cg, mh, (int32_t)steps[s].hi);
-                        cg_emit_load_const32(cg, ml, (int32_t)steps[s].lo);
-                        cg_emit_load_const32(cg, sh, steps[s].sh);
-                        cg_emit(cg, enc_r(CVM_OP_AND, t, x, mh));  /* t = x & hi    */
-                        cg_emit(cg, enc_r(CVM_OP_SHR, t, t, sh));  /* t >>= sh      */
-                        cg_emit(cg, enc_r(CVM_OP_AND, x, x, ml));  /* x &= lo       */
-                        cg_emit(cg, enc_r(CVM_OP_SHL, x, x, sh));  /* x <<= sh      */
-                        cg_emit(cg, enc_r(CVM_OP_OR,  x, x, t));   /* x = x | t     */
+                    cg_emit_load_const32(cg, kw, (int32_t)width_mask);
+                    cg_emit(cg, enc_r(CVM_OP_AND, x, src, kw)); /* x = src & widthmask */
+                    for (s = 1; s < br_bits; s <<= 1) {
+                        /* lo mask: low s bits set in each 2s-bit group, over N bits */
+                        uint32_t lo = 0;
+                        int bit;
+                        for (bit = 0; bit < br_bits; ++bit)
+                            if ((bit % (2 * s)) < s) lo |= (1u << bit);
+                        uint32_t hi = (lo << s) & width_mask;
+                        cg_emit_load_const32(cg, mh, (int32_t)hi);
+                        cg_emit_load_const32(cg, ml, (int32_t)lo);
+                        cg_emit_load_const32(cg, sh, s);
+                        cg_emit(cg, enc_r(CVM_OP_AND, t, x, mh));  /* t = x & hi  */
+                        cg_emit(cg, enc_r(CVM_OP_SHR, t, t, sh));  /* t >>= s     */
+                        cg_emit(cg, enc_r(CVM_OP_AND, x, x, ml));  /* x &= lo     */
+                        cg_emit(cg, enc_r(CVM_OP_SHL, x, x, sh));  /* x <<= s     */
+                        cg_emit(cg, enc_r(CVM_OP_OR,  x, x, t));   /* x = x | t   */
                     }
                     cg_emit(cg, enc_r(CVM_OP_MOV, dst, x, 0));
                     break;
+                    }
                 }
 
                 /* llvm.cttz.i32(%x, is_zero_undef) — count trailing zeros. No
@@ -4840,15 +4851,16 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
 
                 /* Saturating add/sub, any integer width. clang -O folds
                  * counters guarded with `if (x > 0) --x;` / `if (x < N) ++x;`
-                 * into llvm.{u,s}{add,sub}.sat.iN. Lowered as cmp + select
-                 * (no narrow-width adjustment needed: the saturate is the
-                 * cmp itself; on overflow we just clamp). Same shape as
-                 * the min/max family above. */
-                int is_sat = 0, sat_sub = 0, sat_signed = 0;
-                if      (strncmp(name, "llvm.uadd.sat.i", 15) == 0) { is_sat=1; }
-                else if (strncmp(name, "llvm.usub.sat.i", 15) == 0) { is_sat=1; sat_sub=1; }
-                else if (strncmp(name, "llvm.sadd.sat.i", 15) == 0) { is_sat=1; sat_signed=1; }
-                else if (strncmp(name, "llvm.ssub.sat.i", 15) == 0) { is_sat=1; sat_sub=1; sat_signed=1; }
+                 * into llvm.{u,s}{add,sub}.sat.iN. Lowered as cmp + select.
+                 * NARROW WIDTHS MATTER for the add form: the upper clamp is
+                 * 2^N-1 (not 0xFFFFFFFF) and the overflow test is "sum > 2^N-1"
+                 * (the 32-bit carry never fires for N<32). UQM emits
+                 * uadd.sat.i8 + usub.sat.i8/i16. */
+                int is_sat = 0, sat_sub = 0, sat_signed = 0, sat_bits = 0;
+                if      (strncmp(name, "llvm.uadd.sat.i", 15) == 0) { is_sat=1;               sat_bits=atoi(name+15); }
+                else if (strncmp(name, "llvm.usub.sat.i", 15) == 0) { is_sat=1; sat_sub=1;    sat_bits=atoi(name+15); }
+                else if (strncmp(name, "llvm.sadd.sat.i", 15) == 0) { is_sat=1; sat_signed=1; sat_bits=atoi(name+15); }
+                else if (strncmp(name, "llvm.ssub.sat.i", 15) == 0) { is_sat=1; sat_sub=1; sat_signed=1; sat_bits=atoi(name+15); }
                 if (is_sat) {
                     /* For now handle unsigned only — the signed variants
                      * have asymmetric saturation (negative-overflow → MIN,
@@ -4880,16 +4892,24 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                         cg_emit(cg, enc_i24(CVM_OP_JMP, 1));
                         cg_emit(cg, enc_r (CVM_OP_MOV, dst, tmp, 0));
                     } else {
-                        /* uadd.sat(a, b) = (a + b < a) ? UINT32_MAX : a + b
-                         * (carry == wrap). For narrow widths a clamp would
-                         * also need the high-bit-vs-width check; we trust
-                         * clang to have already extended narrow operands
-                         * before this call site. */
+                        /* uadd.sat(a, b): clamp to the width's max.
+                         *  N==32: sum = a+b; saturate on carry (sum < a) -> 2^32-1.
+                         *  N<32 : sum = a+b can't wrap a 32-bit reg (inputs are
+                         *         zero-extended to <=2^N-1), so the carry test
+                         *         never fires — instead saturate when sum > 2^N-1,
+                         *         clamping to 2^N-1 (NOT 0xFFFFFFFF). */
                         uint8_t max_r = cg_alloc_reg(cg);
                         if (cg->had_error) break;
                         cg_emit(cg, enc_r(CVM_OP_ADD, tmp, a, b2));
-                        cg_emit_load_const32(cg, max_r, -1);   /* 0xFFFFFFFF */
-                        cg_emit(cg, enc_r(CVM_OP_CMP_LTU, cond, tmp, a));
+                        if (sat_bits > 0 && sat_bits < 32) {
+                            uint32_t maxn = ((uint32_t)1 << sat_bits) - 1u;
+                            cg_emit_load_const32(cg, max_r, (int32_t)maxn);
+                            /* cond = (maxn < sum)  ==  (sum > maxn) */
+                            cg_emit(cg, enc_r(CVM_OP_CMP_LTU, cond, max_r, tmp));
+                        } else {
+                            cg_emit_load_const32(cg, max_r, -1);   /* 0xFFFFFFFF */
+                            cg_emit(cg, enc_r(CVM_OP_CMP_LTU, cond, tmp, a));
+                        }
                         cg_emit(cg, enc_br(CVM_OP_BEQ, cond, cg->zero_reg, 2));
                         cg_emit(cg, enc_r (CVM_OP_MOV, dst, max_r, 0));
                         cg_emit(cg, enc_i24(CVM_OP_JMP, 1));

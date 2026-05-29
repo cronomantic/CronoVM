@@ -232,4 +232,21 @@ if(TARGET cvm-translate)
              COMMAND test_e2e ${_cvmcc_abi} 0 0)
     set_tests_properties(e2e_cvm_cc_abi64
                          PROPERTIES FIXTURES_REQUIRED cvm_cc_bins)
+
+    # Differential conformance corpus: proactively exercise the C / LLVM-
+    # intrinsic surface (integer intrinsics across widths, i64 arithmetic,
+    # narrow icmp, float/double conversions + math). Each fixture is built on
+    # the VM (cvm-cc) AND natively (the oracle); the runner compares checksums
+    # so unlowered intrinsics (gaps) and mislowerings (wrong values) are both
+    # caught BEFORE a port trips over them. Needs bash (matches the project's
+    # bash build tooling); skipped gracefully where bash is absent.
+    find_program(BASH_EXECUTABLE bash)
+    if(BASH_EXECUTABLE)
+        add_test(NAME conformance
+                 COMMAND ${BASH_EXECUTABLE}
+                         ${CVM_SOURCE_ROOT}/tests/conformance/run_conformance.sh
+                         $<TARGET_FILE:cvm-cc>
+                         $<TARGET_FILE:test_e2e>
+                         ${CVM_FIXTURE_CC})
+    endif()
 endif()
