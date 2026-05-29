@@ -6027,6 +6027,7 @@ int main(int argc, char **argv) {
     if (src && src_len) printf("module: %.*s\n", (int)src_len, src);
 
     LLVMValueRef main_fn = NULL;
+    int main_is_c = 0;   /* found an unmangled (C-linkage) "main" */
     int defs = 0;
     for (LLVMValueRef fn = LLVMGetFirstFunction(mod);
          fn; fn = LLVMGetNextFunction(fn))
@@ -6036,10 +6037,21 @@ int main(int argc, char **argv) {
         ++defs;
         validate_function(fn);
 
+        /* Entry selection: an unmangled "main" wins; else the C++-mangled
+         * "_Z4mainv" (int main() / int main(void) — clang mangles main under
+         * the bare i386-elf target since it isn't treated as the hosted entry);
+         * else the first defined function. A C-linkage main always takes
+         * priority over the mangled form if both appear. */
         size_t nl = 0;
         const char *nm = LLVMGetValueName2(fn, &nl);
-        if (!main_fn || (nm && nl == 4 && memcmp(nm, "main", 4) == 0))
+        if (nm && nl == 4 && memcmp(nm, "main", 4) == 0) {
+            main_fn = fn; main_is_c = 1;
+        } else if (!main_is_c && nm && nl == 8 &&
+                   memcmp(nm, "_Z4mainv", 8) == 0) {
             main_fn = fn;
+        } else if (!main_fn) {
+            main_fn = fn;
+        }
     }
     if (defs == 0) ERR(NULL, "module contains no function definitions");
 

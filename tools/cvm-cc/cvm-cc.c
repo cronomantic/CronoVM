@@ -81,6 +81,7 @@
  * runtime dir and are never hand-listed by the user. */
 #define CVM_F64_RUNTIME_TU "cvm_float64_rt.c"
 #define CVM_I64_RUNTIME_TU "cvm_int64_rt.c"
+#define CVM_CXX_RUNTIME_TU "cvm_cxxrt.cpp"
 
 #define MAX_REGIONS         64
 #define MAX_INCLUDE_DIRS    32
@@ -117,13 +118,16 @@ struct cli {
 
 static void usage(FILE *f) {
     fprintf(f,
-        "Usage: cvm-cc <input.c|input.bc>... -o <output.bin> [options]\n"
+        "Usage: cvm-cc <input.c|input.cpp|input.bc>... -o <output.bin> [opts]\n"
         "\n"
         "Driver around clang + llvm-link + cvm-translate. Each .c is compiled\n"
-        "with clang --target=i386-elf -emit-llvm -O<level> to bitcode; .bc\n"
-        "inputs skip clang. Multiple inputs are llvm-link'd into one module\n"
-        "(true multi-file linking — file-local statics don't collide), then\n"
-        "translated. A single input skips the link step.\n"
+        "with clang --target=i386-elf -emit-llvm -O<level> to bitcode; .cpp/.cc/\n"
+        ".cxx are compiled as C++ (-x c++ -fno-exceptions -fno-rtti) and the C++\n"
+        "ABI runtime (cvm_cxxrt) is auto-linked; .bc inputs skip clang. Multiple\n"
+        "inputs are llvm-link'd into one module (true multi-file linking —\n"
+        "file-local statics don't collide), then translated. (C++ note: the\n"
+        "translator runs global constructors before main; operator new/delete\n"
+        "forward to the cart's malloc/free.)\n"
         "\n"
         "Required:\n"
         "  -o <file>                  output .bin path\n"
@@ -167,6 +171,14 @@ static void usage(FILE *f) {
 static int has_suffix(const char *s, const char *suf) {
     size_t sl = strlen(s), tl = strlen(suf);
     return sl >= tl && memcmp(s + sl - tl, suf, tl) == 0;
+}
+
+/* A C++ source input (compiled with clang -x c++ -fno-exceptions -fno-rtti).
+ * .C is intentionally omitted — on case-insensitive filesystems it aliases the
+ * C extension .c. */
+static int is_cpp_src(const char *s) {
+    return has_suffix(s, ".cpp") || has_suffix(s, ".cc") ||
+           has_suffix(s, ".cxx");
 }
 
 /* The last path component of `s` (after the final '/' or '\'). */
@@ -417,11 +429,22 @@ static int compile_c_to_bc(const struct cli *cli, const char *clang,
     char rtinc[1024];
     snprintf(rtinc, sizeof rtinc, "-I%s", cli->runtime_dir);
 
-    char *cargv[16 + 2 * MAX_INCLUDE_DIRS + MAX_DEFINES];
+    char *cargv[24 + 2 * MAX_INCLUDE_DIRS + MAX_DEFINES];
     int   n = 0;
     cargv[n++] = (char *)clang;
     cargv[n++] = (char *)"--target=i386-elf";
     cargv[n++] = (char *)"-ffreestanding";
+    /* C++ inputs: force the C++ frontend and disable the two features that
+     * pull in ABI surface the VM doesn't support yet — exceptions
+     * (invoke/landingpad/_Unwind_*) and RTTI (type_info). The global-ctor and
+     * operator-new/delete + __cxa_* surface IS supported (translator runs
+     * global ctors; cvm_cxxrt provides the ABI runtime). */
+    if (is_cpp_src(input)) {
+        cargv[n++] = (char *)"-x";
+        cargv[n++] = (char *)"c++";
+        cargv[n++] = (char *)"-fno-exceptions";
+        cargv[n++] = (char *)"-fno-rtti";
+    }
     cargv[n++] = (char *)"-emit-llvm";
     /* Line tables only: enough for the translator to report file:line on
      * rejected constructs; no .bin impact (debug metadata is dropped when the
@@ -460,12 +483,15 @@ int main(int argc, char **argv) {
         cli.runtime_dir = installed ? installed : CVM_RUNTIME_DIR;
     }
 
+    int any_cpp = 0;
     for (int i = 0; i < cli.input_count; ++i) {
-        if (!has_suffix(cli.inputs[i], ".c") && !has_suffix(cli.inputs[i], ".bc")) {
-            fprintf(stderr, "cvm-cc: input must end in .c or .bc (got '%s')\n",
-                    cli.inputs[i]);
+        if (!has_suffix(cli.inputs[i], ".c") && !has_suffix(cli.inputs[i], ".bc") &&
+            !is_cpp_src(cli.inputs[i])) {
+            fprintf(stderr, "cvm-cc: input must end in .c, .cpp/.cc/.cxx or .bc "
+                    "(got '%s')\n", cli.inputs[i]);
             return 2;
         }
+        if (is_cpp_src(cli.inputs[i])) any_cpp = 1;
     }
 
     /* Per-input bitcode. A .c is compiled to an owned temp .bc next to the
@@ -561,6 +587,41 @@ int main(int argc, char **argv) {
             bc_paths[bc_count] = bc;
             bc_owned[bc_count] = 1;
             ++bc_count;
+        }
+    }
+
+    /* Auto-link the C++ ABI runtime when any input is C++: operator new/delete
+     * (referenced by every class with a virtual destructor, via the deleting-
+     * dtor vtable slot), __cxa_pure_virtual, the local-static guards, and
+     * __cxa_atexit. operator new/delete forward to the cart's malloc/free
+     * (provided by the SDK libc). Skipped if the user already listed it. */
+    if (!fail && any_cpp) {
+        int listed = 0;
+        for (int i = 0; i < cli.input_count; ++i)
+            if (strcmp(basename_of(cli.inputs[i]), CVM_CXX_RUNTIME_TU) == 0)
+                listed = 1;
+        if (!listed) {
+            if (bc_count >= MAX_INPUTS) {
+                fprintf(stderr, "cvm-cc: too many inputs to auto-link %s "
+                        "(max %d)\n", CVM_CXX_RUNTIME_TU, MAX_INPUTS);
+                fail = 1;
+            } else {
+                char rt_src[1100];
+                snprintf(rt_src, sizeof rt_src, "%s/%s",
+                         cli.runtime_dir, CVM_CXX_RUNTIME_TU);
+                char *bc = (char *)malloc(outlen + 24);
+                if (!bc) { perror("malloc"); fail = 1; }
+                else {
+                    snprintf(bc, outlen + 24, "%s.rtcxx.tmp.bc", cli.output);
+                    if (compile_c_to_bc(&cli, clang, rt_src, bc) != 0) {
+                        free(bc); fail = 1;
+                    } else {
+                        bc_paths[bc_count] = bc;
+                        bc_owned[bc_count] = 1;
+                        ++bc_count;
+                    }
+                }
+            }
         }
     }
 

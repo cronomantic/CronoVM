@@ -1,8 +1,30 @@
-/* vm_entry.c — VM-side entry shim for the conformance corpus. The fixtures
- * export `conf_main` (not `main`), so the translator's "named main, else first
- * defined function" entry heuristic could pick the wrong function in a
- * multi-function module (notably a C++ global-ctor function). Providing a real
- * `main` that tail-calls conf_main pins the entry deterministically for every
- * fixture, C and C++ alike. (Real carts already name their entry `main`.) */
+/* vm_entry.c — VM-side support for the conformance corpus.
+ *
+ * (1) A real `main` tail-calling conf_main, to pin the VM entry
+ *     deterministically: fixtures export `conf_main` (not `main`), and the
+ *     translator's "named main, else first defined function" heuristic could
+ *     otherwise pick the wrong function in a multi-function module (e.g. a C++
+ *     global-ctor). Real carts already name their entry `main`.
+ *
+ * (2) A tiny bump allocator providing malloc/free. The C++ fixtures pull in
+ *     cvm-cc's auto-linked C++ ABI runtime (runtime/lib/cvm_cxxrt.cpp), whose
+ *     operator new/delete forward to malloc/free. Real carts get those from the
+ *     Cronopio SDK libc; the standalone conformance build has no libc, so this
+ *     supplies just enough. (The fixtures use stack objects, so this is rarely
+ *     exercised at runtime — it mainly needs to exist for linking.) */
+#include <stddef.h>
+
 extern int conf_main(void);
 int main(void) { return conf_main(); }
+
+static unsigned char g_heap[1u << 16];
+static size_t g_hp = 0;
+
+void *malloc(size_t n) {
+    size_t a = (n + 7u) & ~(size_t)7u;
+    if (g_hp + a > sizeof g_heap) return 0;
+    void *p = &g_heap[g_hp];
+    g_hp += a;
+    return p;
+}
+void free(void *p) { (void)p; }

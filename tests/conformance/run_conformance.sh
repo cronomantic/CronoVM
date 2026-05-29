@@ -2,8 +2,8 @@
 # Differential conformance runner for the CronoVM translator.
 #
 # For each fixture tests/conformance/conf_*.{c,cpp}:
-#   1. Build it on the VM    (cvm-cc; C++ is pre-compiled to .bc by clang -x c++
-#                             and linked with the C++ ABI runtime cvm_cxxrt)
+#   1. Build it on the VM    (cvm-cc — it compiles C++ natively and auto-links
+#                             the C++ ABI runtime runtime/lib/cvm_cxxrt.cpp)
 #   2. Build it natively     (clang / clang++ -> the oracle)
 #   3. Run native -> the expected int32 checksum
 #   4. Run the VM bin via test_e2e and compare to the native checksum
@@ -27,14 +27,8 @@ shift 3
 CLANGXX="$(dirname "$CLANG")/clang++"
 [[ -x "$CLANGXX" || -x "$CLANGXX.exe" ]] || CLANGXX="clang++"
 
-CXXVM=(-x c++ --target=i386-elf -ffreestanding -fno-exceptions -fno-rtti
-       -emit-llvm -gline-tables-only -O1)
-
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-
-# Pre-compile the C++ ABI runtime to bitcode (operator new/delete, __cxa_*).
-"$CLANG" "${CXXVM[@]}" -c "$HERE/cvm_cxxrt.cpp" -o "$TMP/cxxrt.bc" 2>/dev/null
 
 fixtures=( "$@" )
 if [[ ${#fixtures[@]} -eq 0 ]]; then
@@ -49,12 +43,8 @@ for src in "${fixtures[@]}"; do
   nat="$TMP/$name.exe"
 
   if [[ "$src" == *.cpp ]]; then
-    # VM: clang -x c++ -> .bc, then cvm-cc links fixture + cxxrt + entry shim.
-    vmlog="$("$CLANG" "${CXXVM[@]}" -c "$src" -o "$TMP/$name.bc" 2>&1)"
-    if [[ $? -ne 0 ]]; then
-      printf 'GAP        %-22s (clang++ -> bc failed)\n' "$name"; gap=$((gap+1)); continue
-    fi
-    vmlog="$("$CVMCC" "$TMP/$name.bc" "$TMP/cxxrt.bc" "$HERE/vm_entry.c" -o "$bin" 2>&1)"; vmrc=$?
+    # VM: cvm-cc compiles the .cpp and auto-links runtime/lib/cvm_cxxrt.cpp.
+    vmlog="$("$CVMCC" "$src" "$HERE/vm_entry.c" -o "$bin" 2>&1)"; vmrc=$?
     natcmd=("$CLANGXX" -O1 -x c++ "$src" -x c "$HERE/driver.c" -o "$nat")
   else
     vmlog="$("$CVMCC" "$src" "$HERE/vm_entry.c" -o "$bin" 2>&1)"; vmrc=$?
