@@ -682,6 +682,7 @@ const char *cvm_strerror(int result) {
     case CVM_E_NULL_FUNC_PTR:    return "null function pointer call";
     case CVM_E_BAD_REGION:       return "malformed host_region section";
     case CVM_E_NO_SUCH_REGION:   return "no region with that name";
+    case CVM_E_BAD_CORO_STATE:   return "coro swap to a RUNNING or DEAD coroutine";
     default:                     return "unknown error";
     }
 }
