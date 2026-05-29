@@ -136,11 +136,17 @@ the gap is what's still being implemented:
   via `MOVI scratch, (32-w); SHL dst, src, scratch; SAR dst, dst,
   scratch` — three instructions per narrow signed load
 - intrinsic calls:
-  - integer min/max/abs: `llvm.abs.i32`, `llvm.smax.i32`, `llvm.smin.i32`,
-    `llvm.umax.i32`, `llvm.umin.i32`
+  - integer min/max/abs: `llvm.abs.i8/i16/i32/i64`, `llvm.smax.i32`,
+    `llvm.smin.i32`, `llvm.umax.i32`, `llvm.umin.i32` (abs.i64 via the sign mask
+    on the i64 slot pair)
   - three-way compare: `llvm.scmp.iN.iN` / `llvm.ucmp.iN.iN` (the `(a>b)-(a<b)`
     spaceship in `qsort`/`bsearch` comparators) → two `CMP`s + a `SUB`, narrow
     operands extended to 32 bits first; result is −1/0/1
+  - overflow-checked arithmetic: `llvm.{uadd,umul}.with.overflow.i32/i64` (the
+    `{iN,i1}` aggregate; unsigned add/mul only). Value + flag computed at the call
+    site into per-call aggregate slots; the consuming `extractvalue`s read field 0
+    (value) / field 1 (overflow). i64 umul detects overflow via the schoolbook
+    64×64 high half
   - bit counts: `llvm.ctlz.i32`, `llvm.cttz.i32`, `llvm.ctpop.i32` (small
     loops — no dedicated opcode); funnel shifts `llvm.fshl.iN` / `llvm.fshr.iN`
   - byte swaps: `llvm.bswap.i16`, `llvm.bswap.i32` (shift/mask/or)

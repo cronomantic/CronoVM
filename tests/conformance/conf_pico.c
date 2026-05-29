@@ -76,11 +76,17 @@ int conf_main(void) {
     MIX(atoi("  -42abc"));
     MIX((int)atol("1000000"));
 
-    /* ---- numeric parsing (touches errno path; in-range so errno untouched).
-     * strtoul/strtoull are deferred to the with.overflow translator increment. ---- */
+    /* ---- numeric parsing (touches errno path; in-range so errno untouched) ---- */
     MIX((int)strtol("  -2147483", NULL, 10));
     MIX((int)strtol("7fff", NULL, 16));
     MIX((int)strtol("-0", NULL, 10));
+    MIX((int)strtoul("4294967", NULL, 10));
+    MIX((int)strtoul("deadBEEF", NULL, 16));
+    /* 64-bit: strtoull + llabs exercise the i64 surface (with.overflow + abs.i64) */
+    unsigned long long u64 = strtoull("12345678901234", NULL, 10);
+    MIX((int32_t)u64); MIX((int32_t)(u64 >> 32));
+    long long ll = llabs(-9000000000LL);
+    MIX((int32_t)ll); MIX((int32_t)(ll >> 32));
 
     /* ---- qsort + bsearch (function pointers + maybe malloc) ---- */
     int arr[] = { 9, 3, 7, 1, 8, 2, 6, 0, 5, 4 };

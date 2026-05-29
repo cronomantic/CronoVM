@@ -62,18 +62,16 @@ SOURCES=(
   # NOTE: string/strerror is omitted — it takes the address of the user-override
   # hook _user_strerror (undefined here), which the translator rejects (extern
   # address-of). Re-add with its default _user_strerror source when needed.
-  # stdlib.h (integer/util; the allocator is the embedder's). NOTE: the 64-bit
-  # variants (llabs/lldiv/imaxabs/atoll/strtoll/strtoull) are EXCLUDED for now —
-  # they emit i64 intrinsics (llvm.abs.i64, i64 div/rem) that belong to the i64
-  # legalizer workstream, not this 32-bit-surface phase. On i386-elf `long` is
-  # 32-bit, so labs/ldiv/atol/strtol/strtoul are plain i32 and included.
-  stdlib/abs stdlib/labs stdlib/div stdlib/ldiv
-  stdlib/atoi stdlib/atol
+  # stdlib.h (integer/util; the allocator is the embedder's). The 64-bit
+  # variants (llabs/lldiv/imaxabs/atoll) work now that the translator lowers
+  # llvm.abs.i64 + the i64 mul/div legalizer is complete.
+  stdlib/abs stdlib/labs stdlib/llabs stdlib/imaxabs
+  stdlib/div stdlib/ldiv stdlib/lldiv
+  stdlib/atoi stdlib/atol stdlib/atoll
   search/bsearch search/qsort
-  # numeric parsing. strtoul/strtoull are EXCLUDED for now — they emit
-  # llvm.{uadd,umul}.with.overflow (the {iN,i1} aggregate), pending the
-  # with.overflow + extractvalue translator increment. strtol (signed) does not.
-  stdio/strtol
+  # numeric parsing. strtoul/strtoull emit llvm.{uadd,umul}.with.overflow
+  # (the {iN,i1} aggregate) — lowered now (i32 + i64).
+  stdio/strtol stdio/strtoul stdio/strtoll stdio/strtoull
   # ctype: the classification table (_ctype_b) + table builders. Most is*()
   # are macros over the table; include a few real classifier fns defensively.
   ctype/ctype_ ctype/ctype_table ctype/ctype_class

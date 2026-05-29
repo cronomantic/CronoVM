@@ -865,6 +865,14 @@ struct cg {
                              * register: regs[idx]==CG_REG_SPILLED and
                              * val_slot[idx]==CG_NO_SLOT so the normal spill
                              * path ignores it. Parallel to vals/regs. */
+    uint16_t     *agg_slot; /* with.overflow legalisation: if != CG_NO_SLOT,
+                             * this SSA value is the {iN,i1} result of an
+                             * llvm.{uadd,umul}.with.overflow call, stored in
+                             * consecutive value-spill slots: the iN result
+                             * word(s) first (1 for i32, 2 for i64) then a 1-word
+                             * overflow flag. extractvalue reads from these. Like
+                             * i64_slot it occupies no register. Parallel to
+                             * vals/regs. */
     int           map_count;
     int           map_cap;
     int           next_reg;
@@ -1126,7 +1134,10 @@ static uint8_t cg_assign(struct cg *cg, LLVMValueRef v, uint8_t r) {
                                       cg->map_cap * sizeof(*cg->val_slot));
         cg->i64_slot = (uint16_t *)realloc(cg->i64_slot,
                                       cg->map_cap * sizeof(*cg->i64_slot));
-        if (!cg->vals || !cg->regs || !cg->val_slot || !cg->i64_slot) {
+        cg->agg_slot = (uint16_t *)realloc(cg->agg_slot,
+                                      cg->map_cap * sizeof(*cg->agg_slot));
+        if (!cg->vals || !cg->regs || !cg->val_slot || !cg->i64_slot
+            || !cg->agg_slot) {
             perror("realloc"); exit(1);
         }
     }
@@ -1134,6 +1145,7 @@ static uint8_t cg_assign(struct cg *cg, LLVMValueRef v, uint8_t r) {
     cg->regs[cg->map_count] = r;
     cg->val_slot[cg->map_count] = CG_NO_SLOT;
     cg->i64_slot[cg->map_count] = CG_NO_SLOT;
+    cg->agg_slot[cg->map_count] = CG_NO_SLOT;
     cg->map_count++;
     return r;
 }
@@ -2050,6 +2062,40 @@ static int cg_call_is_handled_f64_intrinsic(LLVMValueRef i) {
         || strcmp(cn, "sqrt")              == 0;
 }
 
+/* If `v` is a supported llvm.{uadd,umul}.with.overflow.iN intrinsic CALL, return
+ * 1 and set *is_mul (0=add, 1=mul) and *bits (32 or 64). Otherwise 0. The signed
+ * (sadd/ssub/smul) and usub variants and non-32/64 widths return 0 — picolibc's
+ * strtoul/strtoull only emit the unsigned add/mul forms; anything else is
+ * rejected loudly at the call site so a future need surfaces. */
+static int cg_overflow_call_kind(LLVMValueRef v, int *is_mul, int *bits) {
+    if (!v || !LLVMIsACallInst(v)) return 0;
+    const char *nm = value_name(LLVMGetCalledValue(v));
+    int mul, b;
+    if      (strncmp(nm, "llvm.uadd.with.overflow.i", 25) == 0) { mul = 0; b = atoi(nm + 25); }
+    else if (strncmp(nm, "llvm.umul.with.overflow.i", 25) == 0) { mul = 1; b = atoi(nm + 25); }
+    else return 0;
+    if (b != 32 && b != 64) return 0;
+    if (is_mul) *is_mul = mul;
+    if (bits)   *bits = b;
+    return 1;
+}
+
+/* Words occupied by the iN result part of a with.overflow aggregate (the
+ * overflow flag adds one more slot on top). */
+static int cg_overflow_val_words(int bits) { return bits == 64 ? 2 : 1; }
+
+/* If `i` is `extractvalue <overflow-call>, {0|1}`, return 1 and set *call to the
+ * source call and *field to 0 (the iN result) or 1 (the i1 overflow flag). */
+static int cg_is_overflow_extract(LLVMValueRef i, LLVMValueRef *call, unsigned *field) {
+    if (LLVMGetInstructionOpcode(i) != LLVMExtractValue) return 0;
+    LLVMValueRef src = LLVMGetOperand(i, 0);
+    if (!cg_overflow_call_kind(src, NULL, NULL)) return 0;
+    if (LLVMGetNumIndices(i) != 1) return 0;
+    if (call)  *call = src;
+    if (field) *field = LLVMGetIndices(i)[0];
+    return 1;
+}
+
 /* SP-relative byte offset of the LO word of the i64 value at map index idx
  * (the HI word is at +4). */
 static int32_t cg_i64_lo_off(struct cg *cg, int idx) {
@@ -2347,6 +2393,18 @@ static void cg_emit_i64_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
         cg_i64_write(cg, idx, out_lo, out_hi);
         break;
     }
+    case LLVMExtractValue: {
+        /* The i64 value (field 0) of an llvm.*.with.overflow result. Its two
+         * i64 slots were ALIASED onto the call's aggregate base in pre-alloc
+         * (the val_lo/val_hi words already live there), so there is nothing to
+         * emit. Any other i64 extractvalue is unsupported. */
+        LLVMValueRef ov_call; unsigned ov_field;
+        if (cg_is_overflow_extract(i, &ov_call, &ov_field) && ov_field == 0)
+            break;
+        ERR(cg->fn_name, "i64 extractvalue: only with.overflow results supported");
+        cg->had_error = 1;
+        break;
+    }
     default:
         ERR(cg->fn_name, "i64 operation '%s' not yet supported "
                          "(mul/div/rem, phi, select and i64-returning calls "
@@ -2536,7 +2594,25 @@ static void cg_pre_alloc_function(struct cg *cg, LLVMValueRef fn) {
             int dst_reg = -1;
             int dst_spilled = 0;
             LLVMTypeRef ty = LLVMTypeOf(i);
-            if (cg_type_is_wide(ty)) {
+            int ov_mul, ov_bits; LLVMValueRef ov_call; unsigned ov_field;
+            if (cg_overflow_call_kind(i, &ov_mul, &ov_bits)) {
+                /* with.overflow CALL: the {iN,i1} result lives in consecutive
+                 * slots (val word(s) then the overflow flag), no register. */
+                cg_assign(cg, i, (uint8_t)CG_REG_SPILLED);
+                int idx = cg->map_count - 1;
+                cg->agg_slot[idx] = (uint16_t)cg->val_spill_count;
+                cg->val_spill_count += cg_overflow_val_words(ov_bits) + 1;
+            } else if (cg_is_overflow_extract(i, &ov_call, &ov_field)
+                       && ov_field == 0 && cg_type_is_i64(ty)) {
+                /* extractvalue <ov>, 0 of an i64 overflow result: ALIAS its two
+                 * i64 slots onto the call's aggregate base (the val_lo/val_hi
+                 * words already sit there) — no register, no copy. cg_emit_i64_def
+                 * then no-ops for it. */
+                int cidx = cg_lookup(cg, ov_call);
+                cg_assign(cg, i, (uint8_t)CG_REG_SPILLED);
+                int idx = cg->map_count - 1;
+                cg->i64_slot[idx] = (cidx >= 0) ? cg->agg_slot[cidx] : CG_NO_SLOT;
+            } else if (cg_type_is_wide(ty)) {
                 /* 64-bit result (i64 or f64): claim TWO consecutive value-spill
                  * slots (lo, hi) instead of a register. regs stays
                  * CG_REG_SPILLED and val_slot stays CG_NO_SLOT, so the
@@ -4610,8 +4686,30 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 break;
 
             case LLVMExtractValue: {
-                /* The only extractvalue we lower is reading a landingpad's two
-                 * result fields: idx 0 = exception object (-> __cvm_eh_exc),
+                /* with.overflow result: read a field from the call's aggregate
+                 * slots. Field 0 = the iN value (the i32 case here; the i64 case
+                 * is aliased onto the call's slots in pre-alloc and no-ops in
+                 * cg_emit_i64_def). Field 1 = the i1 overflow flag. */
+                LLVMValueRef ov_call; unsigned ov_field;
+                if (cg_is_overflow_extract(i, &ov_call, &ov_field)) {
+                    int cidx = cg_lookup(cg, ov_call);
+                    if (cidx < 0 || cg->agg_slot[cidx] == CG_NO_SLOT) {
+                        ERR(cg->fn_name, "internal: overflow extract without agg slot");
+                        cg->had_error = 1; break;
+                    }
+                    int ov_mul, ov_bits;
+                    cg_overflow_call_kind(ov_call, &ov_mul, &ov_bits);
+                    int base = cg->agg_slot[cidx];
+                    /* the overflow flag sits right after the value word(s) */
+                    int slot = (ov_field == 0) ? base
+                                               : base + cg_overflow_val_words(ov_bits);
+                    uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                    if (cg_ldw_sp_off(cg, dst, cg_val_slot_off(cg, (uint16_t)slot)))
+                        cg->had_error = 1;
+                    break;
+                }
+                /* The only other extractvalue we lower is reading a landingpad's
+                 * two result fields: idx 0 = exception object (-> __cvm_eh_exc),
                  * idx 1 = selector (-> __cvm_eh_sel). Both are CALLs, so they are
                  * registered runtime-call spill points (cg_op_is_runtime_call). */
                 if (!cg_is_landingpad_extract(i)) {
@@ -5040,6 +5138,39 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     cg_emit(cg, enc_i24(CVM_OP_JMP, 1));
                     cg_emit(cg, enc_r (CVM_OP_MOV, dst, x, 0));
                     break;
+                    }
+                    if (abs_bits == 64) {
+                        /* abs.i64: branch-free via the sign mask.
+                         *   m = xhi >>(arith) 31   (0 if x>=0, all-ones if x<0)
+                         *   res = (x ^ (m:m)) - (m:m)
+                         * For x>=0, m=0 -> res=x; for x<0, m=-1 -> res = ~x + 1
+                         * computed as (x^-1) - -1 = -x. Result -> the i64 slots
+                         * (a wide-returning call gets i64_slot in pre-alloc). */
+                        int idx = cg_lookup(cg, i);
+                        if (idx < 0 || cg->i64_slot[idx] == CG_NO_SLOT) {
+                            ERR(cg->fn_name, "internal: abs.i64 without i64 slot");
+                            cg->had_error = 1; break;
+                        }
+                        uint8_t xl, xh;
+                        if (cg_i64_read(cg, LLVMGetOperand(i, 0), &xl, &xh)) break;
+                        uint8_t m = cg_alloc_reg(cg); if (cg->had_error) break;
+                        cg_shift_imm(cg, CVM_OP_SAR, m, xh, 31);
+                        uint8_t xl2 = cg_alloc_reg(cg);
+                        uint8_t xh2 = cg_alloc_reg(cg);
+                        if (cg->had_error) break;
+                        cg_emit(cg, enc_r(CVM_OP_XOR, xl2, xl, m));
+                        cg_emit(cg, enc_r(CVM_OP_XOR, xh2, xh, m));
+                        /* (xh2:xl2) - (m:m): borrow = (xl2 <u m). */
+                        uint8_t lo = cg_alloc_reg(cg);
+                        uint8_t hi = cg_alloc_reg(cg);
+                        uint8_t borrow = cg_alloc_reg(cg);
+                        if (cg->had_error) break;
+                        cg_emit(cg, enc_r(CVM_OP_CMP_LTU, borrow, xl2, m));
+                        cg_emit(cg, enc_r(CVM_OP_SUB, lo, xl2, m));
+                        cg_emit(cg, enc_r(CVM_OP_SUB, hi, xh2, m));
+                        cg_emit(cg, enc_r(CVM_OP_SUB, hi, hi, borrow));
+                        cg_i64_write(cg, idx, lo, hi);
+                        break;
                     }
                 }
 
@@ -5643,6 +5774,117 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     cg_emit(cg, enc_r(cmp_op,    lt, ca, cb));
                     cg_emit(cg, enc_r(CVM_OP_SUB, dst, gt, lt));
                     break;
+                }
+
+                /* llvm.{uadd,umul}.with.overflow.iN (i32/i64) — the {iN,i1}
+                 * aggregate clang emits for overflow-checked arithmetic (e.g.
+                 * strtoul/strtoull digit accumulation). Compute the value + the
+                 * overflow flag at the call site (where the operands are live)
+                 * and store them to the call's aggregate slots: the value
+                 * word(s) then a 0/1 overflow word; the consuming extractvalues
+                 * read them back. Unsigned add/mul only — see
+                 * cg_overflow_call_kind. */
+                {
+                    int ov_mul, ov_bits;
+                    if (cg_overflow_call_kind(i, &ov_mul, &ov_bits)) {
+                        int oidx = cg_lookup(cg, i);
+                        if (oidx < 0 || cg->agg_slot[oidx] == CG_NO_SLOT) {
+                            ERR(cg->fn_name, "internal: with.overflow without agg slot");
+                            cg->had_error = 1; break;
+                        }
+                        int base = cg->agg_slot[oidx];
+                        if (ov_bits == 32) {
+                            uint8_t a = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                            uint8_t b = cg_reg_for(cg, LLVMGetOperand(i, 1));
+                            if (cg->had_error) break;
+                            uint8_t val = cg_alloc_reg(cg);
+                            uint8_t ovf = cg_alloc_reg(cg);
+                            if (cg->had_error) break;
+                            if (!ov_mul) {
+                                /* sum, overflow = carry out = (sum <u a) */
+                                cg_emit(cg, enc_r(CVM_OP_ADD, val, a, b));
+                                cg_emit(cg, enc_r(CVM_OP_CMP_LTU, ovf, val, a));
+                            } else {
+                                /* product low = a*b, overflow = (high32 != 0) */
+                                uint8_t hi = cg_alloc_reg(cg); if (cg->had_error) break;
+                                cg_emit(cg, enc_r(CVM_OP_MUL,   val, a, b));
+                                cg_emit(cg, enc_r(CVM_OP_MULHU, hi,  a, b));
+                                cg_emit(cg, enc_r(CVM_OP_CMP_LTU, ovf, cg->zero_reg, hi));
+                            }
+                            cg_stw_sp_off(cg, cg_val_slot_off(cg, (uint16_t)base),       val);
+                            cg_stw_sp_off(cg, cg_val_slot_off(cg, (uint16_t)(base + 1)), ovf);
+                        } else {
+                            /* i64: operands in lo/hi word pairs. */
+                            uint8_t al, ah, bl, bh;
+                            if (cg_i64_read(cg, LLVMGetOperand(i, 0), &al, &ah)) break;
+                            if (cg_i64_read(cg, LLVMGetOperand(i, 1), &bl, &bh)) break;
+                            uint8_t lo  = cg_alloc_reg(cg);
+                            uint8_t hi  = cg_alloc_reg(cg);
+                            uint8_t ovf = cg_alloc_reg(cg);
+                            if (cg->had_error) break;
+                            if (!ov_mul) {
+                                /* lo=al+bl (c1); t=ah+bh (c2); hi=t+c1 (c3);
+                                 * overflow = carry out of the high word = c2|c3. */
+                                uint8_t c1 = cg_alloc_reg(cg), c2 = cg_alloc_reg(cg),
+                                        c3 = cg_alloc_reg(cg), t = cg_alloc_reg(cg);
+                                if (cg->had_error) break;
+                                cg_emit(cg, enc_r(CVM_OP_ADD, lo, al, bl));
+                                cg_emit(cg, enc_r(CVM_OP_CMP_LTU, c1, lo, al));
+                                cg_emit(cg, enc_r(CVM_OP_ADD, t, ah, bh));
+                                cg_emit(cg, enc_r(CVM_OP_CMP_LTU, c2, t, ah));
+                                cg_emit(cg, enc_r(CVM_OP_ADD, hi, t, c1));
+                                cg_emit(cg, enc_r(CVM_OP_CMP_LTU, c3, hi, t));
+                                cg_emit(cg, enc_r(CVM_OP_OR, ovf, c2, c3));
+                            } else {
+                                /* 64x64 unsigned product. Value = low 64 bits
+                                 * (lo = al*bl; hi = mulhu(al,bl)+al*bh+ah*bl),
+                                 * matching the i64 MUL lowering. Overflow (true
+                                 * product >= 2^64) iff ANY bit at/above 64 is
+                                 * set, i.e.:
+                                 *   (ah!=0 && bh!=0)         [ah*bh sits at bit 64]
+                                 * | hi32(al*bh) != 0
+                                 * | hi32(ah*bl) != 0
+                                 * | carry out of the [32:64) column
+                                 *     (t0hi + lo(al*bh) + lo(ah*bl)). */
+                                uint8_t t0hi = cg_alloc_reg(cg), t1lo = cg_alloc_reg(cg),
+                                        t1hi = cg_alloc_reg(cg), t2lo = cg_alloc_reg(cg),
+                                        t2hi = cg_alloc_reg(cg);
+                                if (cg->had_error) break;
+                                cg_emit(cg, enc_r(CVM_OP_MUL,   lo,   al, bl));
+                                cg_emit(cg, enc_r(CVM_OP_MULHU, t0hi, al, bl));
+                                cg_emit(cg, enc_r(CVM_OP_MUL,   t1lo, al, bh));
+                                cg_emit(cg, enc_r(CVM_OP_MULHU, t1hi, al, bh));
+                                cg_emit(cg, enc_r(CVM_OP_MUL,   t2lo, ah, bl));
+                                cg_emit(cg, enc_r(CVM_OP_MULHU, t2hi, ah, bl));
+                                /* column [32:64): s=t0hi+t1lo (ca); hi=s+t2lo (cb) */
+                                uint8_t s = cg_alloc_reg(cg), ca = cg_alloc_reg(cg),
+                                        cb = cg_alloc_reg(cg);
+                                if (cg->had_error) break;
+                                cg_emit(cg, enc_r(CVM_OP_ADD, s, t0hi, t1lo));
+                                cg_emit(cg, enc_r(CVM_OP_CMP_LTU, ca, s, t0hi));
+                                cg_emit(cg, enc_r(CVM_OP_ADD, hi, s, t2lo));
+                                cg_emit(cg, enc_r(CVM_OP_CMP_LTU, cb, hi, s));
+                                /* fold the overflow conditions */
+                                uint8_t o = cg_alloc_reg(cg), tmp = cg_alloc_reg(cg);
+                                if (cg->had_error) break;
+                                cg_emit(cg, enc_r(CVM_OP_CMP_LTU, o,   cg->zero_reg, t1hi)); /* t1hi!=0 */
+                                cg_emit(cg, enc_r(CVM_OP_CMP_LTU, tmp, cg->zero_reg, t2hi)); /* t2hi!=0 */
+                                cg_emit(cg, enc_r(CVM_OP_OR, o, o, tmp));
+                                cg_emit(cg, enc_r(CVM_OP_OR, tmp, ca, cb));                  /* col carry */
+                                cg_emit(cg, enc_r(CVM_OP_OR, o, o, tmp));
+                                uint8_t ahnz = cg_alloc_reg(cg), bhnz = cg_alloc_reg(cg);
+                                if (cg->had_error) break;
+                                cg_emit(cg, enc_r(CVM_OP_CMP_LTU, ahnz, cg->zero_reg, ah));
+                                cg_emit(cg, enc_r(CVM_OP_CMP_LTU, bhnz, cg->zero_reg, bh));
+                                cg_emit(cg, enc_r(CVM_OP_AND, tmp, ahnz, bhnz));            /* ah&&bh */
+                                cg_emit(cg, enc_r(CVM_OP_OR, ovf, o, tmp));
+                            }
+                            cg_stw_sp_off(cg, cg_val_slot_off(cg, (uint16_t)base),       lo);
+                            cg_stw_sp_off(cg, cg_val_slot_off(cg, (uint16_t)(base + 1)), hi);
+                            cg_stw_sp_off(cg, cg_val_slot_off(cg, (uint16_t)(base + 2)), ovf);
+                        }
+                        break;
+                    }
                 }
 
                 /* Calls to cvm_sys_* lower to SYSCALL with the matching

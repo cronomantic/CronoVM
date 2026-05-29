@@ -22,9 +22,9 @@ version bump; breaks are called out explicitly under **Breaking**.
   OS layer (errno storage, malloc/free, future write/read/sbrk/exit) is the
   embedder's machine port. This phase covers the 32-bit string/stdlib/ctype/
   numeric surface (strlen/strcmp/strstr/mem*, abs/div/atoi/atol/strtol,
-  qsort/bsearch, …); the 64-bit functions (llabs/lldiv/strtoull) and the
-  `with.overflow`-based ones (strtoul) are pending a follow-up translator
-  increment. New differential fixture `tests/conformance/conf_pico.c` links
+  qsort/bsearch, …) PLUS the full 64-bit integer surface (llabs/lldiv/imaxabs/
+  atoll/strtoul/strtoll/strtoull), unblocked by the abs.i64 + with.overflow
+  lowerings below. New differential fixture `tests/conformance/conf_pico.c` links
   `picolibc.bc` on the VM side and checks it byte-for-byte against the host libc.
 - **Three-way integer compare (`llvm.scmp` / `llvm.ucmp`, any width).** clang
   folds the spaceship idiom `(a > b) - (a < b)` — pervasive in `qsort`/`bsearch`
@@ -32,6 +32,20 @@ version bump; breaks are called out explicitly under **Breaking**.
   branch-free as two `CMP`s and a `SUB`, sign-/zero-extending narrow operands to
   32 bits first (mirroring the min/max lowering). Surfaced by the picolibc
   conformance fixture.
+- **`llvm.abs.i64`** — the i64 case of the abs intrinsic (the i8/16/32 cases
+  already existed). Lowered branch-free on the i64 slot pair via the sign mask:
+  `m = hi >>(arith) 31; res = (x ^ (m:m)) − (m:m)`. Unblocks `llabs`/`imaxabs`.
+- **Overflow-checked arithmetic (`llvm.{uadd,umul}.with.overflow`, i32 + i64).**
+  The `{iN, i1}` aggregate clang emits for `__builtin_*_overflow` and for
+  `strtoul`/`strtoull` digit accumulation. The value + overflow flag are computed
+  at the call site (operands live) and stored to per-call aggregate frame slots
+  (a new `agg_slot` map, like `i64_slot`); the consuming `extractvalue`s read them
+  back — field 0 (the iN result; the i64 case aliases its slots onto the call's,
+  so it costs no copy) and field 1 (the i1 flag). This extends `extractvalue`
+  beyond landingpad results. i32 overflow uses the VM's `MULHU` (umul → high32 ≠ 0)
+  / carry (uadd → sum < a); the i64 umul computes the schoolbook 64×64 high half
+  to detect any bit ≥ 2⁶⁴. Unsigned add/mul only (picolibc's usage); other forms
+  are rejected loudly. New fixtures exercise both differentially.
 
 - **C++ exceptions (`try` / `catch` / `throw`)**. `cvm-cc` no longer forces
   `-fno-exceptions`; the translator lowers the Itanium EH instructions
