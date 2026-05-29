@@ -132,3 +132,122 @@ extern "C" void *__dynamic_cast(const void *sub, const void * /*src_ti*/,
     return r < 0 ? 0 : (void *)(most + r);
 }
 
+/* ---- Exceptions: a setjmp/longjmp unwinder ----------------------------- *
+ * The translator lowers each `invoke` to: alloca a cvm_eh_frame, set its
+ * descriptor (the target landingpad's catch clauses), __cvm_eh_push it,
+ * SETJMP(frame.jb), then branch — setjmp==0 runs the call + __cvm_eh_pop +
+ * normal edge; setjmp!=0 means we were unwound here, so it reads the in-flight
+ * exception (__cvm_eh_exc / __cvm_eh_sel) and runs the landingpad. `resume`
+ * lowers to __cvm_eh_resume (continue unwinding). __cxa_throw drives the walk.
+ *
+ * Layout below MUST match what the translator emits (jb first so &frame ==
+ * &frame.jb). No DWARF/LSDA — our own per-landingpad descriptors. */
+
+extern "C" void longjmp(int *env, int val) __attribute__((__noreturn__));
+extern "C" void __cvm_eh_terminate(void);
+
+namespace {
+
+struct eh_clause { const void *ti; };          /* ti == 0 => catch(...) */
+struct eh_desc   { int n_clauses; int has_cleanup; const eh_clause *clauses; };
+struct eh_frame  { int jb[4]; const eh_desc *desc; eh_frame *next; };
+
+eh_frame  *g_eh_top = 0;       /* top of the active-landingpad chain */
+void      *g_eh_exc = 0;       /* in-flight exception object */
+const ti_base *g_eh_ti = 0;    /* its type_info */
+int        g_eh_sel = 0;       /* selector handed to the landingpad */
+int        g_eh_handlers = 0;  /* live __cxa_begin_catch nesting */
+
+/* Exception header sits just before the thrown object. */
+struct exc_header { const void *ti; void (*dtor)(void *); };
+inline exc_header *hdr_of(void *obj) { return (exc_header *)obj - 1; }
+
+/* Does a thrown object of type `thrown` match a `catch (Caught)` clause? True
+ * if thrown == caught or thrown publicly derives from caught (catch-by-base). */
+bool eh_type_matches(const ti_base *thrown, const ti_base *caught) {
+    char dummy = 0;
+    return ti_search(thrown, caught, 0, &dummy) >= 0;
+}
+
+/* Walk the chain from the top, popping each frame. Stop at the first frame that
+ * catches the in-flight exception (a matching typed clause, a catch-all, or a
+ * cleanup) by longjmp-ing into it; that frame is already popped. If none, the
+ * program cannot handle the exception -> terminate. */
+[[noreturn]] void eh_unwind() {
+    while (g_eh_top) {
+        eh_frame *f = g_eh_top;
+        g_eh_top = f->next;                 /* pop before transferring */
+        const eh_desc *d = f->desc;
+        if (d) {
+            for (int i = 0; i < d->n_clauses; ++i) {
+                const void *cti = d->clauses[i].ti;
+                if (cti == 0) {             /* catch(...) */
+                    g_eh_sel = 0;
+                    longjmp(f->jb, 1);
+                }
+                if (eh_type_matches(g_eh_ti, (const ti_base *)cti)) {
+                    g_eh_sel = (int)(long)cti;   /* == llvm.eh.typeid.for(cti) */
+                    longjmp(f->jb, 1);
+                }
+            }
+            if (d->has_cleanup) {           /* run dtors, then it will resume */
+                g_eh_sel = 0;
+                longjmp(f->jb, 1);
+            }
+        }
+    }
+    /* nobody caught it */
+    __cvm_eh_terminate();
+    for (;;) {}
+}
+
+} /* anon */
+
+extern "C" {
+
+/* translator-emitted helpers */
+void  __cvm_eh_push(eh_frame *f) { f->next = g_eh_top; g_eh_top = f; }
+void  __cvm_eh_pop(void)         { if (g_eh_top) g_eh_top = g_eh_top->next; }
+void *__cvm_eh_exc(void)         { return g_eh_exc; }     /* landingpad value[0] */
+int   __cvm_eh_sel(void)         { return g_eh_sel; }     /* landingpad value[1] */
+int   __cvm_eh_typeid(const void *ti) { return (int)(long)ti; }  /* eh.typeid.for */
+[[noreturn]] void __cvm_eh_resume(void) { eh_unwind(); }  /* `resume` */
+
+/* Itanium __cxa_* surface */
+void *__cxa_allocate_exception(unsigned long size) {
+    char *p = (char *)malloc(sizeof(exc_header) + (size ? size : 1));
+    if (!p) { for (;;) {} }
+    exc_header *h = (exc_header *)p;
+    h->ti = 0; h->dtor = 0;
+    return p + sizeof(exc_header);
+}
+void __cxa_free_exception(void *obj) { if (obj) free(hdr_of(obj)); }
+
+[[noreturn]] void __cxa_throw(void *obj, void *ti, void (*dtor)(void *)) {
+    exc_header *h = hdr_of(obj);
+    h->ti = ti; h->dtor = dtor;
+    g_eh_exc = obj;
+    g_eh_ti  = (const ti_base *)ti;
+    eh_unwind();
+}
+
+void *__cxa_begin_catch(void *exc) {
+    (void)exc;
+    ++g_eh_handlers;
+    return g_eh_exc;          /* the (possibly base-adjusted) object */
+}
+void __cxa_end_catch(void) {
+    if (--g_eh_handlers <= 0 && g_eh_exc) {
+        exc_header *h = hdr_of(g_eh_exc);
+        if (h->dtor) h->dtor(g_eh_exc);
+        free(h);
+        g_eh_exc = 0; g_eh_ti = 0; g_eh_handlers = 0;
+    }
+}
+[[noreturn]] void __cxa_rethrow(void) { eh_unwind(); }   /* `throw;` */
+
+/* Last-resort terminate. The cart has no std::terminate handler chain; trap. */
+void __cvm_eh_terminate(void) { for (;;) {} }
+
+} /* extern "C" */
+
