@@ -434,16 +434,16 @@ static int compile_c_to_bc(const struct cli *cli, const char *clang,
     cargv[n++] = (char *)clang;
     cargv[n++] = (char *)"--target=i386-elf";
     cargv[n++] = (char *)"-ffreestanding";
-    /* C++ inputs: force the C++ frontend and disable the two features that
-     * pull in ABI surface the VM doesn't support yet — exceptions
-     * (invoke/landingpad/_Unwind_*) and RTTI (type_info). The global-ctor and
-     * operator-new/delete + __cxa_* surface IS supported (translator runs
-     * global ctors; cvm_cxxrt provides the ABI runtime). */
+    /* C++ inputs: force the C++ frontend and disable EXCEPTIONS — the one ABI
+     * piece the VM doesn't support yet (invoke/landingpad/_Unwind_*). RTTI IS
+     * supported (cvm_cxxrt provides __dynamic_cast + the type_info abi vtables;
+     * the translator serialises the type_info objects), so it stays enabled —
+     * dynamic_cast works; typeid is untested. Global ctors + operator new/
+     * delete + __cxa_* are all handled. */
     if (is_cpp_src(input)) {
         cargv[n++] = (char *)"-x";
         cargv[n++] = (char *)"c++";
         cargv[n++] = (char *)"-fno-exceptions";
-        cargv[n++] = (char *)"-fno-rtti";
     }
     cargv[n++] = (char *)"-emit-llvm";
     /* Line tables only: enough for the translator to report file:line on
