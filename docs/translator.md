@@ -138,6 +138,9 @@ the gap is what's still being implemented:
 - intrinsic calls:
   - integer min/max/abs: `llvm.abs.i32`, `llvm.smax.i32`, `llvm.smin.i32`,
     `llvm.umax.i32`, `llvm.umin.i32`
+  - three-way compare: `llvm.scmp.iN.iN` / `llvm.ucmp.iN.iN` (the `(a>b)-(a<b)`
+    spaceship in `qsort`/`bsearch` comparators) → two `CMP`s + a `SUB`, narrow
+    operands extended to 32 bits first; result is −1/0/1
   - bit counts: `llvm.ctlz.i32`, `llvm.cttz.i32`, `llvm.ctpop.i32` (small
     loops — no dedicated opcode); funnel shifts `llvm.fshl.iN` / `llvm.fshr.iN`
   - byte swaps: `llvm.bswap.i16`, `llvm.bswap.i32` (shift/mask/or)

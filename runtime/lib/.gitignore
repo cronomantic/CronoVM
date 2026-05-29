@@ -1,0 +1,4 @@
+# Build artifact produced by build_picolibc.sh (curated picolibc subset, linked
+# to one i386-elf bitcode module). Regenerated from the external/picolibc
+# submodule + picolibc.h; never committed.
+picolibc.bc

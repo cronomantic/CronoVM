@@ -35,6 +35,19 @@ if [[ ${#fixtures[@]} -eq 0 ]]; then
   fixtures=( "$HERE"/conf_*.c "$HERE"/conf_*.cpp )
 fi
 
+# picolibc fixtures (conf_pico*) link the real picolibc bitcode on the VM side.
+# Build picolibc.bc once up front if any such fixture is in the run.
+RTLIB="$HERE/../../runtime/lib"
+PICO_INC="$HERE/../../external/picolibc/libc/include"
+PICOLIBC_BC="$RTLIB/picolibc.bc"
+if printf '%s\n' "${fixtures[@]}" | grep -q 'conf_pico'; then
+  LLVM_LINK="$(dirname "$CLANG")/llvm-link"
+  [[ -x "$LLVM_LINK" || -x "$LLVM_LINK.exe" ]] || LLVM_LINK="llvm-link"
+  if ! CLANG="$CLANG" LLVM_LINK="$LLVM_LINK" bash "$RTLIB/build_picolibc.sh" >/dev/null; then
+    echo "run_conformance.sh: failed to build picolibc.bc" >&2; exit 1
+  fi
+fi
+
 pass=0 gap=0 mis=0
 for src in "${fixtures[@]}"; do
   [[ -e "$src" ]] || continue
@@ -42,12 +55,20 @@ for src in "${fixtures[@]}"; do
   bin="$TMP/$name.bin"
   nat="$TMP/$name.exe"
 
+  # picolibc fixtures additionally link picolibc.bc + the machine-port stub on
+  # the VM side, with picolibc's headers on the include path. The native oracle
+  # uses the host libc (no picolibc include path, so host headers win).
+  pico=()
+  if [[ "$name" == conf_pico* ]]; then
+    pico=( "$HERE/pico_machine.c" "$PICOLIBC_BC" -I "$RTLIB" -I "$PICO_INC" )
+  fi
+
   if [[ "$src" == *.cpp ]]; then
     # VM: cvm-cc compiles the .cpp and auto-links runtime/lib/cvm_cxxrt.cpp.
-    vmlog="$("$CVMCC" "$src" "$HERE/vm_entry.c" -o "$bin" 2>&1)"; vmrc=$?
+    vmlog="$("$CVMCC" "$src" "$HERE/vm_entry.c" ${pico[@]+"${pico[@]}"} -o "$bin" 2>&1)"; vmrc=$?
     natcmd=("$CLANGXX" -O1 -x c++ "$src" -x c "$HERE/driver.c" -o "$nat")
   else
-    vmlog="$("$CVMCC" "$src" "$HERE/vm_entry.c" -o "$bin" 2>&1)"; vmrc=$?
+    vmlog="$("$CVMCC" "$src" "$HERE/vm_entry.c" ${pico[@]+"${pico[@]}"} -o "$bin" 2>&1)"; vmrc=$?
     natcmd=("$CLANG" -O1 "$src" "$HERE/driver.c" -o "$nat")
   fi
 

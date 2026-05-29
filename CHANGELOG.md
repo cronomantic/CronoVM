@@ -10,6 +10,29 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **picolibc as the C standard library (phase 1: 32-bit surface).** picolibc is
+  vendored as a submodule (`external/picolibc`, pinned to upstream 1.8.11) and a
+  curated subset is compiled straight to one i386-elf bitcode module via
+  `runtime/lib/build_picolibc.sh` (clang `--target=i386-elf -ffreestanding
+  -emit-llvm`, the SAME flags `cvm-cc` uses), configured by the hand-written
+  `runtime/lib/picolibc.h` (freestanding, `__TINY_STDIO`, single global errno,
+  no locale/wide/threads; `__PREFER_SIZE_OVER_SPEED` to keep the string routines
+  in-bounds for the bounded VM address space). The result, `picolibc.bc` (a
+  gitignored build artifact), is the pure embedder-independent C surface; the
+  OS layer (errno storage, malloc/free, future write/read/sbrk/exit) is the
+  embedder's machine port. This phase covers the 32-bit string/stdlib/ctype/
+  numeric surface (strlen/strcmp/strstr/mem*, abs/div/atoi/atol/strtol,
+  qsort/bsearch, …); the 64-bit functions (llabs/lldiv/strtoull) and the
+  `with.overflow`-based ones (strtoul) are pending a follow-up translator
+  increment. New differential fixture `tests/conformance/conf_pico.c` links
+  `picolibc.bc` on the VM side and checks it byte-for-byte against the host libc.
+- **Three-way integer compare (`llvm.scmp` / `llvm.ucmp`, any width).** clang
+  folds the spaceship idiom `(a > b) - (a < b)` — pervasive in `qsort`/`bsearch`
+  comparators — into these intrinsics (result −1/0/1). The translator lowers them
+  branch-free as two `CMP`s and a `SUB`, sign-/zero-extending narrow operands to
+  32 bits first (mirroring the min/max lowering). Surfaced by the picolibc
+  conformance fixture.
+
 - **C++ exceptions (`try` / `catch` / `throw`)**. `cvm-cc` no longer forces
   `-fno-exceptions`; the translator lowers the Itanium EH instructions
   (`invoke` / `landingpad` / `resume` / `llvm.eh.typeid.for`) onto the VM's

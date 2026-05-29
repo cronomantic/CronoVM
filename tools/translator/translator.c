@@ -5592,6 +5592,59 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     break;
                 }
 
+                /* Three-way compare, any integer width. clang -O folds the
+                 * spaceship idiom `(a > b) - (a < b)` (ubiquitous in qsort/
+                 * bsearch comparators, e.g. picolibc carts) into
+                 * llvm.scmp/ucmp.i<ret>.i<arg>, returning -1/0/1.
+                 * Lowered branch-free as (a > b) - (a < b): two CMPs + a SUB.
+                 * Narrow operands are extended to 32 bits first (like min/max)
+                 * so the ordering is correct; the result is the small signed
+                 * value -1/0/1, which the consumer truncates to the result
+                 * width. */
+                int is_cmp3 = 0, c3_signed = 0;
+                if      (strncmp(name, "llvm.scmp.i", 11) == 0) { is_cmp3=1; c3_signed=1; }
+                else if (strncmp(name, "llvm.ucmp.i", 11) == 0) { is_cmp3=1; }
+                if (is_cmp3) {
+                    LLVMValueRef o0 = LLVMGetOperand(i, 0);
+                    LLVMValueRef o1 = LLVMGetOperand(i, 1);
+                    unsigned ow = LLVMGetIntTypeWidth(LLVMTypeOf(o0));
+                    uint8_t a    = cg_reg_for(cg, o0);
+                    uint8_t b2   = cg_reg_for(cg, o1);
+                    uint8_t dst  = cg->regs[cg_lookup(cg, i)];
+                    if (cg->had_error) break;
+                    /* compare operands ca/cb — widened for narrow types */
+                    uint8_t ca = a, cb = b2;
+                    if (ow > 0 && ow < 32) {
+                        ca = cg_alloc_reg(cg);
+                        cb = cg_alloc_reg(cg);
+                        if (cg->had_error) break;
+                        if (c3_signed) {
+                            uint8_t sh = cg_alloc_reg(cg);
+                            if (cg->had_error) break;
+                            cg_emit_load_const32(cg, sh, 32 - (int)ow);
+                            cg_emit(cg, enc_r(CVM_OP_SHL, ca, a,  sh));
+                            cg_emit(cg, enc_r(CVM_OP_SAR, ca, ca, sh));
+                            cg_emit(cg, enc_r(CVM_OP_SHL, cb, b2, sh));
+                            cg_emit(cg, enc_r(CVM_OP_SAR, cb, cb, sh));
+                        } else {
+                            uint8_t mask = cg_alloc_reg(cg);
+                            if (cg->had_error) break;
+                            cg_emit_load_const32(cg, mask, (int32_t)(((uint32_t)1 << ow) - 1u));
+                            cg_emit(cg, enc_r(CVM_OP_AND, ca, a,  mask));
+                            cg_emit(cg, enc_r(CVM_OP_AND, cb, b2, mask));
+                        }
+                    }
+                    uint8_t gt = cg_alloc_reg(cg);
+                    uint8_t lt = cg_alloc_reg(cg);
+                    if (cg->had_error) break;
+                    uint8_t cmp_op = c3_signed ? CVM_OP_CMP_LT : CVM_OP_CMP_LTU;
+                    /* gt = (a > b) == (cb < ca); lt = (a < b) == (ca < cb) */
+                    cg_emit(cg, enc_r(cmp_op,    gt, cb, ca));
+                    cg_emit(cg, enc_r(cmp_op,    lt, ca, cb));
+                    cg_emit(cg, enc_r(CVM_OP_SUB, dst, gt, lt));
+                    break;
+                }
+
                 /* Calls to cvm_sys_* lower to SYSCALL with the matching
                  * import index. Args go in R0..R(narg-1); return value
                  * comes back in R0. */
