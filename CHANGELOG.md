@@ -45,6 +45,19 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Fixed
 
+- **Reference allocator (`runtime/lib/cvm_alloc.h`) was O(n²) for
+  allocation-heavy workloads.** `cvm_malloc` did a first-fit walk over EVERY
+  block from the heap start on each call, and `cvm_free` scanned the WHOLE
+  heap to coalesce on each call — both O(total blocks). Mounting a ~10k-entry
+  archive (UQM's `libs/uio` over a `.uqm` ZIP) spent **minutes** there.
+  Rewrote it as an explicit doubly-linked free list + boundary-tag footers:
+  `cvm_malloc` now walks only FREE blocks, `cvm_free` coalesces with both
+  physical neighbours and splices in O(1). Same external API and header
+  format (header at `ptr-4`, low bit = FREE), so `realloc` and friends are
+  unchanged; min block grows 8 → 16 (footer + room for the free links). The
+  UQM content-mount dropped from ~1–3 min to ~1 s. Allocator suite + all e2e
+  fixtures (incl. `free_list` split/coalesce/reuse) stay green (133/133).
+
 - **Register pool double-free when a value fills several operand slots of one
   instruction** (e.g. `x*x` → `llvm.fmuladd.f32(x, x, acc)`, or any `f(a, a)`).
   The per-operand register-free loop reached such a value once per occurrence
