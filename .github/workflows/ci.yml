@@ -23,6 +23,15 @@ jobs:
     name: linux-${{ matrix.cc }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive   # external/picolibc: the conformance test
+                                   # builds picolibc.bc from it (else it fails)
+          # NB: this job runs the FULL ctest, including the C++ STL conformance
+          # fixtures (conf_pico_cpp_*) which compile with `-stdlib=libc++`, so
+          # libc++ must be installed below. Our freestanding <__config_site> is
+          # written against libc++ 22 (the maintainer's local toolchain); if
+          # Ubuntu's default clang/libc++ (currently 18) skews the knobs, pin
+          # clang-21 + libc++-21 via apt.llvm.org.
 
       # Ubuntu 24.04 ships clang-18 by default. clang-18 -O1 emits
       # ~10% more IR instructions per function than clang-21+, and
@@ -47,7 +56,8 @@ jobs:
       - name: Install LLVM + toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm llvm-dev cmake ninja-build
+          sudo apt-get install -y clang llvm llvm-dev \
+              libc++-dev libc++abi-dev cmake ninja-build
 
       - name: Configure
         run: cmake -B build -G Ninja -DCMAKE_C_COMPILER=${{ matrix.cc }}
@@ -63,6 +73,9 @@ jobs:
     name: linux-no-stdlib-fallback
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive   # external/picolibc: the conformance test
+                                   # builds picolibc.bc from it (else it fails)
 
       # llvm-dev pulls headers + libs for the translator's LLVM-C
       # bindings; clang is needed at fixture-build time even on the GCC
@@ -127,6 +140,9 @@ jobs:
     name: linux-cortex-m-sanity-${{ matrix.target.name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive   # external/picolibc: the conformance test
+                                   # builds picolibc.bc from it (else it fails)
 
       # gcc-arm-none-eabi: arm-none-eabi-gcc covers both thumbv7m
       # and thumbv6m via -mcpu= flags. Ships newlib headers bundled,
@@ -174,6 +190,9 @@ jobs:
         shell: msys2 {0}
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive   # external/picolibc: the conformance test
+                                   # builds picolibc.bc from it (else it fails)
 
       # The local dev environment is MSYS2 UCRT64; match it on CI so
       # llvm-config / clang behave identically to what the maintainer
@@ -202,6 +221,9 @@ jobs:
     name: macos-clang
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive   # external/picolibc: the conformance test
+                                   # builds picolibc.bc from it (else it fails)
 
       # Apple Clang ships without llvm-config (it's part of an internal
       # toolchain). Brew's LLVM keg gets the standalone tools, including
