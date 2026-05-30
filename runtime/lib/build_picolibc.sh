@@ -116,7 +116,7 @@ if [ "$WITH_STDIO" = 1 ]; then
     stdio/fgetc stdio/fgets stdio/getchar stdio/ungetc
     stdio/fopen stdio/fdopen stdio/fclose stdio/fread stdio/fwrite
     stdio/fseek stdio/ftell stdio/fflush
-    stdio/clearerr stdio/feof stdio/ferror stdio/fileno
+    stdio/clearerr stdio/feof stdio/ferror stdio/fileno stdio/perror
     stdio/posixiob_stdin stdio/posixiob_stdout stdio/posixiob_stderr
     stdio/sflags stdio/fdevopen
   )

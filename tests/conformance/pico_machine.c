@@ -46,6 +46,10 @@ void *sbrk(ptrdiff_t incr) {
  * discarded, and fd>=3 is ONE in-memory file (enough for an fopen round-trip).*/
 int __isnand(double x) { return x != x; }
 
+/* strerror: picolibc omits it (it would take the _user_strerror hook address);
+ * the embedder supplies it (cron_sys.c in a cart). picolibc's perror() calls it. */
+char *strerror(int n) { (void)n; return (char *)"error"; }
+
 #define PICO_FILE_BYTES (1u << 16)
 static unsigned char g_file[PICO_FILE_BYTES];
 static size_t g_file_len = 0;     /* logical EOF */
