@@ -31,8 +31,11 @@
 
 #define _LIBCPP_ABI_VERSION 1
 #define _LIBCPP_ABI_NAMESPACE __1
-#define _LIBCPP_ABI_FORCE_ITANIUM 0
-#define _LIBCPP_ABI_FORCE_MICROSOFT 0
+// _LIBCPP_ABI_FORCE_ITANIUM / _LIBCPP_ABI_FORCE_MICROSOFT are deliberately NOT
+// defined: the Itanium ABI is the default when neither is set. Defining BOTH
+// (even to 0) is a hard error on libc++ <= 18, whose abi.h checks
+// `defined(X) && defined(Y)` rather than the values — a cross-version trap.
+// Leaving them unset is correct on every libc++ ( `#if X` treats undefined as 0 ).
 
 // Threads ON, but via the external (cron-coro) API. MONOTONIC_CLOCK must be 1
 // whenever THREADS is 1 (libc++ enforces this).
