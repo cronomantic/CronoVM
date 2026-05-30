@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(cronovm
-    VERSION 0.1.0
-    DESCRIPTION "Embeddable virtual machine with a Clang-driven C toolchain"
+    VERSION 0.2.0
+    DESCRIPTION "Embeddable virtual machine with a Clang-driven C/C++ toolchain"
     LANGUAGES C)
 
 # Stash CronoVM's own source root so subdirectory CMakeLists can refer

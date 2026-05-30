@@ -11,9 +11,9 @@ user.c ──[ clang -emit-llvm ]──▶ user.bc ──[ cvm-translate ]──
 The translator is **not** part of the runtime. The VM binary you ship with
 your game has zero LLVM dependency.
 
-## Status (step 11)
+## What the translator accepts
 
-Codegen now covers **scalar i32 arithmetic, comparisons, branches,
+Codegen covers **scalar i32 arithmetic, comparisons, branches,
 multi-block control flow, `select`, `switch`, calls between user
 functions (direct, recursive, indirect, with > 8 args),
 entry-block allocas with escaping pointers, i8/i16 memory ops,
@@ -358,7 +358,7 @@ non-syscall non-intrinsic):
 6. Reload `R8..R(ssa_reg_high-1)` from the spill area.
 7. `MOV dst, R0` for the call's return value (when not `void`).
 
-Spill is **liveness-narrowed** as of step 9. The codegen runs a
+Spill is **liveness-narrowed**. The codegen runs a
 standard fixed-point liveness analysis after pre-allocation:
 
 - `cg_block_def_use` computes `def[bb]`, `phi_def[bb]`, and

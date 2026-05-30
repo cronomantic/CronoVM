@@ -8,6 +8,62 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-05-30
+
+The **Beta** milestone. Since 0.1.0, CronoVM gained a complete C standard
+library (picolibc) and C++ standard library (libc++ STL), software 64-bit
+integer and `double` arithmetic, cooperative coroutines, C++ exceptions and
+RTTI, and a differential conformance corpus. The runtime, toolchain and
+language support are now stable enough for real projects (the binary format and
+ABI may still change pre-1.0; breaks are flagged under **Breaking**).
+
+### Added
+
+- **C++ standard library (libc++ STL).** `cvm-cc` compiles C++20 against the
+  toolchain Clang's own libc++ (`-stdlib=libc++`, version-matched). Working:
+  `std::vector`, `std::string`, `std::map`, `<memory>`
+  (`unique_ptr`/`shared_ptr`/`weak_ptr`), and the full integer/pointer
+  `std::atomic` surface — plus `throw`/`catch` across the std exception
+  hierarchy. The out-of-line std exception classes + `shared_ptr` control block
+  are provided by `runtime/lib/cvm_cxxstl.cpp` (compiled against libc++ so Clang
+  emits matching vtables/`type_info`); freestanding configuration lives in two
+  small overrides, `runtime/lib/__config_site` and `__external_threading` (the
+  libc++ thread API mapped onto cron coroutines). Auto-linked only when a module
+  references the std exception ABI (a `--probe-runtime` `CXXSTL` bit).
+- **picolibc is *the* C library, end to end.** Promoted from the phase-1 bitcode
+  surface (below) to the full standard library: the SDK's hand-written libc
+  became a thin machine port, and the complete stdio comes from picolibc
+  tinystdio (`printf`/`scanf`/`FILE`/`fopen` over a host POSIX backend
+  `open`/`read`/`write`/`lseek`/`close`). Allocator is a per-build choice
+  (picolibc's sbrk-backed malloc, or a tuned O(1)-free allocator).
+- **`std::atomic` / atomic intrinsics.** The translator lowers `atomicrmw`,
+  `cmpxchg` and `fence` for scalar (i8/i16/i32/ptr) and i64 widths to plain
+  load/op/store — correct under the cooperative, no-preemption model — and
+  `llvm.trap`/`llvm.debugtrap` to `HALT`.
+- **RTTI / `dynamic_cast`.** `__dynamic_cast` + the Itanium `type_info` ABI in
+  `cvm_cxxrt`; `cvm-cc` no longer forces `-fno-rtti`.
+- **Native C++ input + ABI runtime.** `cvm-cc` compiles `.cpp/.cc/.cxx`
+  directly and auto-links `cvm_cxxrt` — `operator new`/`delete`, `__cxa_*`,
+  global constructors, and the setjmp/longjmp exception unwinder.
+- **Differential conformance corpus** (`tests/conformance/`). Each fixture is
+  built for the VM *and* natively and the results are compared bit-for-bit, so
+  unlowered intrinsics and miscompiles are caught proactively. 28 fixtures span
+  C, C++ (OO/templates/lambdas/EH/RTTI), picolibc, the STL containers,
+  `<memory>` and `std::atomic`.
+- **f64<->i64 bitcast legalisation** plus the i64/`double` software runtimes
+  reaching full coverage (mul/div/rem, shifts, conversions, the 64-bit calling
+  convention).
+- **Cross-platform CI.** GitHub Actions builds and tests on Linux (Clang + GCC),
+  Windows (MSYS2 UCRT Clang) and macOS, plus bare-metal sanity builds for
+  `thumbv6m`, `thumbv7m` and `rv32imc`.
+
+### Changed
+
+- **Project version → 0.2.0, status Beta.** Consumers now
+  `find_package(CronoVM 0.2 …)`.
+
+The remaining entries below were also part of the 0.2.0 cycle:
+
 ### Added
 
 - **picolibc as the C standard library (phase 1: 32-bit surface).** picolibc is
@@ -695,4 +751,5 @@ needs them uses the runtime headers below.
   GEP + the supported intrinsic set is rejected with a clear
   error.
 
+[0.2.0]: https://github.com/cronomantic/CronoVM/releases/tag/v0.2.0
 [0.1.0]: https://github.com/cronomantic/CronoVM/releases/tag/v0.1.0
