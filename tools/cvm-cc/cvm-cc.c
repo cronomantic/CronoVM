@@ -86,6 +86,7 @@
 #define MAX_REGIONS         64
 #define MAX_INCLUDE_DIRS    32
 #define MAX_DEFINES         32
+#define MAX_PASSTHRU        64   /* verbatim clang args: -isystem/-idirafter/-std */
 #define MAX_INPUTS         256   /* a multi-file port (e.g. Crispy) is ~100+ TUs */
 
 struct cli {
@@ -98,6 +99,9 @@ struct cli {
     const char *opt_path;       /* --opt= */
     const char *translate_path; /* --translate= */
     const char *runtime_dir;    /* --runtime-dir= */
+    const char *libcxx_dir;     /* --libcxx-dir=: explicit libc++ v1 header dir
+                                 * (default: the toolchain clang's own, via
+                                 * -stdlib=libc++ — always version-matched) */
 
     const char *heap_reserve;   /* --heap-reserve=, raw string */
     const char *stack_reserve;  /* --stack-reserve=, raw string */
@@ -110,6 +114,13 @@ struct cli {
     int         include_count;
     const char *defines[MAX_DEFINES];   /* -D<macro>[=val], passed to clang */
     int         define_count;
+    /* Verbatim clang args forwarded in order: -isystem D / -idirafter D / -std=.
+     * -idirafter lets a build place the C library (picolibc/SDK) headers BELOW
+     * libc++ so libc++'s own wrapper <math.h>/<cstring>/... win and #include_next
+     * through to the C ones (required when compiling C++ with the STL). */
+    const char *passthru[MAX_PASSTHRU];
+    int         passthru_count;
+    int         has_std;        /* user passed -std=: don't inject the default */
 
     int lto;        /* --lto: run opt default<O2> on the (linked) module */
     int keep_bc;
@@ -144,8 +155,21 @@ static void usage(FILE *f) {
         "\n"
         "Pass-through to clang:\n"
         "  -I <dir>                   extra include dir (repeatable)\n"
+        "  -isystem <dir>             extra system include dir (repeatable)\n"
+        "  -idirafter <dir>           include dir searched LAST (repeatable).\n"
+        "                             Use for the C library (picolibc/SDK)\n"
+        "                             headers when compiling C++ so libc++'s\n"
+        "                             wrapper headers win and #include_next.\n"
         "  -D<macro>[=val]            predefine a macro (repeatable)\n"
+        "  -std=<std>                 language standard (C++ defaults to c++20)\n"
         "  -O0|-O1|-O2|-O3|-Os        optimisation level (default -O1)\n"
+        "\n"
+        "C++ (.cpp/.cc/.cxx):\n"
+        "  libc++ from the toolchain clang (-stdlib=libc++) by default; the\n"
+        "  freestanding <__config_site>/<__external_threading> in the runtime\n"
+        "  dir override it. --libcxx-dir=PATH pins an explicit v1 header tree.\n"
+        "  --libcxx-dir=PATH          explicit libc++ v1 header dir (else the\n"
+        "                             toolchain clang's own, version-matched)\n"
         "\n"
         "Link-time optimisation:\n"
         "  --lto                      run opt 'default<O2>' on the linked module\n"
@@ -367,6 +391,28 @@ static int parse_argv(int argc, char **argv, struct cli *cli) {
                 return 2;
             }
             cli->defines[cli->define_count++] = a;
+        } else if (strcmp(a, "-isystem") == 0 || strcmp(a, "-idirafter") == 0) {
+            /* Two-token clang include flags, forwarded verbatim (in order).
+             * -idirafter is how a C++ build demotes the C library headers
+             * below libc++ (see struct cli). */
+            if (i + 1 >= argc) { usage(stderr); return 2; }
+            if (cli->passthru_count + 2 > MAX_PASSTHRU) {
+                fprintf(stderr, "cvm-cc: too many passthrough args (max %d)\n",
+                        MAX_PASSTHRU);
+                return 2;
+            }
+            cli->passthru[cli->passthru_count++] = a;
+            cli->passthru[cli->passthru_count++] = argv[++i];
+        } else if (strncmp(a, "-std=", 5) == 0) {
+            if (cli->passthru_count + 1 > MAX_PASSTHRU) {
+                fprintf(stderr, "cvm-cc: too many passthrough args (max %d)\n",
+                        MAX_PASSTHRU);
+                return 2;
+            }
+            cli->passthru[cli->passthru_count++] = a;
+            cli->has_std = 1;
+        } else if (strncmp(a, "--libcxx-dir=", 13) == 0) {
+            cli->libcxx_dir = a + 13;
         } else if (strncmp(a, "-O", 2) == 0 && a[2] != '\0') {
             cli->opt_level = a + 2;
         } else if (strncmp(a, "--heap-reserve=", 15) == 0) {
@@ -428,8 +474,9 @@ static int compile_c_to_bc(const struct cli *cli, const char *clang,
     snprintf(optflag, sizeof optflag, "-O%s", cli->opt_level);
     char rtinc[1024];
     snprintf(rtinc, sizeof rtinc, "-I%s", cli->runtime_dir);
+    char libcxxinc[1024];
 
-    char *cargv[24 + 2 * MAX_INCLUDE_DIRS + MAX_DEFINES];
+    char *cargv[32 + 2 * MAX_INCLUDE_DIRS + MAX_DEFINES + MAX_PASSTHRU];
     int   n = 0;
     cargv[n++] = (char *)clang;
     cargv[n++] = (char *)"--target=i386-elf";
@@ -443,6 +490,28 @@ static int compile_c_to_bc(const struct cli *cli, const char *clang,
     if (is_cpp_src(input)) {
         cargv[n++] = (char *)"-x";
         cargv[n++] = (char *)"c++";
+        /* libc++ headers. By default use the toolchain clang's own libc++
+         * (-stdlib=libc++ self-locates them — always version-matched, the most
+         * portable choice since libc++ is co-versioned with clang). The
+         * runtime dir (added via rtinc as -I, highest priority) supplies our
+         * freestanding <__config_site> + <__external_threading> overrides, so
+         * they win over the toolchain's. --libcxx-dir pins an explicit v1 tree
+         * instead (for a vendored/hermetic build): point clang at it with
+         * -nostdinc++ -isystem and drop -stdlib. The C library headers
+         * (picolibc/SDK) must be passed by the caller via -idirafter so
+         * libc++'s wrapper headers shadow them and #include_next through. */
+        if (cli->libcxx_dir) {
+            cargv[n++] = (char *)"-nostdinc++";
+            cargv[n++] = (char *)"-isystem";
+            snprintf(libcxxinc, sizeof libcxxinc, "%s", cli->libcxx_dir);
+            cargv[n++] = libcxxinc;
+        } else {
+            cargv[n++] = (char *)"-stdlib=libc++";
+        }
+        /* Default to C++20 (modern STL; <compare> etc.) unless the user set
+         * -std explicitly (forwarded via passthru). */
+        if (!cli->has_std)
+            cargv[n++] = (char *)"-std=c++20";
     }
     cargv[n++] = (char *)"-emit-llvm";
     /* Line tables only: enough for the translator to report file:line on
@@ -457,6 +526,12 @@ static int compile_c_to_bc(const struct cli *cli, const char *clang,
     }
     for (int k = 0; k < cli->define_count; ++k)
         cargv[n++] = (char *)cli->defines[k];
+    /* Verbatim passthrough (-isystem / -idirafter / -std=), in the order given.
+     * After rtinc (-I, highest) and -D, but the -idirafter entries still land
+     * at the very end of clang's search chain by definition — that's the point
+     * (C library below libc++). */
+    for (int k = 0; k < cli->passthru_count; ++k)
+        cargv[n++] = (char *)cli->passthru[k];
     cargv[n++] = (char *)"-c";
     cargv[n++] = (char *)input;
     cargv[n++] = (char *)"-o";

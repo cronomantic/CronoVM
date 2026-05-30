@@ -1,0 +1,165 @@
+// -*- C++ -*-
+// __external_threading — CronoVM cooperative threading API for libc++.
+//
+// Selected by _LIBCPP_HAS_THREAD_API_EXTERNAL in <__config_site>. libc++
+// includes this header (via <__thread/support/external.h>) and expects it to
+// define the `__libcpp_*` threading primitives documented in
+// <__thread/support.h>. We map them onto CronoVM's execution model.
+//
+// CRONOVM EXECUTION MODEL: cooperative. There is no preemption — a context
+// runs until it explicitly swaps out (sdk/include/coro.h, CORO_SWAP). libc++
+// never yields inside one of its own critical sections, so:
+//   - Mutexes are NO-OPS: a lock taken by the running context can never be
+//     contended by another context mid-section (the only way another context
+//     runs is an explicit swap, which libc++ code never does while holding an
+//     internal lock). recursive mutex == plain mutex.
+//   - execute_once needs no atomics: a plain flag is race-free.
+//   - TLS is a single-context table (one logical thread until real coro-backed
+//     std::thread lands).
+//
+// SCOPE (libc/libc++ phase 4a): this provides everything the header-only STL
+// (std::vector / string / map / memory / atomic) needs. The std::thread /
+// std::condition_variable surface is DEFERRED: thread_create reports failure
+// and condvar wait is a no-op, so constructing a std::thread or genuinely
+// blocking on a condition variable is not supported YET. A later phase backs
+// those with the cron-coro scheduler (coro.h). Nothing in vector/string/map/
+// memory references them, so they stay unused (no link dependency) until then.
+
+#ifndef _LIBCPP___EXTERNAL_THREADING
+#define _LIBCPP___EXTERNAL_THREADING
+
+#include <__chrono/duration.h>   // chrono::nanoseconds (sleep_for signature)
+#include <__config>
+
+#ifndef _LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER
+#  pragma GCC system_header
+#endif
+
+_LIBCPP_BEGIN_NAMESPACE_STD
+
+// Self-contained timespec (avoids pulling a C <time.h> into the STL config
+// path). Only condvar_timedwait / sleep_for reference it, both no-ops here.
+struct __cron_timespec_t {
+  long tv_sec;
+  long tv_nsec;
+};
+using __libcpp_timespec_t _LIBCPP_NODEBUG = __cron_timespec_t;
+
+//
+// Mutex — no-op under cooperative scheduling (see header note).
+//
+using __libcpp_mutex_t           = int;
+#define _LIBCPP_MUTEX_INITIALIZER 0
+using __libcpp_recursive_mutex_t = int;
+
+inline _LIBCPP_HIDE_FROM_ABI int __libcpp_recursive_mutex_init(__libcpp_recursive_mutex_t*) { return 0; }
+_LIBCPP_NO_THREAD_SAFETY_ANALYSIS inline _LIBCPP_HIDE_FROM_ABI int
+__libcpp_recursive_mutex_lock(__libcpp_recursive_mutex_t*) { return 0; }
+_LIBCPP_NO_THREAD_SAFETY_ANALYSIS inline _LIBCPP_HIDE_FROM_ABI bool
+__libcpp_recursive_mutex_trylock(__libcpp_recursive_mutex_t*) { return true; }
+_LIBCPP_NO_THREAD_SAFETY_ANALYSIS inline _LIBCPP_HIDE_FROM_ABI int
+__libcpp_recursive_mutex_unlock(__libcpp_recursive_mutex_t*) { return 0; }
+inline _LIBCPP_HIDE_FROM_ABI int __libcpp_recursive_mutex_destroy(__libcpp_recursive_mutex_t*) { return 0; }
+
+_LIBCPP_NO_THREAD_SAFETY_ANALYSIS inline _LIBCPP_HIDE_FROM_ABI int
+__libcpp_mutex_lock(__libcpp_mutex_t*) { return 0; }
+_LIBCPP_NO_THREAD_SAFETY_ANALYSIS inline _LIBCPP_HIDE_FROM_ABI bool
+__libcpp_mutex_trylock(__libcpp_mutex_t*) { return true; }
+_LIBCPP_NO_THREAD_SAFETY_ANALYSIS inline _LIBCPP_HIDE_FROM_ABI int
+__libcpp_mutex_unlock(__libcpp_mutex_t*) { return 0; }
+inline _LIBCPP_HIDE_FROM_ABI int __libcpp_mutex_destroy(__libcpp_mutex_t*) { return 0; }
+
+//
+// Condition variable — DEFERRED (see header note). signal/broadcast are no-ops;
+// wait returns immediately. Real blocking needs the coro scheduler.
+//
+using __libcpp_condvar_t            = int;
+#define _LIBCPP_CONDVAR_INITIALIZER 0
+
+inline _LIBCPP_HIDE_FROM_ABI int __libcpp_condvar_signal(__libcpp_condvar_t*) { return 0; }
+inline _LIBCPP_HIDE_FROM_ABI int __libcpp_condvar_broadcast(__libcpp_condvar_t*) { return 0; }
+_LIBCPP_NO_THREAD_SAFETY_ANALYSIS inline _LIBCPP_HIDE_FROM_ABI int
+__libcpp_condvar_wait(__libcpp_condvar_t*, __libcpp_mutex_t*) { return 0; }
+_LIBCPP_NO_THREAD_SAFETY_ANALYSIS inline _LIBCPP_HIDE_FROM_ABI int
+__libcpp_condvar_timedwait(__libcpp_condvar_t*, __libcpp_mutex_t*, __libcpp_timespec_t*) { return 0; }
+inline _LIBCPP_HIDE_FROM_ABI int __libcpp_condvar_destroy(__libcpp_condvar_t*) { return 0; }
+
+//
+// Execute once — plain flag, race-free under cooperative scheduling.
+//
+using __libcpp_exec_once_flag         = long;
+#define _LIBCPP_EXEC_ONCE_INITIALIZER 0
+
+inline _LIBCPP_HIDE_FROM_ABI int __libcpp_execute_once(__libcpp_exec_once_flag* __flag, void (*__init_routine)()) {
+  if (*__flag == 0) {
+    __init_routine();
+    *__flag = 1;
+  }
+  return 0;
+}
+
+//
+// Thread id.
+//
+using __libcpp_thread_id = unsigned int;
+
+inline _LIBCPP_HIDE_FROM_ABI bool __libcpp_thread_id_equal(__libcpp_thread_id __t1, __libcpp_thread_id __t2) {
+  return __t1 == __t2;
+}
+inline _LIBCPP_HIDE_FROM_ABI bool __libcpp_thread_id_less(__libcpp_thread_id __t1, __libcpp_thread_id __t2) {
+  return __t1 < __t2;
+}
+
+//
+// Thread — DEFERRED (see header note). create reports failure; the rest are
+// trivial so std::thread's header compiles, but constructing one is not
+// supported until the coro-backed scheduler lands.
+//
+#define _LIBCPP_NULL_THREAD 0U
+using __libcpp_thread_t = unsigned int;
+
+inline _LIBCPP_HIDE_FROM_ABI __libcpp_thread_id __libcpp_thread_get_id(const __libcpp_thread_t* __t) { return *__t; }
+inline _LIBCPP_HIDE_FROM_ABI bool __libcpp_thread_isnull(const __libcpp_thread_t* __t) { return *__t == 0; }
+inline _LIBCPP_HIDE_FROM_ABI int __libcpp_thread_create(__libcpp_thread_t*, void* (*)(void*), void*) {
+  return 1; // EAGAIN-ish: thread creation not yet supported (deferred phase).
+}
+inline _LIBCPP_HIDE_FROM_ABI __libcpp_thread_id __libcpp_thread_get_current_id() { return 1; }
+inline _LIBCPP_HIDE_FROM_ABI int __libcpp_thread_join(__libcpp_thread_t*) { return 0; }
+inline _LIBCPP_HIDE_FROM_ABI int __libcpp_thread_detach(__libcpp_thread_t*) { return 0; }
+inline _LIBCPP_HIDE_FROM_ABI void __libcpp_thread_yield() {}
+inline _LIBCPP_HIDE_FROM_ABI void __libcpp_thread_sleep_for(const chrono::nanoseconds&) {}
+
+//
+// Thread-local storage — single-context table (one logical thread for now).
+//
+#define _LIBCPP_TLS_DESTRUCTOR_CC /* nothing */
+using __libcpp_tls_key = unsigned int;
+
+enum { __CRON_TLS_MAX = 64 };
+
+inline _LIBCPP_HIDE_FROM_ABI void** __cron_tls_slots() {
+  static void* __slots[__CRON_TLS_MAX] = {};
+  return __slots;
+}
+
+inline _LIBCPP_HIDE_FROM_ABI int __libcpp_tls_create(__libcpp_tls_key* __key, void (*)(void*)) {
+  static unsigned int __next = 1; // 0 reserved as "invalid"
+  if (__next >= __CRON_TLS_MAX)
+    return 1;
+  *__key = __next++;
+  return 0;
+}
+inline _LIBCPP_HIDE_FROM_ABI void* __libcpp_tls_get(__libcpp_tls_key __key) {
+  return (__key != 0 && __key < __CRON_TLS_MAX) ? __cron_tls_slots()[__key] : nullptr;
+}
+inline _LIBCPP_HIDE_FROM_ABI int __libcpp_tls_set(__libcpp_tls_key __key, void* __p) {
+  if (__key != 0 && __key < __CRON_TLS_MAX) {
+    __cron_tls_slots()[__key] = __p;
+    return 0;
+  }
+  return 1;
+}
+
+_LIBCPP_END_NAMESPACE_STD
+
+#endif // _LIBCPP___EXTERNAL_THREADING

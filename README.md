@@ -138,6 +138,36 @@ A complete worked example lives under
 [`examples/installed_consumer/`](examples/installed_consumer) and
 is exercised end-to-end by the `installed_*` ctest entries.
 
+## C++ and the STL
+
+`cvm-cc` compiles `.cpp/.cc/.cxx` as C++ and auto-links the C++ ABI
+runtime (`runtime/lib/cvm_cxxrt.cpp`: `operator new/delete`, `__cxa_*`,
+exceptions on setjmp/longjmp, RTTI). The standard library is the
+toolchain clang's own **libc++** (`-stdlib=libc++`, so it is always
+version-matched to the compiler — the most portable choice, since libc++
+is co-versioned with clang). CronoVM overrides only two small headers in
+`runtime/lib`, found ahead of the toolchain's copies:
+
+- `__config_site` — freestanding configuration (no locale / wide chars /
+  unicode / filesystem; hardening off; cooperative **external** thread
+  API; the C library underneath is picolibc).
+- `__external_threading` — the libc++ thread API mapped onto CronoVM's
+  cooperative coroutines (mutexes are no-ops under no-preemption;
+  `std::thread`/`std::condition_variable` are deferred — vector/string/
+  map/memory/atomic do not use them).
+
+C++ defaults to `-std=c++20`. Because libc++ ships its own wrapper
+`<math.h>`/`<cstring>`/… that must shadow the C library's and
+`#include_next` through, pass the C headers (picolibc/SDK) with
+`-idirafter` (not `-I`) so they sit *below* libc++:
+
+```sh
+cvm-cc game.cpp -idirafter path/to/picolibc/libc/include -o game.bin
+```
+
+Use `--libcxx-dir=PATH` to pin an explicit libc++ `v1` header tree
+instead of the toolchain's (e.g. for a hermetic/CI build).
+
 ## Runtime APIs
 
 ```c

@@ -1,0 +1,69 @@
+// __config_site — CronoVM's freestanding configuration for libc++.
+//
+// libc++ normally generates this header at configure time. CronoVM does NOT
+// build libc++; it uses the libc++ HEADERS that ship with the toolchain's own
+// clang (always version-matched — see the libc/libc++ decision) and overrides
+// ONLY this file + <__external_threading>. cvm-cc puts runtime/lib on the
+// include path AHEAD of the toolchain's libc++ dir, so this <__config_site>
+// wins and pins every feature knob for the VM.
+//
+// Mirrors picolibc.h's role for the C library: a single hand-written point of
+// configuration, freestanding, no hosted OS.
+//
+// Design (the libc/libc++ decision):
+//   - FREESTANDING: no locale / wide chars / unicode / filesystem / random
+//     device / time-zone DB. The C surface underneath is picolibc.
+//   - COOPERATIVE threads: the VM has no preemption (coroutines via CORO_SWAP),
+//     so libc++ uses the EXTERNAL thread API (_LIBCPP_HAS_THREAD_API_EXTERNAL)
+//     backed by <__external_threading> over cron coros. Threads are NOT
+//     disabled (a C++ cart like Exult may use std::thread/std::mutex/atomics);
+//     under cooperation a mutex is a no-op (no section yields mid-way).
+//   - HARDENING OFF: _LIBCPP_HARDENING_MODE_NONE (== 2 in this LLVM). The
+//     bounds checks would call the hardening-failure handler (abort/log); the
+//     VM traps OOB itself. Keep the STL lean.
+//
+// Pinned against the libc++ that ships with clang 22.x (LLVM 22.1.x). When the
+// toolchain's major LLVM version moves, re-check the knob names/values here
+// against the stock <__config_site> for that release.
+
+#ifndef _LIBCPP___CONFIG_SITE
+#define _LIBCPP___CONFIG_SITE
+
+#define _LIBCPP_ABI_VERSION 1
+#define _LIBCPP_ABI_NAMESPACE __1
+#define _LIBCPP_ABI_FORCE_ITANIUM 0
+#define _LIBCPP_ABI_FORCE_MICROSOFT 0
+
+// Threads ON, but via the external (cron-coro) API. MONOTONIC_CLOCK must be 1
+// whenever THREADS is 1 (libc++ enforces this).
+#define _LIBCPP_HAS_THREADS 1
+#define _LIBCPP_HAS_MONOTONIC_CLOCK 1
+#define _LIBCPP_HAS_THREAD_API_PTHREAD 0
+#define _LIBCPP_HAS_THREAD_API_EXTERNAL 1
+#define _LIBCPP_HAS_THREAD_API_WIN32 0
+#define _LIBCPP_HAS_THREAD_API_C11 0
+
+// No hosted OS facilities.
+#define _LIBCPP_HAS_TERMINAL 0
+#define _LIBCPP_HAS_MUSL_LIBC 0
+#define _LIBCPP_HAS_VENDOR_AVAILABILITY_ANNOTATIONS 0
+#define _LIBCPP_HAS_FILESYSTEM 0
+#define _LIBCPP_HAS_RANDOM_DEVICE 0
+#define _LIBCPP_HAS_LOCALIZATION 0
+#define _LIBCPP_HAS_UNICODE 0
+#define _LIBCPP_HAS_WIDE_CHARACTERS 0
+#define _LIBCPP_HAS_TIME_ZONE_DATABASE 0
+#define _LIBCPP_INSTRUMENTED_WITH_ASAN 0
+
+// PSTL: serial backend (no std::thread fan-out for parallel algorithms).
+#define _LIBCPP_PSTL_BACKEND_SERIAL
+
+// Hardening + assertions OFF (NONE / IGNORE map to value 2 in this LLVM).
+#define _LIBCPP_HARDENING_MODE_DEFAULT 2
+#define _LIBCPP_ASSERTION_SEMANTIC_DEFAULT 2
+
+// The C library underneath is picolibc.
+#define _LIBCPP_LIBC_PICOLIBC 1
+#define _LIBCPP_LIBC_NEWLIB 0
+
+#endif // _LIBCPP___CONFIG_SITE
