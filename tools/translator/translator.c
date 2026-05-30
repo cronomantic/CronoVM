@@ -266,13 +266,14 @@ static int opcode_in_subset(LLVMOpcode op) {
      * __cvm_eh_exc/__cvm_eh_sel, and `resume` calls __cvm_eh_resume. The MSVC EH
      * model (CatchPad/CleanupPad/…) stays rejected — we only see Itanium IR. */
     case LLVMInvoke: case LLVMLandingPad: case LLVMResume:
-    /* Atomic read-modify-write + fence. The VM is COOPERATIVE (no preemption —
-     * a context runs until it explicitly swaps), so an atomicrmw is just
-     * load/op/store and a fence is a no-op; both are correct by construction.
-     * Lets std::atomic / std::shared_ptr's refcount translate. (cmpxchg is still
-     * rejected — no cart needs it yet; see reject_reason.) Atomic load/store are
-     * plain LLVMLoad/LLVMStore and already accepted. */
-    case LLVMAtomicRMW: case LLVMFence:
+    /* Atomic read-modify-write, compare-exchange + fence. The VM is COOPERATIVE
+     * (no preemption — a context runs until it explicitly swaps), so atomicrmw
+     * is load/op/store, cmpxchg is load/compare/conditional-store, and a fence
+     * is a no-op; all correct by construction. Lets std::atomic /
+     * std::shared_ptr translate. Atomic load/store are plain LLVMLoad/LLVMStore
+     * and already accepted. (cmpxchg codegen handles scalar widths; i64 cmpxchg
+     * is rejected at the call site.) */
+    case LLVMAtomicRMW: case LLVMAtomicCmpXchg: case LLVMFence:
     /* freeze: lowered as identity (pass the operand through). clang emits it
      * to block poison propagation, e.g. around div/rem and the i64 legaliser's
      * volatile operands. Since the VM never exploits UB, identity is correct. */
@@ -301,10 +302,6 @@ static const char *reject_reason(LLVMOpcode op) {
     case LLVMCleanupPad: case LLVMCatchSwitch:
         return "MSVC/SEH exception model not supported (the Itanium model — "
                "invoke/landingpad/resume — is)";
-    case LLVMAtomicCmpXchg:
-        return "cmpxchg not in the subset yet (atomicrmw + fence are; the "
-               "cooperative VM needs no real compare-exchange — add when a cart "
-               "uses std::atomic::compare_exchange)";
     case LLVMExtractElement: case LLVMInsertElement: case LLVMShuffleVector:
         return "vector instructions not in the subset";
     case LLVMVAArg:
@@ -2129,6 +2126,35 @@ static int cg_is_overflow_extract(LLVMValueRef i, LLVMValueRef *call, unsigned *
     return 1;
 }
 
+/* cmpxchg lowering. `cmpxchg ptr, cmp, new` yields {iN value, i1 success}.
+ * Like with.overflow it is an aggregate stored in consecutive frame slots
+ * (value word, then the success flag) read back by extractvalue. We lower the
+ * SCALAR widths (i8/i16/i32/ptr -> one value word); i64 cmpxchg is rejected at
+ * the codegen site. */
+static int cg_is_cmpxchg(LLVMValueRef v) {
+    if (!v || LLVMGetInstructionOpcode(v) != LLVMAtomicCmpXchg) return 0;
+    LLVMTypeRef vt = LLVMTypeOf(LLVMGetOperand(v, 1));   /* the `cmp` operand */
+    LLVMTypeKind k = LLVMGetTypeKind(vt);
+    if (k == LLVMPointerTypeKind) return 1;
+    if (k == LLVMIntegerTypeKind) {
+        unsigned w = LLVMGetIntTypeWidth(vt);
+        return w == 8 || w == 16 || w == 32;
+    }
+    return 0;   /* i64 / other -> not lowered here */
+}
+
+/* If `i` is `extractvalue <cmpxchg>, {0|1}`, return 1 and set src + field
+ * (0 = the iN value, 1 = the i1 success flag). */
+static int cg_is_cmpxchg_extract(LLVMValueRef i, LLVMValueRef *src, unsigned *field) {
+    if (LLVMGetInstructionOpcode(i) != LLVMExtractValue) return 0;
+    LLVMValueRef s = LLVMGetOperand(i, 0);
+    if (!cg_is_cmpxchg(s)) return 0;
+    if (LLVMGetNumIndices(i) != 1) return 0;
+    if (src)   *src = s;
+    if (field) *field = LLVMGetIndices(i)[0];
+    return 1;
+}
+
 /* SP-relative byte offset of the LO word of the i64 value at map index idx
  * (the HI word is at +4). */
 static int32_t cg_i64_lo_off(struct cg *cg, int idx) {
@@ -2645,6 +2671,13 @@ static void cg_pre_alloc_function(struct cg *cg, LLVMValueRef fn) {
                 int idx = cg->map_count - 1;
                 cg->agg_slot[idx] = (uint16_t)cg->val_spill_count;
                 cg->val_spill_count += cg_overflow_val_words(ov_bits) + 1;
+            } else if (cg_is_cmpxchg(i)) {
+                /* cmpxchg: {iN value, i1 success} in two consecutive slots
+                 * (scalar value word, then the success flag). No register. */
+                cg_assign(cg, i, (uint8_t)CG_REG_SPILLED);
+                int idx = cg->map_count - 1;
+                cg->agg_slot[idx] = (uint16_t)cg->val_spill_count;
+                cg->val_spill_count += 2;
             } else if (cg_is_overflow_extract(i, &ov_call, &ov_field)
                        && ov_field == 0 && cg_type_is_i64(ty)) {
                 /* extractvalue <ov>, 0 of an i64 overflow result: ALIAS its two
@@ -4742,6 +4775,21 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                  * slots. Field 0 = the iN value (the i32 case here; the i64 case
                  * is aliased onto the call's slots in pre-alloc and no-ops in
                  * cg_emit_i64_def). Field 1 = the i1 overflow flag. */
+                LLVMValueRef cx_src; unsigned cx_field;
+                if (cg_is_cmpxchg_extract(i, &cx_src, &cx_field)) {
+                    /* cmpxchg result: field 0 = the iN value word, field 1 = the
+                     * i1 success flag, in consecutive agg slots. */
+                    int cidx = cg_lookup(cg, cx_src);
+                    if (cidx < 0 || cg->agg_slot[cidx] == CG_NO_SLOT) {
+                        ERR(cg->fn_name, "internal: cmpxchg extract without agg slot");
+                        cg->had_error = 1; break;
+                    }
+                    int slot = cg->agg_slot[cidx] + (cx_field == 0 ? 0 : 1);
+                    uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                    if (cg_ldw_sp_off(cg, dst, cg_val_slot_off(cg, (uint16_t)slot)))
+                        cg->had_error = 1;
+                    break;
+                }
                 LLVMValueRef ov_call; unsigned ov_field;
                 if (cg_is_overflow_extract(i, &ov_call, &ov_field)) {
                     int cidx = cg_lookup(cg, ov_call);
@@ -4939,6 +4987,68 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 }
                 if (cg->had_error) break;
                 cg_emit(cg, enc_r(stop, 0, addr, nw));
+                break;
+            }
+
+            case LLVMAtomicCmpXchg: {
+                /* Cooperative VM: load; eq = (old == cmp); [ptr] = eq ? new : old;
+                 * result {value=old, success=eq} -> the agg slots. The store is
+                 * branchless (storing `old` on failure is a harmless re-write):
+                 *   mask = 0 - eq;  sv = old ^ ((old ^ new) & mask). */
+                LLVMValueRef ptr_v = LLVMGetOperand(i, 0);
+                LLVMValueRef cmp_v = LLVMGetOperand(i, 1);
+                LLVMValueRef new_v = LLVMGetOperand(i, 2);
+                LLVMTypeRef  vt = LLVMTypeOf(cmp_v);
+                LLVMTypeKind vk = LLVMGetTypeKind(vt);
+                uint8_t ldop = 0, stop = 0; unsigned width = 0;
+                if (vk == LLVMPointerTypeKind) { ldop = CVM_OP_LDW; stop = CVM_OP_STW; width = 32; }
+                else if (vk == LLVMIntegerTypeKind) {
+                    width = LLVMGetIntTypeWidth(vt);
+                    if (width == 8)       { ldop = CVM_OP_LDB; stop = CVM_OP_STB; }
+                    else if (width == 16) { ldop = CVM_OP_LDH; stop = CVM_OP_STH; }
+                    else if (width == 32) { ldop = CVM_OP_LDW; stop = CVM_OP_STW; }
+                }
+                if (!ldop) {
+                    ERR(cg->fn_name, "cmpxchg: unsupported width "
+                        "(i8/i16/i32/ptr only; i64 not yet)");
+                    cg->had_error = 1; break;
+                }
+                int oidx = cg_lookup(cg, i);
+                if (oidx < 0 || cg->agg_slot[oidx] == CG_NO_SLOT) {
+                    ERR(cg->fn_name, "internal: cmpxchg without agg slot");
+                    cg->had_error = 1; break;
+                }
+                int base = cg->agg_slot[oidx];
+                uint8_t addr = cg_reg_for(cg, ptr_v);
+                uint8_t cmp  = cg_reg_for(cg, cmp_v);
+                uint8_t neu  = cg_reg_for(cg, new_v);
+                if (cg->had_error) break;
+                uint8_t old = cg_alloc_reg(cg); if (cg->had_error) break;
+                cg_emit(cg, enc_r(ldop, old, addr, 0));   /* old = [ptr] (zero-ext) */
+                uint8_t oc = old, cc = cmp;
+                if (width < 32) {
+                    /* mask both to width (LDB/LDH zero-extend old, but cmp may
+                     * carry garbage above the width). */
+                    uint32_t m = (width == 8) ? 0xFFu : 0xFFFFu;
+                    cg_movi_scratch(cg, (int32_t)m);
+                    oc = cg_alloc_reg(cg); if (cg->had_error) break;
+                    cg_emit(cg, enc_r(CVM_OP_AND, oc, old, (uint8_t)CG_REG_SCRATCH));
+                    cc = cg_alloc_reg(cg); if (cg->had_error) break;
+                    cg_emit(cg, enc_r(CVM_OP_AND, cc, cmp, (uint8_t)CG_REG_SCRATCH));
+                }
+                uint8_t eq = cg_alloc_reg(cg); if (cg->had_error) break;
+                cg_emit(cg, enc_r(CVM_OP_CMP_EQ, eq, oc, cc));
+                uint8_t mask = cg_alloc_reg(cg); if (cg->had_error) break;
+                cg_emit(cg, enc_r(CVM_OP_SUB, mask, cg->zero_reg, eq));
+                uint8_t sv = cg_alloc_reg(cg); if (cg->had_error) break;
+                cg_emit(cg, enc_r(CVM_OP_XOR, sv, old, neu));
+                cg_emit(cg, enc_r(CVM_OP_AND, sv, sv, mask));
+                cg_emit(cg, enc_r(CVM_OP_XOR, sv, old, sv));
+                cg_emit(cg, enc_r(stop, 0, addr, sv));
+                if (cg_stw_sp_off(cg, cg_val_slot_off(cg, (uint16_t)base), old))
+                    { cg->had_error = 1; break; }
+                if (cg_stw_sp_off(cg, cg_val_slot_off(cg, (uint16_t)(base + 1)), eq))
+                    { cg->had_error = 1; break; }
                 break;
             }
 
