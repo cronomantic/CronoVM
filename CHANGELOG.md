@@ -8,9 +8,11 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ## [Unreleased]
 
-## [0.2.0] — 2026-05-30
+## [0.4.0] — 2026-05-30
 
-The **Beta** milestone. Since 0.1.0, CronoVM gained a complete C standard
+The **Beta** milestone. (The intermediate `v0.2.0` and `v0.3.0` tags shipped
+without changelog sections; this entry consolidates everything since `0.1.0`.)
+Since 0.1.0, CronoVM gained a complete C standard
 library (picolibc) and C++ standard library (libc++ STL), software 64-bit
 integer and `double` arithmetic, cooperative coroutines, C++ exceptions and
 RTTI, and a differential conformance corpus. The runtime, toolchain and
@@ -59,10 +61,10 @@ ABI may still change pre-1.0; breaks are flagged under **Breaking**).
 
 ### Changed
 
-- **Project version → 0.2.0, status Beta.** Consumers now
-  `find_package(CronoVM 0.2 …)`.
+- **Project version → 0.4.0, status Beta.** Consumers now
+  `find_package(CronoVM 0.4 …)`.
 
-The remaining entries below were also part of the 0.2.0 cycle:
+The remaining entries below were also part of this cycle:
 
 ### Added
 
@@ -751,5 +753,5 @@ needs them uses the runtime headers below.
   GEP + the supported intrinsic set is rejected with a clear
   error.
 
-[0.2.0]: https://github.com/cronomantic/CronoVM/releases/tag/v0.2.0
+[0.4.0]: https://github.com/cronomantic/CronoVM/releases/tag/v0.4.0
 [0.1.0]: https://github.com/cronomantic/CronoVM/releases/tag/v0.1.0

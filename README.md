@@ -155,7 +155,7 @@ cmake --install build --prefix /opt/cronovm
 
 ```cmake
 list(APPEND CMAKE_PREFIX_PATH /opt/cronovm)
-find_package(CronoVM 0.2 REQUIRED)
+find_package(CronoVM 0.4 REQUIRED)
 target_link_libraries(my_host PRIVATE cronovm::cvm)
 
 add_custom_command(
@@ -216,8 +216,8 @@ hermetic or CI build) instead of the toolchain's.
 ## Runtime API
 
 ```c
-const char *cvm_version_string(void);   /* "0.2.0" */
-uint32_t    cvm_version_number(void);   /* 0x00020000 for 0.2.0 */
+const char *cvm_version_string(void);   /* "0.4.0" */
+uint32_t    cvm_version_number(void);   /* 0x00040000 for 0.4.0 */
 
 int  cvm_load(const void *bytes, size_t len, struct cvm_image *out);
 int  cvm_load_ex(const void *bytes, size_t len, struct cvm_image *out,
@@ -256,7 +256,7 @@ own (FreeRTOS heap_4, Zephyr `k_malloc`, a fixed pool, …).
 
 ## Project status
 
-**Beta (0.2.x).** The runtime, toolchain and language support are stable enough
+**Beta (0.4.x).** The runtime, toolchain and language support are stable enough
 for real projects, and the test suite is comprehensive: 137 CTest cases cover
 the interpreter, the translator's accepted IR subset, the soft i64/double
 runtimes, the host APIs and both consumer integration patterns, alongside a

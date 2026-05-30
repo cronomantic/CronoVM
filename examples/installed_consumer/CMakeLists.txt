@@ -17,7 +17,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(cvm_installed_consumer C)
 
-find_package(CronoVM 0.2 REQUIRED)
+find_package(CronoVM 0.4 REQUIRED)
 
 if(NOT TARGET cronovm::cvm-translate)
     message(FATAL_ERROR

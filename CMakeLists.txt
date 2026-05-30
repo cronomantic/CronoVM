@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(cronovm
-    VERSION 0.2.0
+    VERSION 0.4.0
     DESCRIPTION "Embeddable virtual machine with a Clang-driven C/C++ toolchain"
     LANGUAGES C)
 
