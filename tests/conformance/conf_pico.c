@@ -98,6 +98,54 @@ int conf_main(void) {
     MIX(found ? *found : -1);
     MIX(found - arr);
 
+    /* ---- the CANONICAL allocator: malloc/free/calloc/realloc ----
+     * picolibc owns these on the VM side (backed by sbrk in pico_machine.c); the
+     * native oracle uses host libc. Addresses differ, so checksum only OBSERVABLE
+     * behaviour — bytes written/read, zeroing, content preserved across realloc,
+     * NULL on overflow — never a returned pointer value. */
+    unsigned char *p = (unsigned char *)malloc(100);
+    MIX(p != NULL);
+    for (int i = 0; i < 100; ++i) p[i] = (unsigned char)(i * 7 + 3);
+    for (int i = 0; i < 100; ++i) MIX(p[i]);              /* survives the write */
+
+    /* realloc grows + preserves the first 100 bytes */
+    unsigned char *q = (unsigned char *)realloc(p, 300);
+    MIX(q != NULL);
+    for (int i = 0; i < 100; ++i) MIX(q[i]);              /* preserved content */
+    for (int i = 100; i < 300; ++i) q[i] = (unsigned char)(255 - (i & 0xFF));
+    MIX(q[150]); MIX(q[299]);
+
+    /* realloc shrink, then free */
+    unsigned char *r = (unsigned char *)realloc(q, 50);
+    MIX(r != NULL);
+    for (int i = 0; i < 50; ++i) MIX(r[i]);
+    free(r);
+
+    /* calloc zeroes its block */
+    int *z = (int *)calloc(32, sizeof(int));
+    MIX(z != NULL);
+    int zsum = 0;
+    for (int i = 0; i < 32; ++i) zsum |= z[i];            /* must stay 0 */
+    MIX(zsum);
+    z[0] = 0x1234; z[31] = 0x5678;
+    MIX(z[0]); MIX(z[31]);
+    free(z);
+    /* NOTE: the calloc nmemb*size overflow guard is deliberately NOT tested
+     * differentially — picolibc detects the wrap and returns NULL, but some
+     * host libcs (the native oracle) don't, and size_t is 32-bit on the VM vs
+     * 64-bit on the host, so the edge case isn't comparable. picolibc's guard
+     * is exercised by its own test suite. */
+
+    /* a churn loop: alloc/fill/free repeatedly, fold the readback */
+    for (int k = 0; k < 8; ++k) {
+        size_t sz = (size_t)(16 + k * 9);
+        unsigned char *b = (unsigned char *)malloc(sz);
+        MIX(b != NULL);
+        for (size_t i = 0; i < sz; ++i) b[i] = (unsigned char)(i ^ (k * 13));
+        MIX(b[0]); MIX(b[sz - 1]);
+        free(b);
+    }
+
     #undef SGN
     #undef MIX
     return (int)h;

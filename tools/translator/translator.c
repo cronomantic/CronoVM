@@ -1208,7 +1208,27 @@ static uint8_t cg_reload_spilled(struct cg *cg, int idx) {
     return reload;
 }
 
+/* Resolve a GlobalAlias to the value it aliases. picolibc defines several libc
+ * entry points as aliases — e.g. `free` -> `__malloc_free`, `sbrk` ->
+ * `__fallback_sbrk` (via __strong_reference/__weak_reference) — so a direct
+ * `call @free` carries a GlobalAlias (not a Function) as its callee, and taking
+ * `&free` yields an alias operand. Peeling to the aliasee lets the normal
+ * Function/global-variable paths handle them. Alias chains are followed; a
+ * non-alias value passes through unchanged. (A GlobalAlias's aliasee may be a
+ * constant-expr cast wrapping the global; the constexpr-bitcast handling in
+ * cg_reg_for / cg_const_gep_offset peels that layer.) */
+static LLVMValueRef cg_strip_alias(LLVMValueRef v) {
+    while (v && LLVMIsAGlobalAlias(v))
+        v = LLVMAliasGetAliasee(v);
+    return v;
+}
+
 static uint8_t cg_reg_for(struct cg *cg, LLVMValueRef v) {
+    /* An aliased global/function used as an operand (e.g. `&free`): resolve to
+     * the aliasee so the Function / global-variable cases below apply. */
+    if (LLVMIsAGlobalAlias(v))
+        return cg_reg_for(cg, cg_strip_alias(v));
+
     int idx = cg_lookup(cg, v);
     if (idx >= 0) {
         if (cg->val_slot[idx] != CG_NO_SLOT)
@@ -4567,7 +4587,7 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                  * `push` must additionally preserve the invoke's own operands (so
                  * the call can pass them) — ever_spilled was widened to cover
                  * them in cg_function. */
-                LLVMValueRef callee    = LLVMGetCalledValue(i);
+                LLVMValueRef callee    = cg_strip_alias(LLVMGetCalledValue(i));
                 LLVMValueRef callee_fn = LLVMIsAFunction(callee);
                 const char  *iname     = NULL;
                 if (callee_fn) { size_t nl; iname = LLVMGetValueName2(callee_fn, &nl); }
@@ -5034,7 +5054,10 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
             }
 
             case LLVMCall: {
-                LLVMValueRef callee = LLVMGetCalledValue(i);
+                /* Resolve a global alias (picolibc's `free`->`__malloc_free`
+                 * etc.) so the direct-call path + name dispatch see the real
+                 * Function instead of treating it as an indirect call. */
+                LLVMValueRef callee = cg_strip_alias(LLVMGetCalledValue(i));
                 LLVMValueRef callee_fn = LLVMIsAFunction(callee);
 
                 /* Indirect call (callee is an SSA value, not a Function

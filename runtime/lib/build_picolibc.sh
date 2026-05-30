@@ -6,16 +6,22 @@
 # sources straight to bitcode with the SAME clang flags cvm-cc uses
 # (--target=i386-elf -ffreestanding -emit-llvm), the hand-written picolibc.h in
 # this directory pinning every feature knob, then llvm-links the objects into
-# picolibc.bc — exactly mirroring how cvm_libc.c is compiled today, but as one
+# picolibc.bc — exactly mirroring how cron_sys.c is compiled, but as one
 # reusable artifact.
 #
 # Output: runtime/lib/picolibc.bc  (a build artifact; gitignored)
 #
-# The OS layer (errno storage, malloc/free, and any write/read/sbrk/exit hooks)
-# is NOT here — it is the embedder's machine port (Cronopio's SDK libc over cron
-# syscalls). This module is the pure, embedder-independent C standard surface.
+# picolibc owns the CANONICAL allocator (malloc/free/calloc/realloc); its only OS
+# hook is sbrk(), which the embedder's machine port backs over the cron heap
+# (errno storage is the other machine-port symbol). write/read/exit hooks (stdio)
+# are still NOT here. Everything else is the pure, embedder-independent C surface.
 #
-# Usage: bash build_picolibc.sh [-O<n>] [--keep-ll] [-v]
+# --no-malloc omits picolibc's malloc family (malloc/free/calloc/realloc), so a
+# cart can supply the CANONICAL malloc itself (e.g. the Cronopio tuned allocator
+# via -DCRON_LIBC_TUNED_MALLOC). The machine-port surface then shrinks back to
+# just `errno` (no sbrk). See sdk/lib/cron_sys.c + libc-libcxx-decision.
+#
+# Usage: bash build_picolibc.sh [-O<n>] [--no-malloc] [--keep-ll] [-v]
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,9 +30,11 @@ OUT="$HERE/picolibc.bc"
 OPT="-O1"
 KEEP_LL=0
 VERBOSE=0
+WITH_MALLOC=1
 for a in "$@"; do
   case "$a" in
     -O*) OPT="$a" ;;
+    --no-malloc) WITH_MALLOC=0 ;;
     --keep-ll) KEEP_LL=1 ;;
     -v|--verbose) VERBOSE=1 ;;
     *) echo "build_picolibc.sh: unknown arg '$a'" >&2; exit 2 ;;
@@ -47,7 +55,7 @@ INC=(-I"$HERE" -I"$L/include"
      -I"$L/stdio" -I"$L/time" -I"$L/search")
 
 CFLAGS=(--target=i386-elf -ffreestanding -emit-llvm -gline-tables-only "$OPT"
-        -D_LIBC -U_FORTIFY_SOURCE "${INC[@]}")
+        -D_LIBC -DNDEBUG -U_FORTIFY_SOURCE "${INC[@]}")
 
 # --- Source manifest: "<subdir>/<file>" relative to libc/, no .c suffix. ----
 # Curated to the standard C surface the ports need; extend as engines demand.
@@ -78,6 +86,14 @@ SOURCES=(
   ctype/isalnum ctype/isalpha ctype/isdigit ctype/isspace
   ctype/isupper ctype/islower ctype/isxdigit ctype/toupper ctype/tolower
 )
+
+# The malloc family is OPTIONAL (see --no-malloc). When included, picolibc owns
+# the canonical malloc/free/calloc/realloc; its only OS hook is sbrk() (the
+# embedder backs it over the cron heap). MALLOC_LOCK is a no-op under
+# __SINGLE_THREAD; -DNDEBUG drops realloc's assert (no __assert_func).
+if [ "$WITH_MALLOC" = 1 ]; then
+  SOURCES+=( stdlib/malloc stdlib/free stdlib/calloc stdlib/realloc )
+fi
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
