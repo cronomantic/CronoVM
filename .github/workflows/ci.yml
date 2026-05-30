@@ -26,38 +26,32 @@ jobs:
         with:
           submodules: recursive   # external/picolibc: the conformance test
                                    # builds picolibc.bc from it (else it fails)
-          # NB: this job runs the FULL ctest, including the C++ STL conformance
-          # fixtures (conf_pico_cpp_*) which compile with `-stdlib=libc++`, so
-          # libc++ must be installed below. Our freestanding <__config_site> is
-          # written against libc++ 22 (the maintainer's local toolchain); if
-          # Ubuntu's default clang/libc++ (currently 18) skews the knobs, pin
-          # clang-21 + libc++-21 via apt.llvm.org.
 
-      # Ubuntu 24.04 ships clang-18 by default. clang-18 -O1 emits
-      # ~10% more IR instructions per function than clang-21+, and
-      # cvm_float64.h's cvm_d_add doesn't fit in the translator's
-      # 245-slot SSA register budget under that inflation
-      # (`ran out of registers` error). Bumping to clang-21 from
-      # apt.llvm.org gives IR shape comparable to the maintainer's
-      # local LLVM 22 and clears the limit.
-      #
-      # The translator's C++ shim (llvm_c_compat.cpp) papers over
-      # LLVMGetSwitchCaseValue's late arrival in upstream llvm-c, so
-      # the LLVM-C header version doesn't matter; we pick clang-21
-      # purely for IR-shape compatibility.
-      # llvm-dev pulls headers + libs for the translator's LLVM-C
-      # bindings; clang is needed at fixture-build time even on the GCC
-      # row, because tools/translator/CMakeLists.txt resolves a separate
-      # clang binary for `--target=i386-elf -emit-llvm`. The translator's
-      # C++ shim (llvm_c_compat.cpp) papers over LLVMGetSwitchCaseValue's
-      # absence in older LLVM-C headers, and the new block-local SSA
-      # register reuse in the translator keeps even clang-18's inflated
-      # IR within budget — so the system's default LLVM is enough.
-      - name: Install LLVM + toolchain
+      # Pin clang-21 + libc++-21 from apt.llvm.org. This job runs the FULL ctest,
+      # incl. the C++ conformance fixtures (which compile with -stdlib=libc++).
+      # Ubuntu 24.04's default is clang/libc++ 18, which breaks us two ways:
+      #   (a) IR shape — clang-18 -O1 inflates IR ~10%; cvm_float64.h's cvm_d_add
+      #       overflowed the translator's 245-slot SSA budget, and clang-18 also
+      #       emits C++ exception IR the translator rejects (conf_cpp_exc).
+      #   (b) libc++ <= 18 validates several <__config_site> knobs with
+      #       `defined(X)` rather than the VALUE (ABI_FORCE, VENDOR_AVAILABILITY,
+      #       …), so our hand-written freestanding config — fine on libc++ 22 —
+      #       errors there. Fighting that knob-by-knob is endless.
+      # libc++ 21 ≈ the maintainer's local LLVM 22 (value-based checks; matching
+      # EH IR), so pinning it fixes both. The translator finds LLVM via
+      # llvm-config; cvm-cc + the fixtures use `clang`/`clang++` on PATH — point
+      # all three at the -21 tools via update-alternatives (needed on the gcc row
+      # too, where fixtures still compile with clang).
+      - name: Install LLVM 21 (clang + libc++) via apt.llvm.org
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang llvm llvm-dev \
-              libc++-dev libc++abi-dev cmake ninja-build
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 21
+          sudo apt-get install -y clang-21 llvm-21-dev \
+              libc++-21-dev libc++abi-21-dev cmake ninja-build
+          sudo update-alternatives --install /usr/bin/clang       clang       /usr/bin/clang-21 100
+          sudo update-alternatives --install /usr/bin/clang++     clang++     /usr/bin/clang++-21 100
+          sudo update-alternatives --install /usr/bin/llvm-config llvm-config /usr/bin/llvm-config-21 100
 
       - name: Configure
         run: cmake -B build -G Ninja -DCMAKE_C_COMPILER=${{ matrix.cc }}
