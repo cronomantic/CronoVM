@@ -40,8 +40,10 @@ jobs:
       # libc++ 21 ≈ the maintainer's local LLVM 22 (value-based checks; matching
       # EH IR), so pinning it fixes both. The translator finds LLVM via
       # llvm-config; cvm-cc + the fixtures use `clang`/`clang++` on PATH — point
-      # all three at the -21 tools via update-alternatives (needed on the gcc row
-      # too, where fixtures still compile with clang).
+      # tools to the -21 set by putting /usr/lib/llvm-21/bin first on PATH (it
+      # holds the UNVERSIONED names clang/clang++/llvm-config AND llvm-link/opt,
+      # which cvm-cc also execs — versioned-only installs miss those). Needed on
+      # the gcc row too, where the fixtures still compile with clang.
       - name: Install LLVM 21 (clang + libc++) via apt.llvm.org
         run: |
           wget -qO llvm.sh https://apt.llvm.org/llvm.sh
@@ -49,9 +51,7 @@ jobs:
           sudo ./llvm.sh 21
           sudo apt-get install -y clang-21 llvm-21-dev \
               libc++-21-dev libc++abi-21-dev cmake ninja-build
-          sudo update-alternatives --install /usr/bin/clang       clang       /usr/bin/clang-21 100
-          sudo update-alternatives --install /usr/bin/clang++     clang++     /usr/bin/clang++-21 100
-          sudo update-alternatives --install /usr/bin/llvm-config llvm-config /usr/bin/llvm-config-21 100
+          echo "/usr/lib/llvm-21/bin" >> "$GITHUB_PATH"
 
       - name: Configure
         run: cmake -B build -G Ninja -DCMAKE_C_COMPILER=${{ matrix.cc }}
