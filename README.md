@@ -2,21 +2,19 @@
 
 **A small, deterministic bytecode virtual machine with a real C/C++ toolchain.**
 
-Write your program in C or C++, compile it with Clang, and CronoVM turns the
-LLVM bitcode into a compact `.bin` image that runs identically on any host —
-desktop, console, or microcontroller. The runtime is a single static library
-with no dependencies, no JIT, and no garbage collector, so frame times stay
-predictable and the whole VM embeds in a few hundred kilobytes.
+Write a program in C or C++, compile it with Clang, and CronoVM turns the LLVM
+bitcode into a compact `.bin` image that runs identically on any host —
+desktop, server, or microcontroller. The runtime is a single static library
+with no dependencies, no JIT, and no garbage collector, so execution timing
+stays predictable and the whole VM embeds in a few hundred kilobytes.
 
-CronoVM is the spiritual successor to the Quake III VM: the same idea of a
-sandboxed, embeddable interpreter for shippable game/plugin logic, redesigned
-for modern toolchains (a 32-bit register machine, IEEE-754 floats, an LLVM
-front end, and cooperative coroutines).
-
-It is a **general-purpose VM toolkit**, not tied to any one application. The
-program that embeds it — a game engine, a scripting host, a plugin sandbox —
-lives in its own project; this repository ships the runtime, the toolchain,
-and a small set of runtime support libraries.
+It is a **general-purpose VM toolkit**, deliberately decoupled from any one
+application. Typical uses: sandbox untrusted or hot-swappable logic, ship
+portable plugins, embed a deterministic scripting or simulation layer, or run
+one compiled module unchanged across very different hosts. Whatever embeds it —
+an application, a scripting host, a plugin runtime — lives in its own project;
+this repository ships the runtime, the toolchain, and a small set of runtime
+support libraries.
 
 ---
 
@@ -29,7 +27,7 @@ and a small set of runtime support libraries.
   exceptions and RTTI. See [Language support](#language-support).
 - **Deterministic by design.** A bytecode interpreter with no JIT and no GC:
   no compilation pauses, no collection pauses, reproducible behaviour run to
-  run and host to host. Ideal for fixed-timestep simulations.
+  run and host to host — ideal for deterministic, reproducible workloads.
 - **Genuinely embeddable.** The runtime (`cvm`) is one static library in C11
   with zero third-party dependencies. Bring your own allocator (or none) via a
   hook, so it drops into FreeRTOS, Zephyr, or a bare-metal pool allocator.
@@ -40,39 +38,39 @@ and a small set of runtime support libraries.
   IEEE-754 binary32 floats native, 64-bit integers and doubles via small
   software runtimes) with a fully documented opcode set — see
   [docs/isa.md](docs/isa.md).
-- **Cooperative concurrency.** A single coroutine-swap opcode lets a cart build
-  fibers, generators, or a cooperative scheduler on top — the basis for
+- **Cooperative concurrency.** A single coroutine-swap opcode lets a program
+  build fibers, generators, or a cooperative scheduler on top — the basis for
   `std::thread`-style APIs without preemption.
 - **Sandboxed.** Every memory access is bounds-checked against the image's
-  regions; the cart can only reach the host through explicitly linked syscalls.
+  regions; the guest can only reach the host through explicitly linked syscalls.
 
 ## Quick example
 
 ```c
-/* game.c — compiled to game.bin by cvm-cc */
+/* program.c — compiled to program.bin by cvm-cc */
 int main(int n) { return n + 42; }
 ```
 
 ```sh
-cvm-cc game.c -o game.bin
+cvm-cc program.c -o program.bin
 ```
 
 ```c
-/* host.c — links the cvm static library, runs game.bin */
+/* host.c — links the cvm static library, runs program.bin */
 #include "cvm.h"
 #include <stdio.h>
 
 int main(void) {
     extern uint8_t *slurp(const char *, size_t *);   /* read file -> buffer */
     size_t   n;
-    uint8_t *blob = slurp("game.bin", &n);
+    uint8_t *blob = slurp("program.bin", &n);
 
     struct cvm_image img;
     cvm_load(blob, n, &img);
 
     int32_t result;
     cvm_run(&img, &result);                           /* result == 42 */
-    printf("game returned %d\n", result);
+    printf("program returned %d\n", result);
 
     cvm_image_free(&img);
     free(blob);
@@ -84,16 +82,13 @@ A complete, runnable version lives in [`examples/embedder/`](examples/embedder).
 ## How it works
 
 ```text
-  your code            Clang front end          CronoVM translator        host
- ┌──────────┐  -emit-  ┌──────────────┐         ┌────────────────┐    ┌──────────┐
- │ game.c   │ ───────▶ │  LLVM bitcode│ ──────▶ │  cvm-translate │──▶ │ game.bin │
- │ game.cpp │  llvm    │  (.bc)       │         │  → bytecode    │    └────┬─────┘
- └──────────┘          └──────────────┘         └────────────────┘         │ cvm_load / cvm_run
-                                                                           ▼
-                                                                    ┌──────────────┐
-                                                                    │ cvm (static  │
-                                                                    │ interpreter) │
-                                                                    └──────────────┘
+  program.c / program.cpp
+        │   clang -emit-llvm
+        ▼
+  LLVM bitcode (.bc)
+        │   cvm-translate          (build-time only; no LLVM in the shipped runtime)
+        ▼
+  program.bin  ──cvm_load / cvm_run──▶  cvm  (static interpreter, linked into the host)
 ```
 
 `cvm-cc` is a one-shot driver that runs the whole left side for you
@@ -159,11 +154,11 @@ find_package(CronoVM 0.4 REQUIRED)
 target_link_libraries(my_host PRIVATE cronovm::cvm)
 
 add_custom_command(
-    OUTPUT  ${CMAKE_BINARY_DIR}/game.bin
+    OUTPUT  ${CMAKE_BINARY_DIR}/program.bin
     COMMAND $<TARGET_FILE:cronovm::cvm-cc>
-            ${CMAKE_CURRENT_SOURCE_DIR}/game.c
-            -o ${CMAKE_BINARY_DIR}/game.bin
-    DEPENDS cronovm::cvm-cc ${CMAKE_CURRENT_SOURCE_DIR}/game.c
+            ${CMAKE_CURRENT_SOURCE_DIR}/program.c
+            -o ${CMAKE_BINARY_DIR}/program.bin
+    DEPENDS cronovm::cvm-cc ${CMAKE_CURRENT_SOURCE_DIR}/program.c
     VERBATIM)
 ```
 
@@ -207,7 +202,7 @@ shadow the C library's and `#include_next` through to them, pass the C headers
 dirs with libc++ first:
 
 ```sh
-cvm-cc game.cpp -idirafter path/to/picolibc/libc/include -o game.bin
+cvm-cc program.cpp -idirafter path/to/picolibc/libc/include -o program.bin
 ```
 
 Use `--libcxx-dir=PATH` to pin an explicit libc++ `v1` header tree (e.g. for a
@@ -239,8 +234,8 @@ int  cvm_heap_read (struct cvm_image *img, uint32_t addr, void *out, size_t n);
 int  cvm_heap_write(struct cvm_image *img, uint32_t addr, const void *in, size_t n);
 ```
 
-`cvm_link` binds a host C function to a name the cart imports — the cart's only
-channel to the outside world. `cvm_load_ex` takes a `cvm_allocator_t
+`cvm_link` binds a host C function to a name the guest program imports — its
+only channel to the outside world. `cvm_load_ex` takes a `cvm_allocator_t
 {alloc_fn, free_fn, user_data}` so targets without `malloc` can plug in their
 own (FreeRTOS heap_4, Zephyr `k_malloc`, a fixed pool, …).
 
@@ -252,7 +247,7 @@ own (FreeRTOS heap_4, Zephyr `k_malloc`, a fixed pool, …).
 - [docs/syscalls.md](docs/syscalls.md) — the host syscall ABI and how to link host functions.
 - [docs/translator.md](docs/translator.md) — the LLVM IR subset accepted and how it is lowered.
 - [CHANGELOG.md](CHANGELOG.md) — release history.
-- [docs/NEXT.md](docs/NEXT.md) — design rationale, roadmap, and deferred work.
+- [docs/NEXT.md](docs/NEXT.md) — internal design log: rationale, roadmap, and deferred work (references the project that drove CronoVM's development).
 
 ## Project status
 

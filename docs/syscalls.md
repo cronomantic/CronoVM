@@ -2,13 +2,13 @@
 
 CronoVM has no built-in I/O. All effects on the outside world go through
 **syscalls** — host C functions registered by name and invoked from bytecode
-with the `SYSCALL` opcode. Each game decides what syscalls to expose, so the
+with the `SYSCALL` opcode. Each program decides what syscalls to expose, so the
 mechanism is open by design.
 
 ## End-to-end flow
 
 ```text
-       user.c                     game.bin                   host program
+       user.c                     program.bin                   host program
    ┌───────────────┐          ┌──────────────┐          ┌──────────────────┐
    │ cvm_sys_print │  clang   │  IMPORTS:    │  load    │ cvm_link(img,    │
    │   _int(42);   │ ───────▶ │   "cvm_sys_  │ ───────▶ │  "cvm_sys_print  │
@@ -168,7 +168,7 @@ static int print_int(struct cvm_image *img, int32_t *regs, void *ud) {
 }
 
 int main(void) {
-    /* read game.bin into `bytes`/`len` here */
+    /* read program.bin into `bytes`/`len` here */
     struct cvm_image img;
     cvm_load(bytes, len, &img);
     cvm_link(&img, "cvm_sys_print_int", print_int, NULL);

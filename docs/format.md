@@ -84,7 +84,7 @@ access either the heap or the stack region.
 - No relocations. The translator emits absolute heap offsets for data
   references, since the VM owns the address space.
 - No ELF-style program headers, RPATH, or dynamic loading. There's exactly
-  one binary per game.
+  one binary per program.
 - No symbol table for code addresses. `CALL imm24` indexes a `FUNCS` table
   whose entries are absolute instruction indices into CODE; the loader
   populates the table once at load time.

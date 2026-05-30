@@ -5,11 +5,11 @@ CronoVM bytecode. It lives in `tools/translator/` and is built as
 `cvm-translate`.
 
 ```text
-user.c ──[ clang -emit-llvm ]──▶ user.bc ──[ cvm-translate ]──▶ game.bin
+user.c ──[ clang -emit-llvm ]──▶ user.bc ──[ cvm-translate ]──▶ program.bin
 ```
 
 The translator is **not** part of the runtime. The VM binary you ship with
-your game has zero LLVM dependency.
+your program has zero LLVM dependency.
 
 ## What the translator accepts
 
@@ -80,7 +80,7 @@ The subset is deliberately narrow. If your C code uses anything outside it,
 the translator rejects with a clear message; that's a feature, not a bug.
 Diagnostics carry the source `file:line` of the offending instruction (cvm-cc
 builds with `-gline-tables-only`), e.g.
-`translator: game.c:42: in 'frame': unsupported intrinsic 'llvm.sin.f32'`.
+`translator: program.c:42: in 'frame': unsupported intrinsic 'llvm.sin.f32'`.
 
 ### Types accepted
 
@@ -96,7 +96,7 @@ builds with `-gline-tables-only`), e.g.
 | ---- | ------ |
 | integers wider than `i64` | not in the subset |
 | `half`, `fp128`, `x86_fp80`, etc. (`float` and `double` excepted) | not in the subset (`float` is first-class; `double` is legalised) |
-| vectors (`<N x T>`) | not in the subset; games target scalars |
+| vectors (`<N x T>`) | not in the subset; programs target scalars |
 | address spaces other than 0 | not supported |
 | `token`, `x86_amx`, target_ext | not in the subset |
 
@@ -167,11 +167,11 @@ the gap is what's still being implemented:
   (atomic save+load of a 16-byte execution-context record). Unlike
   `setjmp`/`longjmp`, the call is **not** intercepted before the user-call
   lowering — it falls through the full call protocol (caller-saved SSA
-  spill to the cart's frame, arg placement in R0/R1) and only the final
+  spill to the program's frame, arg placement in R0/R1) and only the final
   `CALL` emission is replaced by `CORO_SWAP R0, R1`. This is essential:
   the VM register file is shared across coroutines, so the spill protocol
-  is what keeps the cart's live SSA regs valid across a yield. The SDK
-  ships the cart-facing wrappers in `sdk/include/coro.h`
+  is what keeps the program's live SSA regs valid across a yield. The SDK
+  ships the program-facing wrappers in `sdk/include/coro.h`
   (`cron_coro_init` / `cron_coro_swap` / `cron_coro_yield`).
 - syscall calls: any `cvm_sys_*` function call lowers to `SYSCALL`
 - user calls: direct calls to functions defined in the same module
@@ -520,7 +520,7 @@ The two-step pipeline is normally driven by the `cvm-cc` wrapper
 the bitcode through:
 
 ```sh
-cvm-cc user.c -o game.bin [--heap-reserve=N] [--region=name:size:dir]...
+cvm-cc user.c -o program.bin [--heap-reserve=N] [--region=name:size:dir]...
 ```
 
 Manual invocation, when you want to inspect the intermediate `.bc` or
@@ -528,7 +528,7 @@ override clang flags directly:
 
 ```sh
 clang --target=i386-elf -emit-llvm -O1 -I runtime/lib -c user.c -o user.bc
-cvm-translate user.bc -o game.bin
+cvm-translate user.bc -o program.bin
 ```
 
 ## Symbol sidecar (`CVM_SYMS`)
@@ -538,7 +538,7 @@ Setting the `CVM_SYMS` environment variable makes the translator write a
 per user function, `fid<TAB>entry_offset<TAB>name`.
 
 ```sh
-CVM_SYMS=1 cvm-cc user.c -o game.bin   # also writes game.bin.sym
+CVM_SYMS=1 cvm-cc user.c -o program.bin   # also writes program.bin.sym
 ```
 
 `fid` is the runtime **FUNCS index** — i.e. exactly the value a `CALL`/`CALLR`

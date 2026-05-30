@@ -409,7 +409,7 @@ Pipeline runs end-to-end exactly as before:
 ```text
 user.c → clang --target=i386-elf -O1 -emit-llvm → user.bc
        → cvm-translate [--heap-reserve=N] [--stack-reserve=N]
-                       [--region=name:size[:dir]]... -o      → game.bin
+                       [--region=name:size[:dir]]... -o      → program.bin
        → cvm_run / cvm_run_args                              → result
 ```
 
@@ -511,7 +511,7 @@ Two translator fixes piggybacked on the same step:
 Shipped. `tools/cvm-cc/cvm-cc.c` is a single-command driver:
 
 ```sh
-cvm-cc user.c -o game.bin --heap-reserve=4M --region=fb:64K:w
+cvm-cc user.c -o program.bin --heap-reserve=4M --region=fb:64K:w
 ```
 
 Pipeline: `.c → <output>.tmp.bc → .bin → rm <tmp>` (unless
@@ -526,7 +526,7 @@ works without `-I`.
 
 Naming: `cvm-cc` follows the `cvm-translate` pattern. `cc` is the
 universal "C compiler driver" suffix (gcc, clang, tcc). The earlier
-`gamecc` working name was rejected because it baked "game" into the
+`gamecc` working name was rejected because it baked "program" into the
 toolchain when the VM is deliberately generic.
 
 Implementation notes worth keeping in head:
@@ -850,7 +850,7 @@ Three notable choices:
 
 Test fixtures: `examples/installed_consumer/` is a stand-alone
 CMake project that does `find_package(CronoVM)` and reuses the
-embedder's `host.c` + `game.c` verbatim. CronoVM's own ctest drives
+embedder's `host.c` + `program.c` verbatim. CronoVM's own ctest drives
 the full chain via four sequential tests (`installed_install` →
 `installed_configure` → `installed_build` → `installed_run`,
 chained via `FIXTURES_SETUP` / `FIXTURES_REQUIRED`). The install
