@@ -43,7 +43,7 @@ PICOLIBC_BC="$RTLIB/picolibc.bc"
 if printf '%s\n' "${fixtures[@]}" | grep -q 'conf_pico'; then
   LLVM_LINK="$(dirname "$CLANG")/llvm-link"
   [[ -x "$LLVM_LINK" || -x "$LLVM_LINK.exe" ]] || LLVM_LINK="llvm-link"
-  if ! CLANG="$CLANG" LLVM_LINK="$LLVM_LINK" bash "$RTLIB/build_picolibc.sh" >/dev/null; then
+  if ! CLANG="$CLANG" LLVM_LINK="$LLVM_LINK" bash "$RTLIB/build_picolibc.sh" --with-stdio >/dev/null; then
     echo "run_conformance.sh: failed to build picolibc.bc" >&2; exit 1
   fi
 fi

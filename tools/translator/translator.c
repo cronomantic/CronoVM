@@ -2425,6 +2425,16 @@ static void cg_emit_i64_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
         cg->had_error = 1;
         break;
     }
+    case LLVMBitCast: {
+        /* i64 result of a bitcast (e.g. `asuint64`: double->i64 in
+         * math_config.h's isnan/frexp bit-twiddling, used by tinystdio's float
+         * formatter/scanner). i64 and f64 share the 2-slot wide repr, so a
+         * bitcast is a pure reinterpret — copy the operand's two words. */
+        uint8_t lo, hi;
+        if (cg_i64_read(cg, LLVMGetOperand(i, 0), &lo, &hi)) break;
+        cg_i64_write(cg, idx, lo, hi);
+        break;
+    }
     default:
         ERR(cg->fn_name, "i64 operation '%s' not yet supported "
                          "(mul/div/rem, phi, select and i64-returning calls "
@@ -3298,6 +3308,15 @@ static void cg_emit_f64_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
             "fabs/copysign.f64 are; a general double-returning function needs "
             "the 64-bit calling convention, a later phase)", cname);
         cg->had_error = 1;
+        break;
+    }
+    case LLVMBitCast: {
+        /* f64 result of a bitcast (`asdouble`: i64->double, the reverse of the
+         * i64 case above). Pure reinterpret — f64 and i64 share the 2-slot wide
+         * repr, so copy the operand's two words. */
+        uint8_t lo, hi;
+        if (cg_i64_read(cg, LLVMGetOperand(i, 0), &lo, &hi)) break;
+        cg_i64_write(cg, idx, lo, hi);
         break;
     }
     default:

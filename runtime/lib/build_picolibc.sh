@@ -31,10 +31,12 @@ OPT="-O1"
 KEEP_LL=0
 VERBOSE=0
 WITH_MALLOC=1
+WITH_STDIO=0
 for a in "$@"; do
   case "$a" in
     -O*) OPT="$a" ;;
     --no-malloc) WITH_MALLOC=0 ;;
+    --with-stdio) WITH_STDIO=1 ;;
     --keep-ll) KEEP_LL=1 ;;
     -v|--verbose) VERBOSE=1 ;;
     *) echo "build_picolibc.sh: unknown arg '$a'" >&2; exit 2 ;;
@@ -52,7 +54,7 @@ command -v "$LLVM_LINK" >/dev/null || { echo "llvm-link not found" >&2; exit 1; 
 L="$PICO/libc"
 INC=(-I"$HERE" -I"$L/include"
      -I"$L/locale" -I"$L/ctype" -I"$L/string" -I"$L/stdlib"
-     -I"$L/stdio" -I"$L/time" -I"$L/search")
+     -I"$L/stdio" -I"$L/time" -I"$L/search" -I"$L/../libm/common")
 
 CFLAGS=(--target=i386-elf -ffreestanding -emit-llvm -gline-tables-only "$OPT"
         -D_LIBC -DNDEBUG -U_FORTIFY_SOURCE "${INC[@]}")
@@ -93,6 +95,31 @@ SOURCES=(
 # __SINGLE_THREAD; -DNDEBUG drops realloc's assert (no __assert_func).
 if [ "$WITH_MALLOC" = 1 ]; then
   SOURCES+=( stdlib/malloc stdlib/free stdlib/calloc stdlib/realloc )
+fi
+
+# tinystdio — the full stdio (printf/scanf/FILE/fopen). OPTIONAL (--with-stdio)
+# because it leaves a POSIX backend (open/read/write/lseek/close) + __isnand
+# undefined for the embedder; a fixture/cart that doesn't supply those must not
+# pull it in. The variant wrappers (vfprintf.c etc.) self-#include their cores;
+# %f uses the CLASSIC dtoa_engine (f64 soft-float), not ryu. See cron_sys.c.
+if [ "$WITH_STDIO" = 1 ]; then
+  SOURCES+=(
+    stdio/vfprintf stdio/vfscanf
+    stdio/printf stdio/fprintf stdio/vprintf
+    stdio/snprintf stdio/vsnprintf stdio/sprintf stdio/vsprintf
+    stdio/sscanf stdio/scanf stdio/fscanf
+    stdio/bufio stdio/bufio_close stdio/bufio_close_nf
+    stdio/filestrget stdio/filestrput stdio/fseeko
+    stdio/dtoa_engine stdio/dtox_engine stdio/ftoa_engine
+    stdio/atof_engine stdio/atod_engine
+    stdio/puts stdio/putchar stdio/fputc stdio/fputs
+    stdio/fgetc stdio/fgets stdio/getchar stdio/ungetc
+    stdio/fopen stdio/fdopen stdio/fclose stdio/fread stdio/fwrite
+    stdio/fseek stdio/ftell stdio/fflush
+    stdio/clearerr stdio/feof stdio/ferror stdio/fileno
+    stdio/posixiob_stdin stdio/posixiob_stdout stdio/posixiob_stderr
+    stdio/sflags stdio/fdevopen
+  )
 fi
 
 WORK="$(mktemp -d)"

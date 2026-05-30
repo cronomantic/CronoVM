@@ -38,3 +38,49 @@ void *sbrk(ptrdiff_t incr) {
     g_brk += (size_t)incr;
     return p;
 }
+
+/* ---- stdio machine port (when picolibc.bc is built --with-stdio) -------- *
+ * tinystdio's FILE layer sits on POSIX open/read/write/lseek/close; its float
+ * formatter calls __isnand. A real cart routes these to cron syscalls + the
+ * RAM-FS/ROM (cron_sys.c). For the standalone test: console (fd 1/2) is
+ * discarded, and fd>=3 is ONE in-memory file (enough for an fopen round-trip).*/
+int __isnand(double x) { return x != x; }
+
+#define PICO_FILE_BYTES (1u << 16)
+static unsigned char g_file[PICO_FILE_BYTES];
+static size_t g_file_len = 0;     /* logical EOF */
+static size_t g_file_pos = 0;     /* read/write cursor (shared, single fd) */
+
+/* O_TRUNC=0x200 (picolibc fcntl.h); good enough for the fixture's "w"/"r". */
+int open(const char *path, int flags, ...) {
+    (void)path;
+    if (flags & 0x200) { g_file_len = 0; }   /* O_TRUNC */
+    g_file_pos = 0;
+    return 3;
+}
+long write(int fd, const void *buf, unsigned long n) {
+    if (fd == 1 || fd == 2) return (long)n;   /* console: discard */
+    const unsigned char *p = (const unsigned char *)buf;
+    for (unsigned long i = 0; i < n; ++i) {
+        if (g_file_pos >= PICO_FILE_BYTES) break;
+        g_file[g_file_pos++] = p[i];
+        if (g_file_pos > g_file_len) g_file_len = g_file_pos;
+    }
+    return (long)n;
+}
+long read(int fd, void *buf, unsigned long n) {
+    if (fd < 3) return 0;
+    unsigned char *p = (unsigned char *)buf;
+    unsigned long i = 0;
+    for (; i < n && g_file_pos < g_file_len; ++i) p[i] = g_file[g_file_pos++];
+    return (long)i;
+}
+long lseek(int fd, long off, int whence) {
+    if (fd < 3) return -1;
+    long base = (whence == 1) ? (long)g_file_pos : (whence == 2) ? (long)g_file_len : 0;
+    long np = base + off;
+    if (np < 0) { errno = 22; return -1; }   /* EINVAL */
+    g_file_pos = (size_t)np;
+    return np;
+}
+int close(int fd) { (void)fd; return 0; }
