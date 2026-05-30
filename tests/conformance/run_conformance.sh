@@ -58,9 +58,14 @@ for src in "${fixtures[@]}"; do
   # picolibc fixtures additionally link picolibc.bc + the machine-port stub on
   # the VM side, with picolibc's headers on the include path. The native oracle
   # uses the host libc (no picolibc include path, so host headers win).
+  # C++ fixtures must pass picolibc's C headers with -idirafter (NOT -I) so
+  # libc++'s wrapper <math.h>/<cstring>/... shadow them and #include_next through;
+  # -I RTLIB stays high-priority (our __config_site / __external_threading win).
   pico=()
   if [[ "$name" == conf_pico* ]]; then
-    pico=( "$HERE/pico_machine.c" "$PICOLIBC_BC" -I "$RTLIB" -I "$PICO_INC" )
+    pico_inc_flag="-I"
+    [[ "$src" == *.cpp ]] && pico_inc_flag="-idirafter"
+    pico=( "$HERE/pico_machine.c" "$PICOLIBC_BC" -I "$RTLIB" "$pico_inc_flag" "$PICO_INC" )
   fi
 
   if [[ "$src" == *.cpp ]]; then

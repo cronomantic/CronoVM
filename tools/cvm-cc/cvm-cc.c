@@ -74,14 +74,21 @@
  * the module needs linked. Must match the CVM_PROBE_* values in
  * tools/translator/translator.c. The two bits are disjoint, so they OR/AND
  * cleanly (both => 30). */
-#define CVM_PROBE_F64 10   /* uses double -> link the f64 runtime  */
-#define CVM_PROBE_I64 20   /* uses i64 div/rem -> link the i64 runtime */
+#define CVM_PROBE_F64    10   /* uses double -> link the f64 runtime  */
+#define CVM_PROBE_I64    20   /* uses i64 div/rem -> link the i64 runtime */
+#define CVM_PROBE_CXXSTL 64   /* references the std exception ABI -> link
+                               * cvm_cxxstl (bit-disjoint from F64|I64) */
 
 /* Basenames of the soft runtime TUs, auto-linked on demand. They live in the
  * runtime dir and are never hand-listed by the user. */
 #define CVM_F64_RUNTIME_TU "cvm_float64_rt.c"
 #define CVM_I64_RUNTIME_TU "cvm_int64_rt.c"
-#define CVM_CXX_RUNTIME_TU "cvm_cxxrt.cpp"
+/* C++ ABI runtime TUs auto-linked when any input is C++. cvm_cxxrt: operator
+ * new/delete, __cxa_*, the EH unwinder, RTTI. cvm_cxxstl: the out-of-line std
+ * exception hierarchy (std::exception/logic_error/length_error/bad_alloc/...)
+ * the STL headers reference. Both are .cpp, compiled against libc++. */
+#define CVM_CXX_RUNTIME_TUS { "cvm_cxxrt.cpp", "cvm_cxxstl.cpp" }
+#define CVM_CXX_RUNTIME_TU_COUNT 2
 
 #define MAX_REGIONS         64
 #define MAX_INCLUDE_DIRS    32
@@ -605,10 +612,11 @@ int main(int argc, char **argv) {
 
     /* Auto-link the soft runtimes a program needs. Probe each compiled module
      * (cvm-translate --probe-runtime returns a CVM_PROBE_* bitmask: f64 for
-     * `double`, i64 for i64 div/rem); then compile and add each needed runtime
-     * TU so the translator's legaliser finds the __cvm_* helpers. Integer-only
-     * programs link nothing extra. A runtime the user already listed is left
-     * alone (no duplicate-symbol llvm-link error). */
+     * `double`, i64 for i64 div/rem, cxxstl for the std exception ABI); then
+     * compile and add each needed runtime TU so the translator's legaliser finds
+     * the helpers. Integer-only programs link nothing extra. A runtime the user
+     * already listed is left alone (no duplicate-symbol llvm-link error). */
+    int need_cxxstl = 0;   /* module references the std exception ABI */
     if (!fail) {
         struct { int bit; const char *tu; int listed; } rts[2] = {
             { CVM_PROBE_F64, CVM_F64_RUNTIME_TU, 0 },
@@ -629,15 +637,17 @@ int main(int argc, char **argv) {
             pargv[pn++] = bc_paths[i];
             pargv[pn]   = NULL;
             int prc = run_cmd(&cli, pargv);
-            if (prc & ~(CVM_PROBE_F64 | CVM_PROBE_I64)) {
+            if (prc & ~(CVM_PROBE_F64 | CVM_PROBE_I64 | CVM_PROBE_CXXSTL)) {
                 fprintf(stderr, "cvm-cc: runtime probe failed on %s "
                         "(exit %d)\n", bc_paths[i], prc);
                 fail = 1;
                 break;
             }
             need |= prc;
-            if ((need & CVM_PROBE_F64) && (need & CVM_PROBE_I64)) break;
+            /* No early break: must probe every module to catch a late cxxstl
+             * reference (the f64/i64 scan is cheap). */
         }
+        need_cxxstl = (need & CVM_PROBE_CXXSTL) != 0;
 
         for (int j = 0; j < 2 && !fail; ++j) {
             if (!(need & rts[j].bit) || rts[j].listed) continue;
@@ -664,38 +674,46 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Auto-link the C++ ABI runtime when any input is C++: operator new/delete
-     * (referenced by every class with a virtual destructor, via the deleting-
-     * dtor vtable slot), __cxa_pure_virtual, the local-static guards, and
-     * __cxa_atexit. operator new/delete forward to the cart's malloc/free
-     * (provided by the SDK libc). Skipped if the user already listed it. */
+    /* Auto-link the C++ ABI runtime TUs when any input is C++:
+     *  - cvm_cxxrt.cpp: operator new/delete (referenced by every class with a
+     *    virtual destructor via the deleting-dtor vtable slot), __cxa_*, the
+     *    local-static guards, the EH unwinder, RTTI.
+     *  - cvm_cxxstl.cpp: the out-of-line std exception hierarchy
+     *    (std::exception/logic_error/length_error/bad_alloc/...) the STL headers
+     *    reference. Harmless for non-STL C++ (its defs go unused).
+     * operator new/delete + malloc/free come from the cart's C library. A TU the
+     * user already listed is skipped (no duplicate-symbol llvm-link error). */
     if (!fail && any_cpp) {
-        int listed = 0;
-        for (int i = 0; i < cli.input_count; ++i)
-            if (strcmp(basename_of(cli.inputs[i]), CVM_CXX_RUNTIME_TU) == 0)
-                listed = 1;
-        if (!listed) {
+        const char *cxx_tus[] = CVM_CXX_RUNTIME_TUS;
+        for (int j = 0; j < CVM_CXX_RUNTIME_TU_COUNT && !fail; ++j) {
+            /* cvm_cxxrt (j==0) is freestanding and always linked. cvm_cxxstl
+             * (j>=1) pulls libc++'s <stdexcept>/<new> (which need the cart's C
+             * headers) so it is linked ONLY when the module actually references
+             * the std exception ABI — otherwise it can't even compile and a
+             * non-STL C++ cart shouldn't pay for it. */
+            if (j >= 1 && !need_cxxstl) continue;
+            int listed = 0;
+            for (int i = 0; i < cli.input_count; ++i)
+                if (strcmp(basename_of(cli.inputs[i]), cxx_tus[j]) == 0)
+                    listed = 1;
+            if (listed) continue;
             if (bc_count >= MAX_INPUTS) {
                 fprintf(stderr, "cvm-cc: too many inputs to auto-link %s "
-                        "(max %d)\n", CVM_CXX_RUNTIME_TU, MAX_INPUTS);
+                        "(max %d)\n", cxx_tus[j], MAX_INPUTS);
                 fail = 1;
-            } else {
-                char rt_src[1100];
-                snprintf(rt_src, sizeof rt_src, "%s/%s",
-                         cli.runtime_dir, CVM_CXX_RUNTIME_TU);
-                char *bc = (char *)malloc(outlen + 24);
-                if (!bc) { perror("malloc"); fail = 1; }
-                else {
-                    snprintf(bc, outlen + 24, "%s.rtcxx.tmp.bc", cli.output);
-                    if (compile_c_to_bc(&cli, clang, rt_src, bc) != 0) {
-                        free(bc); fail = 1;
-                    } else {
-                        bc_paths[bc_count] = bc;
-                        bc_owned[bc_count] = 1;
-                        ++bc_count;
-                    }
-                }
+                break;
             }
+            char rt_src[1100];
+            snprintf(rt_src, sizeof rt_src, "%s/%s", cli.runtime_dir, cxx_tus[j]);
+            char *bc = (char *)malloc(outlen + 24);
+            if (!bc) { perror("malloc"); fail = 1; break; }
+            snprintf(bc, outlen + 24, "%s.rtcxx%d.tmp.bc", cli.output, j);
+            if (compile_c_to_bc(&cli, clang, rt_src, bc) != 0) {
+                free(bc); fail = 1; break;
+            }
+            bc_paths[bc_count] = bc;
+            bc_owned[bc_count] = 1;
+            ++bc_count;
         }
     }
 

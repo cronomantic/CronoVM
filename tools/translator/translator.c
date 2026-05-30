@@ -30,8 +30,12 @@ extern LLVMValueRef cvm_llvm_get_switch_case_value(LLVMValueRef SI, unsigned i);
 /* --probe-runtime exit code: a bitmask of which soft runtimes the module
  * needs linked. 0 = none; the bits combine (e.g. 30 = both). Distinct from the
  * 1/2 used for IO/usage errors. cvm-cc relies on these exact values. */
-#define CVM_PROBE_F64 10   /* uses double -> link cvm_float64_rt */
-#define CVM_PROBE_I64 20   /* uses i64 div/rem -> link cvm_int64_rt */
+#define CVM_PROBE_F64    10   /* uses double -> link cvm_float64_rt */
+#define CVM_PROBE_I64    20   /* uses i64 div/rem -> link cvm_int64_rt */
+#define CVM_PROBE_CXXSTL 64   /* references the std exception ABI -> link
+                               * cvm_cxxstl. 64 is bit-disjoint from 10|20 (so
+                               * they OR cleanly) and 10|20|64=94 stays a valid
+                               * 8-bit exit code. */
 
 static int g_errors = 0;
 
@@ -6623,8 +6627,39 @@ int cvm_fuzz_translate_buffer(const uint8_t *data, size_t len) {
  * appears (these lower to a runtime call; the other i64 ops are inline).
  * cvm-cc consults this (via --probe-runtime) to auto-link the matching TU
  * only when needed, so integer-only modules carry no soft code. */
+/* True if `name` is one of the std exception ABI symbols that cvm_cxxstl.cpp
+ * provides (the mangled class tokens are unique to that hierarchy). Used to
+ * detect, from undefined references, that a module pulls in the standard
+ * library exception types so cvm-cc auto-links cvm_cxxstl only then (it can't
+ * compile freestanding — it needs the C library headers). */
+static int cg_name_is_std_exc(const char *n) {
+    static const char *const toks[] = {
+        "9exception",      "11logic_error",   "13runtime_error",
+        "12length_error",  "12out_of_range",  "12domain_error",
+        "16invalid_argument", "11range_error", "14overflow_error",
+        "15underflow_error", "9bad_alloc",     "20bad_array_new_length",
+        "17__libcpp_refstring",
+    };
+    if (!n) return 0;
+    for (unsigned i = 0; i < sizeof toks / sizeof toks[0]; ++i)
+        if (strstr(n, toks[i])) return 1;
+    return 0;
+}
+
 static int module_runtime_needs(LLVMModuleRef mod) {
     int need = 0;
+    /* std exception ABI: any UNDEFINED reference (function or global — typeinfo
+     * and vtables are globals) to the std exception classes => link cvm_cxxstl. */
+    for (LLVMValueRef fn = LLVMGetFirstFunction(mod);
+         fn; fn = LLVMGetNextFunction(fn))
+        if (LLVMIsDeclaration(fn) && cg_name_is_std_exc(LLVMGetValueName(fn)))
+            { need |= CVM_PROBE_CXXSTL; break; }
+    if (!(need & CVM_PROBE_CXXSTL))
+        for (LLVMValueRef g = LLVMGetFirstGlobal(mod);
+             g; g = LLVMGetNextGlobal(g))
+            if (LLVMIsDeclaration(g) && cg_name_is_std_exc(LLVMGetValueName(g)))
+                { need |= CVM_PROBE_CXXSTL; break; }
+
     for (LLVMValueRef fn = LLVMGetFirstFunction(mod);
          fn; fn = LLVMGetNextFunction(fn))
     {
@@ -6793,8 +6828,9 @@ int main(int argc, char **argv) {
      * returned 1, so the probe codes can't collide with those.) */
     if (probe_runtime) {
         int need = module_runtime_needs(mod);
-        if (need & CVM_PROBE_F64) printf("f64\n");
-        if (need & CVM_PROBE_I64) printf("i64\n");
+        if (need & CVM_PROBE_F64)    printf("f64\n");
+        if (need & CVM_PROBE_I64)    printf("i64\n");
+        if (need & CVM_PROBE_CXXSTL) printf("cxxstl\n");
         LLVMDisposeModule(mod);
         LLVMContextDispose(ctx);
         return need;
