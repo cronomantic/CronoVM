@@ -70,9 +70,24 @@ for src in "${fixtures[@]}"; do
   # -I RTLIB stays high-priority (our __config_site / __external_threading win).
   pico=()
   if [[ "$name" == conf_pico* ]]; then
-    pico_inc_flag="-I"
-    [[ "$src" == *.cpp ]] && pico_inc_flag="-idirafter"
-    pico=( "$HERE/pico_machine.c" "$PICOLIBC_BC" -I "$RTLIB" "$pico_inc_flag" "$PICO_INC" )
+    pico=( "$HERE/pico_machine.c" "$PICOLIBC_BC" -I "$RTLIB" )
+    if [[ "$src" == *.cpp ]]; then
+      # C++: put libc++ AND picolibc as explicit -isystem dirs, libc++ FIRST, so
+      # both sit above any HOST C library (glibc in /usr/include on Linux). Then
+      # libc++'s wrapper <string.h>/<cmath>/... win and their #include_next
+      # reaches picolibc — NOT the host headers (which broke the Linux CI:
+      # /usr/include/string.h pulling bits/libc-header-start.h). --libcxx-dir
+      # makes cvm-cc emit `-nostdinc++ -isystem <v1>`; the -isystem PICO_INC then
+      # follows it. Derive the toolchain's libc++ v1 dir from the fixture clang.
+      libcxx_v1="$(cd "$(dirname "$CLANG")/../include/c++/v1" 2>/dev/null && pwd)"
+      if [[ -n "$libcxx_v1" ]]; then
+        pico+=( --libcxx-dir="$libcxx_v1" -isystem "$PICO_INC" )
+      else
+        pico+=( -idirafter "$PICO_INC" )   # bare-metal clang: no host C lib to shadow
+      fi
+    else
+      pico+=( -I "$PICO_INC" )
+    fi
   fi
 
   if [[ "$src" == *.cpp ]]; then
