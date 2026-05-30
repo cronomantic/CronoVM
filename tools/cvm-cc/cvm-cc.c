@@ -94,11 +94,13 @@
 #define MAX_INCLUDE_DIRS    32
 #define MAX_DEFINES         32
 #define MAX_PASSTHRU        64   /* verbatim clang args: -isystem/-idirafter/-std */
-#define MAX_INPUTS         256   /* a multi-file port (e.g. Crispy) is ~100+ TUs */
+#define INPUTS_INIT_CAP    256   /* initial capacity; grows dynamically (a whole-
+                                  * engine build — e.g. UQM — is ~270 TUs) */
 
 struct cli {
-    const char *inputs[MAX_INPUTS]; /* .c and/or .bc, >=1 positional */
+    const char **inputs;        /* .c and/or .bc, >=1 positional (grown) */
     int         input_count;
+    int         input_cap;
     const char *output;         /* -o, required */
     const char *opt_level;      /* -O<n>, default "1" */
     const char *clang_path;     /* --clang= */
@@ -459,10 +461,15 @@ static int parse_argv(int argc, char **argv, struct cli *cli) {
             fprintf(stderr, "cvm-cc: unknown option '%s'\n", a);
             usage(stderr);
             return 2;
-        } else if (cli->input_count >= MAX_INPUTS) {
-            fprintf(stderr, "cvm-cc: too many input files (max %d)\n", MAX_INPUTS);
-            return 2;
         } else {
+            if (cli->input_count >= cli->input_cap) {
+                int newcap = cli->input_cap ? cli->input_cap * 2 : INPUTS_INIT_CAP;
+                const char **grown = (const char **)realloc(
+                    (void *)cli->inputs, (size_t)newcap * sizeof *grown);
+                if (!grown) { perror("realloc"); return 1; }
+                cli->inputs = grown;
+                cli->input_cap = newcap;
+            }
             cli->inputs[cli->input_count++] = a;
         }
     }
@@ -578,10 +585,13 @@ int main(int argc, char **argv) {
     /* Per-input bitcode. A .c is compiled to an owned temp .bc next to the
      * output (predictable name keeps temp-dir logic out of this tool); a .bc
      * input is used in place (not owned). --keep-bc surfaces the temps. */
-    char  *bc_paths[MAX_INPUTS];
-    int    bc_owned[MAX_INPUTS];
+    /* One .bc per input + up to 4 auto-linked runtime TUs (f64/i64 + 2 C++). */
+    int    bc_cap = cli.input_count + 8;
+    char **bc_paths = (char **)malloc((size_t)bc_cap * sizeof *bc_paths);
+    int   *bc_owned = (int  *)malloc((size_t)bc_cap * sizeof *bc_owned);
     int    bc_count = 0;
-    int    fail = 0;
+    int    fail = (!bc_paths || !bc_owned);
+    if (fail) perror("malloc");
     const char *clang = cli.clang_path ? cli.clang_path : "clang";
     size_t outlen = strlen(cli.output);
 
@@ -651,9 +661,9 @@ int main(int argc, char **argv) {
 
         for (int j = 0; j < 2 && !fail; ++j) {
             if (!(need & rts[j].bit) || rts[j].listed) continue;
-            if (bc_count >= MAX_INPUTS) {
+            if (bc_count >= bc_cap) {
                 fprintf(stderr, "cvm-cc: too many inputs to auto-link %s "
-                        "(max %d)\n", rts[j].tu, MAX_INPUTS);
+                        "(max %d)\n", rts[j].tu, bc_cap);
                 fail = 1;
                 break;
             }
@@ -697,9 +707,9 @@ int main(int argc, char **argv) {
                 if (strcmp(basename_of(cli.inputs[i]), cxx_tus[j]) == 0)
                     listed = 1;
             if (listed) continue;
-            if (bc_count >= MAX_INPUTS) {
+            if (bc_count >= bc_cap) {
                 fprintf(stderr, "cvm-cc: too many inputs to auto-link %s "
-                        "(max %d)\n", cxx_tus[j], MAX_INPUTS);
+                        "(max %d)\n", cxx_tus[j], bc_cap);
                 fail = 1;
                 break;
             }
@@ -732,20 +742,24 @@ int main(int argc, char **argv) {
             else {
                 snprintf(linked, outlen + 16, "%s.linked.bc", cli.output);
                 char *ll = find_llvm_link(&cli);
-                char *largv[MAX_INPUTS + 8];
-                int   n = 0;
-                largv[n++] = ll;
-                for (int i = 0; i < bc_count; ++i) largv[n++] = bc_paths[i];
-                largv[n++] = (char *)"-o";
-                largv[n++] = linked;
-                largv[n] = NULL;
-                int lrc = run_cmd(&cli, largv);
-                free(ll);
-                if (lrc != 0) {
-                    fprintf(stderr, "cvm-cc: llvm-link failed (exit %d)\n", lrc);
-                    fail = 1;
-                } else {
-                    module = linked;
+                char **largv = (char **)malloc((size_t)(bc_count + 8) * sizeof *largv);
+                if (!largv) { perror("malloc"); free(ll); fail = 1; }
+                else {
+                    int   n = 0;
+                    largv[n++] = ll;
+                    for (int i = 0; i < bc_count; ++i) largv[n++] = bc_paths[i];
+                    largv[n++] = (char *)"-o";
+                    largv[n++] = linked;
+                    largv[n] = NULL;
+                    int lrc = run_cmd(&cli, largv);
+                    free(ll);
+                    free(largv);
+                    if (lrc != 0) {
+                        fprintf(stderr, "cvm-cc: llvm-link failed (exit %d)\n", lrc);
+                        fail = 1;
+                    } else {
+                        module = linked;
+                    }
                 }
             }
         }
@@ -818,6 +832,9 @@ int main(int argc, char **argv) {
     }
     for (int i = 0; i < bc_count; ++i)
         if (bc_owned[i]) free(bc_paths[i]);
+    free(bc_paths);
+    free(bc_owned);
+    free((void *)cli.inputs);
     free(linked);
     free(opt_out);
 
