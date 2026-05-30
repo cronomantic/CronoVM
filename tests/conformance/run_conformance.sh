@@ -55,6 +55,13 @@ for src in "${fixtures[@]}"; do
   bin="$TMP/$name.bin"
   nat="$TMP/$name.exe"
 
+  # conf_alias relies on __attribute__((alias)), which Darwin/Mach-O does not
+  # support, so the NATIVE oracle can't build on macOS. The VM-side GlobalAlias
+  # lowering is still exercised on Linux/Windows; skip the fixture on macOS.
+  if [[ "$name" == "conf_alias" && "$(uname -s)" == Darwin ]]; then
+    printf 'SKIP       %-22s (alias attribute unsupported on darwin)\n' "$name"; continue
+  fi
+
   # picolibc fixtures additionally link picolibc.bc + the machine-port stub on
   # the VM side, with picolibc's headers on the include path. The native oracle
   # uses the host libc (no picolibc include path, so host headers win).
@@ -78,7 +85,7 @@ for src in "${fixtures[@]}"; do
   fi
 
   if [[ $vmrc -ne 0 ]]; then
-    msg="$(printf '%s\n' "$vmlog" | grep -iE "not yet lowered|outside the supported|unsupported|callee has no" | head -1)"
+    msg="$(printf '%s\n' "$vmlog" | grep -iE "not yet lowered|outside the supported|unsupported|callee has no|fatal error|error:" | head -1)"
     printf 'GAP        %-22s %s\n' "$name" "${msg:-(cvm-cc exit $vmrc)}"; gap=$((gap+1)); continue
   fi
   if ! "${natcmd[@]}" 2>"$TMP/nat.err"; then
