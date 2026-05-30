@@ -266,6 +266,13 @@ static int opcode_in_subset(LLVMOpcode op) {
      * __cvm_eh_exc/__cvm_eh_sel, and `resume` calls __cvm_eh_resume. The MSVC EH
      * model (CatchPad/CleanupPad/…) stays rejected — we only see Itanium IR. */
     case LLVMInvoke: case LLVMLandingPad: case LLVMResume:
+    /* Atomic read-modify-write + fence. The VM is COOPERATIVE (no preemption —
+     * a context runs until it explicitly swaps), so an atomicrmw is just
+     * load/op/store and a fence is a no-op; both are correct by construction.
+     * Lets std::atomic / std::shared_ptr's refcount translate. (cmpxchg is still
+     * rejected — no cart needs it yet; see reject_reason.) Atomic load/store are
+     * plain LLVMLoad/LLVMStore and already accepted. */
+    case LLVMAtomicRMW: case LLVMFence:
     /* freeze: lowered as identity (pass the operand through). clang emits it
      * to block poison propagation, e.g. around div/rem and the i64 legaliser's
      * volatile operands. Since the VM never exploits UB, identity is correct. */
@@ -294,8 +301,10 @@ static const char *reject_reason(LLVMOpcode op) {
     case LLVMCleanupPad: case LLVMCatchSwitch:
         return "MSVC/SEH exception model not supported (the Itanium model — "
                "invoke/landingpad/resume — is)";
-    case LLVMAtomicCmpXchg: case LLVMAtomicRMW: case LLVMFence:
-        return "atomic / fence operations not in the subset";
+    case LLVMAtomicCmpXchg:
+        return "cmpxchg not in the subset yet (atomicrmw + fence are; the "
+               "cooperative VM needs no real compare-exchange — add when a cart "
+               "uses std::atomic::compare_exchange)";
     case LLVMExtractElement: case LLVMInsertElement: case LLVMShuffleVector:
         return "vector instructions not in the subset";
     case LLVMVAArg:
@@ -4865,6 +4874,74 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 break;
             }
 
+            case LLVMFence:
+                /* Cooperative VM (no preemption): a fence orders nothing the
+                 * single running context can observe out of order — no-op. */
+                break;
+
+            case LLVMAtomicRMW: {
+                /* Cooperative VM: lower to a plain read-modify-write —
+                 *   old = [ptr]; [ptr] = old OP val; result = old.
+                 * Correct because no other context can run between the load and
+                 * the store (the only yield is an explicit CORO_SWAP, which
+                 * libc++'s atomics never do). */
+                LLVMValueRef ptr_v = LLVMGetOperand(i, 0);
+                LLVMValueRef val_v = LLVMGetOperand(i, 1);
+                LLVMTypeRef  ty    = LLVMTypeOf(i);
+                LLVMTypeKind tk    = LLVMGetTypeKind(ty);
+                uint8_t ldop = 0, stop = 0;
+                if (tk == LLVMPointerTypeKind) { ldop = CVM_OP_LDW; stop = CVM_OP_STW; }
+                else if (tk == LLVMIntegerTypeKind) {
+                    unsigned w = LLVMGetIntTypeWidth(ty);
+                    if (w == 8)       { ldop = CVM_OP_LDB; stop = CVM_OP_STB; }
+                    else if (w == 16) { ldop = CVM_OP_LDH; stop = CVM_OP_STH; }
+                    else if (w == 32) { ldop = CVM_OP_LDW; stop = CVM_OP_STW; }
+                }
+                if (!ldop) {
+                    ERR(cg->fn_name, "atomicrmw: unsupported width "
+                        "(i8/i16/i32/ptr only)");
+                    cg->had_error = 1;
+                    break;
+                }
+                LLVMAtomicRMWBinOp bop = LLVMGetAtomicRMWBinOp(i);
+                uint8_t addr = cg_reg_for(cg, ptr_v);
+                uint8_t val  = cg_reg_for(cg, val_v);
+                uint8_t old  = cg->regs[cg_lookup(cg, i)];   /* result = old */
+                cg_emit(cg, enc_r(ldop, old, addr, 0));
+                uint8_t nw = old;
+                switch (bop) {
+                case LLVMAtomicRMWBinOpXchg: nw = val; break;
+                case LLVMAtomicRMWBinOpAdd:
+                    nw = cg_alloc_reg(cg); if (cg->had_error) break;
+                    cg_emit(cg, enc_r(CVM_OP_ADD, nw, old, val)); break;
+                case LLVMAtomicRMWBinOpSub:
+                    nw = cg_alloc_reg(cg); if (cg->had_error) break;
+                    cg_emit(cg, enc_r(CVM_OP_SUB, nw, old, val)); break;
+                case LLVMAtomicRMWBinOpAnd:
+                    nw = cg_alloc_reg(cg); if (cg->had_error) break;
+                    cg_emit(cg, enc_r(CVM_OP_AND, nw, old, val)); break;
+                case LLVMAtomicRMWBinOpOr:
+                    nw = cg_alloc_reg(cg); if (cg->had_error) break;
+                    cg_emit(cg, enc_r(CVM_OP_OR, nw, old, val)); break;
+                case LLVMAtomicRMWBinOpXor:
+                    nw = cg_alloc_reg(cg); if (cg->had_error) break;
+                    cg_emit(cg, enc_r(CVM_OP_XOR, nw, old, val)); break;
+                case LLVMAtomicRMWBinOpNand:
+                    nw = cg_alloc_reg(cg); if (cg->had_error) break;
+                    cg_emit(cg, enc_r(CVM_OP_AND, nw, old, val));
+                    cg_movi_scratch(cg, -1);
+                    cg_emit(cg, enc_r(CVM_OP_XOR, nw, nw, (uint8_t)CG_REG_SCRATCH));
+                    break;
+                default:
+                    ERR(cg->fn_name, "atomicrmw: unsupported op (xchg/add/sub/"
+                        "and/or/xor/nand supported; max/min/fadd not yet)");
+                    cg->had_error = 1; break;
+                }
+                if (cg->had_error) break;
+                cg_emit(cg, enc_r(stop, 0, addr, nw));
+                break;
+            }
+
             /* Pointer/integer reinterprets are no-ops: pointers live in
              * 32-bit registers like every other scalar. Trunc/ZExt are MOVs
              * because LDB/LDH already zero-extend on load and STB/STH only
@@ -6054,6 +6131,16 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     break;
                 }
 
+                /* llvm.trap / llvm.debugtrap: abort. clang emits llvm.trap on
+                 * genuinely-unreachable paths (e.g. the deleting destructor of
+                 * an abstract class like libc++'s __shared_count) and for UB
+                 * traps. Lower to HALT, same as `unreachable`. */
+                if (strcmp(name, "llvm.trap") == 0 ||
+                    strcmp(name, "llvm.debugtrap") == 0) {
+                    cg_emit(cg, enc_r(CVM_OP_HALT, 0, 0, 0));
+                    break;
+                }
+
                 /* Alias-analysis scope metadata declarations — pure hints with
                  * no runtime effect. clang emits llvm.experimental.noalias.
                  * scope.decl when it inlines functions with restrict/noalias
@@ -6639,6 +6726,8 @@ static int cg_name_is_std_exc(const char *n) {
         "16invalid_argument", "11range_error", "14overflow_error",
         "15underflow_error", "9bad_alloc",     "20bad_array_new_length",
         "17__libcpp_refstring",
+        /* std::shared_ptr control block (also defined in cvm_cxxstl). */
+        "14__shared_count", "19__shared_weak_count",
     };
     if (!n) return 0;
     for (unsigned i = 0; i < sizeof toks / sizeof toks[0]; ++i)

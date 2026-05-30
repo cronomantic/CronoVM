@@ -29,9 +29,11 @@
  * cart's C library (picolibc / SDK). */
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <typeinfo>
 
 /* ---- std::__libcpp_refstring (versioned namespace std::__1) -------------- *
  * Plain owning C string: ctor/copy strdup, dtor frees. free(nullptr) is a no-op
@@ -117,6 +119,35 @@ const char* std::bad_alloc::what() const noexcept { return "std::bad_alloc"; }
 std::bad_array_new_length::bad_array_new_length() noexcept {}
 std::bad_array_new_length::~bad_array_new_length() noexcept {}
 const char* std::bad_array_new_length::what() const noexcept { return "std::bad_array_new_length"; }
+
+/* ---- std::shared_ptr control block (libc++ src/memory.cpp) --------------- *
+ * __shared_count / __shared_weak_count are libc++'s reference-count base
+ * classes; their out-of-line members (and key-function vtables/type_info) live
+ * in the dylib. We provide them here. The refcounts use atomicrmw (now lowered
+ * by the translator under the cooperative model); lock() is written WITHOUT a
+ * compare-exchange (cooperative VM: no other context runs mid-function), so we
+ * don't need cmpxchg. __shared_owners_ is the strong count minus one (== -1 when
+ * expired); __shared_weak_owners_ the weak count minus one. */
+std::__shared_count::~__shared_count() {}
+std::__shared_weak_count::~__shared_weak_count() {}
+
+void std::__shared_weak_count::__release_weak() noexcept {
+    if (__shared_weak_owners_ == 0)
+        __on_zero_shared_weak();
+    else if (--__shared_weak_owners_ == -1)
+        __on_zero_shared_weak();
+}
+
+std::__shared_weak_count* std::__shared_weak_count::lock() noexcept {
+    if (__shared_owners_ == -1)
+        return nullptr;          /* expired */
+    ++__shared_owners_;          /* adopt a strong ref (cooperative: no race) */
+    return this;
+}
+
+const void* std::__shared_weak_count::__get_deleter(const std::type_info&) const noexcept {
+    return nullptr;
+}
 
 /* ---- std::string out-of-line members ------------------------------------ *
  * libc++ marks `basic_string<char>` as an extern template (its common members
