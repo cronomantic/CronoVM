@@ -53,13 +53,19 @@ for cand in \
 done
 [ -n "$V1" ] || { echo "build_cxxio.sh: cannot locate libc++ <v1> headers" >&2; exit 1; }
 
-# The same recipe the carts use: our freestanding <__config_site> (LOCALIZATION
-# 1 + NEWLIB 1) via -I "$HERE"; the vendored src's private headers via
-# libcxx-src/include; the C library (picolibc) BELOW libc++ via -idirafter so
-# libc++'s wrapper <cstdio>/<cwchar> win and #include_next through.
+# The same recipe the C++ conformance fixtures use (run_conformance.sh): our
+# freestanding <__config_site> (LOCALIZATION 1 + NEWLIB 1) via -I "$HERE"; the
+# vendored src's private headers via libcxx-src/include; libc++ and picolibc as
+# explicit -isystem dirs, libc++ FIRST so its wrapper <cstdio>/<cstring>/... win
+# and their #include_next reaches picolibc. picolibc MUST be -isystem (NOT
+# -idirafter): -idirafter would place it BELOW the host C library, so on the
+# linux-clang/linux-gcc CI runners glibc's /usr/include/string.h is found first
+# and fails ("bits/libc-header-start.h"/"bits/wordsize.h" — no i386-elf multiarch).
+# A bare-metal host (no /usr/include) doesn't expose the bug, which is why it
+# only fires on the Linux CI. See ci-runs-failing.
 CXXFLAGS=(--target=i386-elf -ffreestanding -std=c++23 -fno-rtti -mlong-double-64
           -nostdinc++ -isystem "$V1"
-          -I "$HERE" -I "$SRC/include" -idirafter "$PICO_INC"
+          -I "$HERE" -I "$SRC/include" -isystem "$PICO_INC"
           -D_LIBCPP_BUILDING_LIBRARY -D_GNU_SOURCE -DNDEBUG
           -emit-llvm -gline-tables-only "$OPT")
 
