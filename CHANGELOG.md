@@ -10,6 +10,20 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **Translator: 33..65-bit integer legalisation (`sadd.with.overflow.i33` /
+  `.i65`).** The translator now lowers the odd wide integer widths clang emits
+  for libc++ `std::num_get`'s overflow-checked stream parsing — an `int` is
+  range-checked in `i33`, a `long long` in `i65`. A 33..64-bit value is a
+  "wide2" 2-slot value (like `i64`) kept canonically sign-extended to 64 bits,
+  so `sext`/`zext`/`trunc`/`icmp` reuse the existing `i64` paths unchanged;
+  `i65` is a "wide3" 3-slot value `{w0, w1, sign}`. `sadd.with.overflow.iN`
+  flags overflow by a canonicalise-mismatch (the 64-bit signed sum is exact for
+  `N <= 63`; for `i65` the sign word carries bit 64). Only the exact op cluster
+  num_get emits is legalised (`sext`/`zext`/`sadd.with.overflow`/`extractvalue`/
+  `trunc`/`icmp slt …, 0`); other arithmetic at an odd width is rejected loudly
+  rather than miscompiled. Guarded by the `conf_overflow_wide` differential
+  fixture. (Hardens the VM for any C++ `iostream` integer parse, not just the
+  Exult port that surfaced it.)
 - **libm (picolibc), on demand:** `double` `exp`, `acos`, and `log` are now
   available (built into `picolibc.bc` when a program references them). `log`
   pulls in `__math_divzero` (for `log(0)`), so the divide-by-zero math-error

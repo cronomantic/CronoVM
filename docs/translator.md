@@ -94,7 +94,7 @@ builds with `-gline-tables-only`), e.g.
 
 | Type | Reason |
 | ---- | ------ |
-| integers wider than `i64` | not in the subset |
+| integers wider than `i65` | not in the subset (`i33`..`i65` are legalised; see below) |
 | `half`, `fp128`, `x86_fp80`, etc. (`float` and `double` excepted) | not in the subset (`float` is first-class; `double` is legalised) |
 | vectors (`<N x T>`) | not in the subset; programs target scalars |
 | address spaces other than 0 | not supported |
@@ -207,6 +207,19 @@ to explicit lo/hi 32-bit word arithmetic. An `i64` value never occupies a
 register and is invisible to the linear-scan / caller-save spill machinery — it
 already lives in memory. It crosses to the 32-bit world only at the boundaries
 (`sext`/`zext` widen into it; `trunc`/`icmp`/`store` consume it).
+
+The same machinery generalises to the odd wide widths clang emits for libc++
+`std::num_get`'s overflow-checked stream parsing (an `int` is range-checked in
+`i33`, a `long long` in `i65`). A **wide2** value (any `i33`..`i64`) reuses the
+2-slot path above, kept canonically sign-extended to 64 bits so `sext`/`zext`/
+`trunc`/`icmp` are width-agnostic; **`i65`** is a **wide3** 3-slot value
+`{w0, w1, sign}` (the sign word holds bit 64). `llvm.sadd.with.overflow.iN`
+flags overflow by a *canonicalise-mismatch*: the 64-bit signed sum is exact for
+`N <= 63`, so the result simply doesn't fit `N` bits iff re-canonicalising it
+changes the high word; `i65` carries bit 64 in a third word. Only the exact
+cluster num_get produces (`sext`/`zext`/`sadd.with.overflow`/`extractvalue`/
+`trunc`/`icmp slt …, 0`) is lowered at these widths — any other arithmetic at an
+odd width is rejected loudly rather than silently mis-extended.
 
 Currently lowered `i64` operations:
 

@@ -204,12 +204,20 @@ static int type_in_subset(LLVMTypeRef t, char *err, size_t errlen) {
          * width memory access — clang never emits one for normal C, since memory
          * is byte-addressable and bitfields go through i8/i16/i32 + mask/shift. */
         if (bits >= 1 && bits <= 32) return 1;
-        /* i64 is legalised in codegen: a 64-bit value lives in two 32-bit
-         * frame slots and every i64 operation is lowered to explicit lo/hi
-         * word arithmetic (see cg_emit_i64_def). The ISA stays 32-bit. i64
-         * across a function boundary (args/returns) is NOT yet handled —
-         * validate_function rejects that separately. */
-        if (bits == 64) return 1;
+        /* 33..64-bit integers are legalised in codegen as a "wide2" value: it
+         * lives in two 32-bit frame slots (like i64) and is kept canonically
+         * sign-extended to 64 bits, so the i64 consume paths (icmp/trunc/select/
+         * phi/store) handle it unchanged. Only sext/zext (produce) and
+         * sadd.with.overflow.iN are lowered at the odd widths — that is exactly
+         * what clang emits for libc++ num_get's overflow-checked stream parsing
+         * (an i33 accumulator guard). The ISA stays 32-bit. i64 across a
+         * function boundary (args/returns) is NOT yet handled — validate_function
+         * rejects that separately. */
+        if (bits >= 33 && bits <= 64) return 1;
+        /* i65: the "wide3" 3-slot value libc++ num_get uses to range-check a
+         * `long long` parse (an i64 accumulator widened by one bit). Legalised
+         * only for the exact cluster it appears in — see cg_type_is_i65. */
+        if (bits == 65) return 1;
         snprintf(err, errlen, "unsupported integer width: i%u", bits);
         return 0;
     }
@@ -2011,6 +2019,33 @@ static int cg_type_is_i64(LLVMTypeRef t) {
         && LLVMGetIntTypeWidth(t) == 64;
 }
 
+/* A "wide2 integer" lives in two 32-bit frame slots like i64: any 33..64-bit
+ * integer. It is kept canonically SIGN-EXTENDED to 64 bits, so the i64 consume
+ * paths (icmp/trunc/select/phi/store/the with.overflow value alias) handle it
+ * unchanged. cg_type_is_i64 stays EXACTLY 64 for the ops only defined there
+ * (mul-inline, div/rem + variable-shift runtime calls, cmpxchg). At odd widths
+ * 33..63 only sext/zext and sadd.with.overflow are lowered (see the guard in
+ * cg_emit_i64_def and the wide2 branch in the with.overflow emit). */
+static int cg_type_is_wide_int(LLVMTypeRef t) {
+    if (LLVMGetTypeKind(t) != LLVMIntegerTypeKind) return 0;
+    unsigned w = LLVMGetIntTypeWidth(t);
+    return w >= 33 && w <= 64;
+}
+
+/* A "wide3 integer" is exactly i65: the +1-bit overflow-check accumulator
+ * libc++ num_get uses when parsing a `long long` (an i64 value range-checked in
+ * i65). It lives in THREE frame slots {w0, w1, w2}: the low 64 bits in w0/w1 and
+ * bit 64 (the sign) replicated into w2 (0 or 0xFFFFFFFF = canonical). Unlike a
+ * wide2 value it does NOT fit the 2-slot i64 machinery, so it is handled by a
+ * few dedicated sites (zext i64->i65, sext i32->i65, sadd.with.overflow.i65,
+ * trunc i65->i64, icmp slt i65, and the extractvalue value alias). It is never
+ * stored to memory, passed across a call, or fed to another i65 op, so no wider
+ * support is needed. Widths 66..127 are NOT in the subset (rejected loudly). */
+static int cg_type_is_i65(LLVMTypeRef t) {
+    return LLVMGetTypeKind(t) == LLVMIntegerTypeKind
+        && LLVMGetIntTypeWidth(t) == 65;
+}
+
 static int cg_type_is_f64(LLVMTypeRef t) {
     return LLVMGetTypeKind(t) == LLVMDoubleTypeKind;
 }
@@ -2020,7 +2055,7 @@ static int cg_type_is_f64(LLVMTypeRef t) {
  * their ops are lowered: i64 inline (cg_emit_i64_def), f64 via soft-float
  * runtime calls (cg_emit_f64_def). The slot read/write/storage code is shared. */
 static int cg_type_is_wide(LLVMTypeRef t) {
-    return cg_type_is_i64(t) || cg_type_is_f64(t);
+    return cg_type_is_wide_int(t) || cg_type_is_f64(t);
 }
 
 /* True if instruction `i` lowers to a soft runtime CALL (and thus is a
@@ -2112,27 +2147,39 @@ static int cg_call_is_handled_f64_intrinsic(LLVMValueRef i) {
         || strcmp(cn, "sqrt")              == 0;
 }
 
-/* If `v` is a supported llvm.{uadd,umul}.with.overflow.iN intrinsic CALL, return
- * 1 and set *is_mul (0=add, 1=mul) and *bits (32 or 64). Otherwise 0. The signed
- * (sadd/ssub/smul) and usub variants and non-32/64 widths return 0 — picolibc's
- * strtoul/strtoull only emit the unsigned add/mul forms; anything else is
- * rejected loudly at the call site so a future need surfaces. */
+/* If `v` is a supported llvm.{uadd,umul,sadd}.with.overflow.iN intrinsic CALL,
+ * return 1 and set *kind (0=uadd, 1=umul, 2=sadd) and *bits. Otherwise 0.
+ *   - uadd/umul: i32 and i64 (carry / high-half overflow detection) — picolibc's
+ *     strtoul/strtoull digit accumulation.
+ *   - sadd: the odd "wide2" widths 33..63 that libc++ num_get emits for its
+ *     stream-parse overflow guard (an i33 accumulator that range-checks an i32
+ *     result). The i65 case (long long parse) is a separate "wide3" path, not
+ *     recognised here. ssub/smul and usub stay rejected (unused) so a future
+ *     need surfaces loudly at the call site. */
 static int cg_overflow_call_kind(LLVMValueRef v, int *is_mul, int *bits) {
     if (!v || !LLVMIsACallInst(v)) return 0;
     const char *nm = value_name(LLVMGetCalledValue(v));
     int mul, b;
     if      (strncmp(nm, "llvm.uadd.with.overflow.i", 25) == 0) { mul = 0; b = atoi(nm + 25); }
     else if (strncmp(nm, "llvm.umul.with.overflow.i", 25) == 0) { mul = 1; b = atoi(nm + 25); }
+    else if (strncmp(nm, "llvm.sadd.with.overflow.i", 25) == 0) { mul = 2; b = atoi(nm + 25); }
     else return 0;
-    if (b != 32 && b != 64) return 0;
+    /* sadd: the wide2 odd widths 33..63 (i33 int parse) + the wide3 width 65
+     * (i65 long-long parse). i64 signed-add is excluded (no spare bit for the
+     * canonicalise-mismatch overflow check) — not in the contract. */
+    if (mul == 2) { if (!((b >= 33 && b <= 63) || b == 65)) return 0; }
+    else          { if (b != 32 && b != 64) return 0; }
     if (is_mul) *is_mul = mul;
     if (bits)   *bits = b;
     return 1;
 }
 
 /* Words occupied by the iN result part of a with.overflow aggregate (the
- * overflow flag adds one more slot on top). */
-static int cg_overflow_val_words(int bits) { return bits == 64 ? 2 : 1; }
+ * overflow flag adds one more slot on top): 1 for <=32, 2 for the wide2 widths
+ * 33..64, 3 for the wide3 i65 case. */
+static int cg_overflow_val_words(int bits) {
+    return bits > 64 ? 3 : bits >= 33 ? 2 : 1;
+}
 
 /* If `i` is `extractvalue <overflow-call>, {0|1}`, return 1 and set *call to the
  * source call and *field to 0 (the iN result) or 1 (the i1 overflow flag). */
@@ -2249,6 +2296,37 @@ static int cg_i64_write(struct cg *cg, int idx, uint8_t lo, uint8_t hi) {
     return 0;
 }
 
+/* Read / write the THREE 32-bit words {w0, w1, w2} of a wide3 (i65) SSA value
+ * from / to its three consecutive frame slots (base at cg->i64_slot[idx]). i65
+ * operands are only ever SSA values (zext/sext results or the extractvalue
+ * value alias) — no i65 constants arise — so the const/undef paths cg_i64_read
+ * handles are not needed here. */
+static int cg_i65_read(struct cg *cg, LLVMValueRef v,
+                       uint8_t *w0, uint8_t *w1, uint8_t *w2) {
+    int idx = cg_lookup(cg, v);
+    if (idx < 0 || cg->i64_slot[idx] == CG_NO_SLOT) {
+        ERR(cg->fn_name, "internal: i65 operand without a frame slot");
+        cg->had_error = 1; return 1;
+    }
+    int32_t off = cg_val_slot_off(cg, cg->i64_slot[idx]);
+    *w0 = cg_alloc_reg(cg); if (cg->had_error) return 1;
+    if (cg_ldw_sp_off(cg, *w0, off))     { cg->had_error = 1; return 1; }
+    *w1 = cg_alloc_reg(cg); if (cg->had_error) return 1;
+    if (cg_ldw_sp_off(cg, *w1, off + 4)) { cg->had_error = 1; return 1; }
+    *w2 = cg_alloc_reg(cg); if (cg->had_error) return 1;
+    if (cg_ldw_sp_off(cg, *w2, off + 8)) { cg->had_error = 1; return 1; }
+    return 0;
+}
+
+static int cg_i65_write(struct cg *cg, int idx,
+                        uint8_t w0, uint8_t w1, uint8_t w2) {
+    int32_t off = cg_val_slot_off(cg, cg->i64_slot[idx]);
+    if (cg_stw_sp_off(cg, off,     w0)) { cg->had_error = 1; return 1; }
+    if (cg_stw_sp_off(cg, off + 4, w1)) { cg->had_error = 1; return 1; }
+    if (cg_stw_sp_off(cg, off + 8, w2)) { cg->had_error = 1; return 1; }
+    return 0;
+}
+
 /* Emit `dst = src <shift> amt` where amt is a small constant. `cv` is one of
  * CVM_OP_SHL / CVM_OP_SHR / CVM_OP_SAR. The amount goes through R254 (the
  * shift opcode takes its count in a register; no immediate form). */
@@ -2302,6 +2380,25 @@ static void cg_emit_i64_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
         return;
     }
 
+    /* At the odd wide widths (wide2 33..63 and wide3 i65) a value is kept
+     * canonically sign-extended, but only sext/zext (produce a canonical value)
+     * and the with.overflow value alias (extractvalue, written canonical at the
+     * call site) preserve that for free. Plain add/sub/mul/logic/shift would
+     * leave the bits above the width un-canonicalised (the i64 lowerings don't
+     * re-extend), so reject them loudly rather than miscompile. (The contract —
+     * libc++ num_get — never needs them; widen this only with matching
+     * canonicalisation.) Width 64 keeps the full i64 op surface; the i65 result
+     * cluster is sext/zext/extractvalue (trunc i65->i64 has an i64 result and is
+     * handled in the LLVMTrunc case below). */
+    if (LLVMGetIntTypeWidth(LLVMTypeOf(i)) != 64
+        && op != LLVMSExt && op != LLVMZExt && op != LLVMExtractValue) {
+        ERR(cg->fn_name, "i%u operation '%s' not supported at an odd wide width "
+                         "(only sext/zext/extractvalue legalised for 33..63/65)",
+            LLVMGetIntTypeWidth(LLVMTypeOf(i)), opcode_name(op));
+        cg->had_error = 1;
+        return;
+    }
+
     switch (op) {
     case LLVMSExt: {
         /* lo = src; hi = src >>(arith) 31  (sign replicated). */
@@ -2309,14 +2406,42 @@ static void cg_emit_i64_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
         if (cg->had_error) return;
         uint8_t hi = cg_alloc_reg(cg); if (cg->had_error) return;
         cg_shift_imm(cg, CVM_OP_SAR, hi, src, 31);
-        cg_i64_write(cg, idx, src, hi);
+        if (cg_type_is_i65(LLVMTypeOf(i)))
+            cg_i65_write(cg, idx, src, hi, hi);   /* sext i32->i65: w2 = sign */
+        else
+            cg_i64_write(cg, idx, src, hi);
         break;
     }
     case LLVMZExt: {
+        if (cg_type_is_i65(LLVMTypeOf(i))) {
+            /* zext to i65: bit 64 = 0. Source is i64 (the num_get accumulator)
+             * -> low 64 bits = its two words; or a <=32-bit value -> w0 only. */
+            LLVMValueRef sv = LLVMGetOperand(i, 0);
+            if (cg_type_is_i64(LLVMTypeOf(sv))) {
+                uint8_t lo, hi;
+                if (cg_i64_read(cg, sv, &lo, &hi)) return;
+                cg_i65_write(cg, idx, lo, hi, cg->zero_reg);
+            } else {
+                uint8_t src = cg_reg_for(cg, sv);
+                if (cg->had_error) return;
+                cg_i65_write(cg, idx, src, cg->zero_reg, cg->zero_reg);
+            }
+            break;
+        }
         /* lo = src; hi = 0. */
         uint8_t src = cg_reg_for(cg, LLVMGetOperand(i, 0));
         if (cg->had_error) return;
         cg_i64_write(cg, idx, src, cg->zero_reg);
+        break;
+    }
+    case LLVMTrunc: {
+        /* trunc i65 -> i64: the result is the low 64 bits (w0, w1); the sign
+         * word w2 is discarded. (This is the ONLY trunc with a wide result —
+         * trunc to i32/sub-word keeps its result in a register and is handled in
+         * the generic switch.) */
+        uint8_t w0, w1, w2;
+        if (cg_i65_read(cg, LLVMGetOperand(i, 0), &w0, &w1, &w2)) break;
+        cg_i64_write(cg, idx, w0, w1);
         break;
     }
     case LLVMLoad: {
@@ -2779,15 +2904,24 @@ static void cg_pre_alloc_function(struct cg *cg, LLVMValueRef fn) {
                 int idx = cg->map_count - 1;
                 cg->i64_slot[idx] = (cidx >= 0) ? cg->agg_slot[cidx] : CG_NO_SLOT;
             } else if (cg_is_overflow_extract(i, &ov_call, &ov_field)
-                       && ov_field == 0 && cg_type_is_i64(ty)) {
-                /* extractvalue <ov>, 0 of an i64 overflow result: ALIAS its two
-                 * i64 slots onto the call's aggregate base (the val_lo/val_hi
-                 * words already sit there) — no register, no copy. cg_emit_i64_def
-                 * then no-ops for it. */
+                       && ov_field == 0
+                       && (cg_type_is_wide_int(ty) || cg_type_is_i65(ty))) {
+                /* extractvalue <ov>, 0 of an i64/wide2/i65 overflow result: ALIAS
+                 * its value slots (2 for wide2, 3 for i65) onto the call's
+                 * aggregate base (the value words already sit there) — no
+                 * register, no copy. cg_emit_i64_def then no-ops for it. */
                 int cidx = cg_lookup(cg, ov_call);
                 cg_assign(cg, i, (uint8_t)CG_REG_SPILLED);
                 int idx = cg->map_count - 1;
                 cg->i64_slot[idx] = (cidx >= 0) ? cg->agg_slot[cidx] : CG_NO_SLOT;
+            } else if (cg_type_is_i65(ty)) {
+                /* i65 (wide3) result: claim THREE consecutive value-spill slots
+                 * (w0, w1, w2). Like the wide branch below it lives purely in
+                 * memory; cg_emit_i64_def lowers it via cg_i65_read/write. */
+                cg_assign(cg, i, (uint8_t)CG_REG_SPILLED);
+                int idx = cg->map_count - 1;
+                cg->i64_slot[idx] = (uint16_t)cg->val_spill_count;
+                cg->val_spill_count += 3;
             } else if (cg_type_is_wide(ty)) {
                 /* 64-bit result (i64 or f64): claim TWO consecutive value-spill
                  * slots (lo, hi) instead of a register. regs stays
@@ -4015,7 +4149,8 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
              * by the incoming-edge moves (cg_emit_phi_moves), so let it fall
              * through to the (empty) PHI case below. */
             if (op != LLVMPHI && op != LLVMCall && op != LLVMInvoke
-                && cg_type_is_i64(LLVMTypeOf(i))) {
+                && (cg_type_is_wide_int(LLVMTypeOf(i))
+                    || cg_type_is_i65(LLVMTypeOf(i)))) {
                 cg_emit_i64_def(cg, i, op);
                 if (cg->had_error) break;
                 continue;
@@ -4122,8 +4257,45 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
 
             case LLVMICmp: {
                 LLVMIntPredicate p = LLVMGetICmpPredicate(i);
-                /* i64 comparison: read both operands as lo/hi word pairs. */
-                if (cg_type_is_i64(LLVMTypeOf(LLVMGetOperand(i, 0)))) {
+                /* i65 (wide3) compare. The only form num_get emits is
+                 * `icmp slt i65 %val, 0` — the sign test after the long-long
+                 * overflow guard. Support compares against the constant 0:
+                 * slt/sge read the sign word w2 (canonical 0 or -1); eq/ne test
+                 * all three words. Anything else is rejected loudly. */
+                if (cg_type_is_i65(LLVMTypeOf(LLVMGetOperand(i, 0)))) {
+                    LLVMValueRef o1 = LLVMGetOperand(i, 1);
+                    if (!LLVMIsAConstantInt(o1) || LLVMConstIntGetZExtValue(o1) != 0) {
+                        ERR(cg->fn_name, "i65 icmp only supported against constant 0");
+                        cg->had_error = 1; break;
+                    }
+                    uint8_t w0, w1, w2;
+                    if (cg_i65_read(cg, LLVMGetOperand(i, 0), &w0, &w1, &w2)) break;
+                    uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                    if (p == LLVMIntSLT) {        /* < 0  <=> sign set <=> w2 != 0 */
+                        cg_emit(cg, enc_r(CVM_OP_CMP_NE, dst, w2, cg->zero_reg));
+                    } else if (p == LLVMIntSGE) { /* >= 0 <=> w2 == 0 */
+                        cg_emit(cg, enc_r(CVM_OP_CMP_EQ, dst, w2, cg->zero_reg));
+                    } else if (p == LLVMIntEQ || p == LLVMIntNE) {
+                        uint8_t t01 = cg_alloc_reg(cg); if (cg->had_error) break;
+                        uint8_t t2  = cg_alloc_reg(cg); if (cg->had_error) break;
+                        uint8_t cmp  = (p == LLVMIntEQ) ? CVM_OP_CMP_EQ : CVM_OP_CMP_NE;
+                        uint8_t comb = (p == LLVMIntEQ) ? CVM_OP_AND    : CVM_OP_OR;
+                        cg_emit(cg, enc_r(cmp, t01, w0, cg->zero_reg));
+                        cg_emit(cg, enc_r(cmp, t2,  w1, cg->zero_reg));
+                        cg_emit(cg, enc_r(comb, t01, t01, t2));
+                        cg_emit(cg, enc_r(cmp, t2,  w2, cg->zero_reg));
+                        cg_emit(cg, enc_r(comb, dst, t01, t2));
+                    } else {
+                        ERR(cg->fn_name, "i65 icmp predicate unsupported "
+                                         "(only slt/sge/eq/ne vs 0)");
+                        cg->had_error = 1;
+                    }
+                    break;
+                }
+                /* i64 / wide2 comparison: read both operands as lo/hi word
+                 * pairs. A wide2 value (33..63) is canonically sign-extended to
+                 * 64 bits, so the same 64-bit signed/unsigned compare is exact. */
+                if (cg_type_is_wide_int(LLVMTypeOf(LLVMGetOperand(i, 0)))) {
                     uint8_t al, ah, bl, bh;
                     if (cg_i64_read(cg, LLVMGetOperand(i, 0), &al, &ah)) break;
                     if (cg_i64_read(cg, LLVMGetOperand(i, 1), &bl, &bh)) break;
@@ -5283,10 +5455,10 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 uint8_t dst = cg->regs[cg_lookup(cg, i)];
                 LLVMTypeRef dty = LLVMTypeOf(i);
                 unsigned dw = LLVMGetIntTypeWidth(dty);
-                /* trunc from i64: the result is just the LO word (the high
-                 * word is discarded). Load it straight into dst; a following
-                 * mask handles sub-i32 destinations below. */
-                if (cg_type_is_i64(LLVMTypeOf(src_v))) {
+                /* trunc from i64 / a wide2 value: the result is just the LO word
+                 * (the high word is discarded). Load it straight into dst; a
+                 * following mask handles sub-i32 destinations below. */
+                if (cg_type_is_wide_int(LLVMTypeOf(src_v))) {
                     if (LLVMIsAConstantInt(src_v)) {
                         unsigned long long k = LLVMConstIntGetZExtValue(src_v);
                         cg_emit_load_const32(cg, dst, (int32_t)(uint32_t)k);
@@ -6248,6 +6420,70 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                             }
                             cg_stw_sp_off(cg, cg_val_slot_off(cg, (uint16_t)base),       val);
                             cg_stw_sp_off(cg, cg_val_slot_off(cg, (uint16_t)(base + 1)), ovf);
+                        } else if (ov_mul == 2 && ov_bits == 65) {
+                            /* sadd.with.overflow.i65 (wide3 — the long-long parse
+                             * guard). Operands are canonical i65 {w0,w1,w2} (w2 =
+                             * bit 64 sign-extended). Three-word add; the sign word
+                             * w2_raw carries bit 64 in its bit 0. Canonicalise it
+                             * (sign-extend bit 0 -> 0 or -1) and flag overflow when
+                             * the raw differs from the canonical form:
+                             *   w0=a0+b0 (c0); w1=a1+b1+c0 (c1); w2_raw=a2+b2+c1
+                             *   canon_w2 = (w2_raw << 31) >>(arith) 31
+                             *   overflow = (w2_raw != canon_w2)
+                             * value = {w0, w1, canon_w2}; flag at base+3. */
+                            uint8_t a0,a1,a2, b0,b1,b2;
+                            if (cg_i65_read(cg, LLVMGetOperand(i, 0), &a0,&a1,&a2)) break;
+                            if (cg_i65_read(cg, LLVMGetOperand(i, 1), &b0,&b1,&b2)) break;
+                            uint8_t w0=cg_alloc_reg(cg), w1=cg_alloc_reg(cg),
+                                    w2=cg_alloc_reg(cg), c0=cg_alloc_reg(cg),
+                                    t=cg_alloc_reg(cg), ca=cg_alloc_reg(cg),
+                                    cb=cg_alloc_reg(cg), c1=cg_alloc_reg(cg),
+                                    canon=cg_alloc_reg(cg), ovf=cg_alloc_reg(cg);
+                            if (cg->had_error) break;
+                            cg_emit(cg, enc_r(CVM_OP_ADD, w0, a0, b0));
+                            cg_emit(cg, enc_r(CVM_OP_CMP_LTU, c0, w0, a0));
+                            cg_emit(cg, enc_r(CVM_OP_ADD, t, a1, b1));
+                            cg_emit(cg, enc_r(CVM_OP_CMP_LTU, ca, t, a1));
+                            cg_emit(cg, enc_r(CVM_OP_ADD, w1, t, c0));
+                            cg_emit(cg, enc_r(CVM_OP_CMP_LTU, cb, w1, t));
+                            cg_emit(cg, enc_r(CVM_OP_OR, c1, ca, cb));
+                            cg_emit(cg, enc_r(CVM_OP_ADD, w2, a2, b2));
+                            cg_emit(cg, enc_r(CVM_OP_ADD, w2, w2, c1));   /* w2_raw */
+                            cg_shift_imm(cg, CVM_OP_SHL, canon, w2, 31);
+                            cg_shift_imm(cg, CVM_OP_SAR, canon, canon, 31);
+                            cg_emit(cg, enc_r(CVM_OP_CMP_NE, ovf, w2, canon));
+                            cg_stw_sp_off(cg, cg_val_slot_off(cg, (uint16_t)base),       w0);
+                            cg_stw_sp_off(cg, cg_val_slot_off(cg, (uint16_t)(base + 1)), w1);
+                            cg_stw_sp_off(cg, cg_val_slot_off(cg, (uint16_t)(base + 2)), canon);
+                            cg_stw_sp_off(cg, cg_val_slot_off(cg, (uint16_t)(base + 3)), ovf);
+                        } else if (ov_mul == 2) {
+                            /* sadd.with.overflow at a wide2 width N (33..63): both
+                             * operands are canonical iN (sign-extended to 64) in
+                             * lo/hi pairs, so the 64-bit signed sum is EXACT (it
+                             * needs at most N+1 <= 64 bits). Canonicalise the sum
+                             * back to N bits and flag overflow when it didn't fit:
+                             *   lo = al+bl (carry c); hi_raw = ah+bh+c
+                             *   s = 64-N; canon_hi = (hi_raw << s) >>(arith) s
+                             *   overflow = (hi_raw != canon_hi)   (lo is in range)
+                             * value words = {lo, canon_hi}; flag at base+2. */
+                            unsigned s = 64u - (unsigned)ov_bits;   /* 1..31 */
+                            uint8_t al, ah, bl, bh;
+                            if (cg_i64_read(cg, LLVMGetOperand(i, 0), &al, &ah)) break;
+                            if (cg_i64_read(cg, LLVMGetOperand(i, 1), &bl, &bh)) break;
+                            uint8_t lo = cg_alloc_reg(cg), hi = cg_alloc_reg(cg),
+                                    carry = cg_alloc_reg(cg), canon = cg_alloc_reg(cg),
+                                    ovf = cg_alloc_reg(cg);
+                            if (cg->had_error) break;
+                            cg_emit(cg, enc_r(CVM_OP_ADD, lo, al, bl));
+                            cg_emit(cg, enc_r(CVM_OP_CMP_LTU, carry, lo, al));
+                            cg_emit(cg, enc_r(CVM_OP_ADD, hi, ah, bh));
+                            cg_emit(cg, enc_r(CVM_OP_ADD, hi, hi, carry));
+                            cg_shift_imm(cg, CVM_OP_SHL, canon, hi, s);
+                            cg_shift_imm(cg, CVM_OP_SAR, canon, canon, s);
+                            cg_emit(cg, enc_r(CVM_OP_CMP_NE, ovf, hi, canon));
+                            cg_stw_sp_off(cg, cg_val_slot_off(cg, (uint16_t)base),       lo);
+                            cg_stw_sp_off(cg, cg_val_slot_off(cg, (uint16_t)(base + 1)), canon);
+                            cg_stw_sp_off(cg, cg_val_slot_off(cg, (uint16_t)(base + 2)), ovf);
                         } else {
                             /* i64: operands in lo/hi word pairs. */
                             uint8_t al, ah, bl, bh;
