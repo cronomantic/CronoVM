@@ -92,10 +92,10 @@ SOURCES=(
   # the error helpers + exp's data table. f64 lowers to the soft-float runtime.
   # (Paths are ../libm relative to libc/; the loop normalises them.) __isnand
   # (referenced transitively) is the embedder's, in cron_sys.c.
-  ../libm/math/s_exp ../libm/math/s_acos ../libm/math/s_sqrt
-  ../libm/common/exp_data
+  ../libm/math/s_exp ../libm/math/s_acos ../libm/math/s_sqrt ../libm/math/s_log
+  ../libm/common/exp_data ../libm/common/log_data
   ../libm/common/math_err_oflow ../libm/common/math_err_uflow
-  ../libm/common/math_err_invalid
+  ../libm/common/math_err_invalid ../libm/common/math_err_divzero
 )
 
 # The malloc family is OPTIONAL (see --no-malloc). When included, picolibc owns
