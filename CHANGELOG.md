@@ -8,6 +8,33 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ## [Unreleased]
 
+### Added
+
+- **libm (picolibc), on demand:** `double` `exp`, `acos`, and `log` are now
+  available (built into `picolibc.bc` when a program references them). `log`
+  pulls in `__math_divzero` (for `log(0)`), so the divide-by-zero math-error
+  path is included too.
+- **`cvm-cc` input limit removed.** The compiler driver's input/bitcode/argv
+  arrays grow dynamically instead of a fixed 256-entry cap, so a single
+  invocation can compile/link an arbitrary number of translation units.
+
+### Fixed
+
+- **Translator: `zext iN -> i32` now masks to the source width** instead of being
+  a bare register MOV. The MOV relied on the invariant that narrow values are
+  always zero-extended in their register (true for `LDB`/`LDH` loads and `Trunc`,
+  which mask) — but narrow integer *constants* are materialised sign-extended,
+  and a function argument of unsigned-narrow type carries that bit pattern into
+  the callee. So `zext` of a narrow UNSIGNED value with its high bit set produced
+  a negative result, e.g. `(unsigned char)160` evaluated to `-96`. ZExt now
+  emits an `AND` to the source width (a no-op when already zero-extended, a
+  correction when sign-extended); `SExt` is unchanged. Guarded by the
+  `conf_zext_unsigned` differential fixture.
+- **Translator: arbitrary narrow integer widths (`iN`, `N` < 32).** Register-SSA
+  values of odd widths (e.g. clang's `i14` from `-O1` narrowing) now translate —
+  including the narrow `LShr`/`AShr` shiftee normalisation — alongside
+  poison/undef values in global initialisers (clang's switch lookup tables).
+
 ## [0.4.0] — 2026-05-30
 
 The **Beta** milestone. (The intermediate `v0.2.0` and `v0.3.0` tags shipped
