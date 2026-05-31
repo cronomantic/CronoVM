@@ -5234,12 +5234,40 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
             case LLVMPtrToInt:
             case LLVMIntToPtr:
             case LLVMBitCast:
-            case LLVMFreeze:   /* identity for i32/f32/ptr (wide handled above) */
-            case LLVMZExt: {
+            case LLVMFreeze: { /* identity for i32/f32/ptr (wide handled above) */
                 uint8_t src = cg_reg_for(cg, LLVMGetOperand(i, 0));
                 uint8_t dst = cg->regs[cg_lookup(cg, i)];
                 if (src != dst)
                     cg_emit(cg, enc_r(CVM_OP_MOV, dst, src, 0));
+                break;
+            }
+
+            /* ZExt MUST actually zero the high (32 - src_w) bits — it cannot
+             * assume the source is already zero-extended. Most narrow values are
+             * (LDB/LDH zero-extend, Trunc masks), but NOT all: a narrow integer
+             * *constant* is materialised sign-extended (LLVMConstIntGetSExtValue),
+             * so e.g. an `i8 160` arrives as 0xFFFFFFA0 (-96), and a function
+             * argument of unsigned-narrow type carries that into the callee. A
+             * bare MOV would then yield -96 for `(unsigned char)160`. Mask to the
+             * source width (as Trunc does); a no-op when already zero-extended. */
+            case LLVMZExt: {
+                LLVMValueRef src_v = LLVMGetOperand(i, 0);
+                uint8_t src = cg_reg_for(cg, src_v);
+                uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                LLVMTypeRef sty = LLVMTypeOf(src_v);
+                unsigned src_w =
+                    (LLVMGetTypeKind(sty) == LLVMIntegerTypeKind)
+                        ? LLVMGetIntTypeWidth(sty) : 32;
+                if (src_w >= 32) {
+                    if (src != dst)
+                        cg_emit(cg, enc_r(CVM_OP_MOV, dst, src, 0));
+                } else {
+                    uint32_t mask = (uint32_t)(((uint64_t)1 << src_w) - 1u);
+                    cg_emit_load_const32(cg, (uint8_t)CG_REG_SCRATCH,
+                                         (int32_t)mask);
+                    cg_emit(cg, enc_r(CVM_OP_AND, dst, src,
+                                      (uint8_t)CG_REG_SCRATCH));
+                }
                 break;
             }
 
