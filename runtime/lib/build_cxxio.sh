@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# build_cxxio.sh — compile the vendored libc++ iostream/locale subset
-# (runtime/lib/libcxx-src/) into one LLVM bitcode module, cxxio.bc.
+# build_cxxio.sh — compile the vendored libc++ iostream/locale src subset
+# (runtime/lib/libcxx/src/) into one LLVM bitcode module, cxxio.bc.
 #
 # The CronoVM toolchain uses the libc++ HEADERS that ship with clang but does
 # NOT build libc++; for the freestanding STL core (vector/string/exceptions) the
@@ -22,7 +22,11 @@
 set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC="$HERE/libcxx-src"
+# Vendored libc++ (see libcxx/VENDOR.md): the pinned header tree + the src subset.
+# We compile against THIS, not the host's libc++ — hermetic + reproducible across
+# clang versions (any ~clang 21+).
+V1="$HERE/libcxx/include/v1"
+SRC="$HERE/libcxx/src"
 PICO_INC="$HERE/../../external/picolibc/libc/include"
 OUT="$HERE/cxxio.bc"
 OPT="${CXXIO_OPT:--O1}"
@@ -42,34 +46,24 @@ fi
 LLVM_LINK="${LLVM_LINK:-llvm-link}"
 command -v "$LLVM_LINK" >/dev/null || { echo "llvm-link not found" >&2; exit 1; }
 
-# Locate the toolchain's libc++ v1 header dir (the <isystem> for -nostdinc++).
-# `clang++ -print-resource-dir` gives .../lib/clang/NN; the c++/v1 tree is a few
-# levels up under include/. Probe the common layouts.
-V1=""
-for cand in \
-    "$(dirname "$CLANGXX")/../include/c++/v1" \
-    "$("$CLANGXX" -print-resource-dir 2>/dev/null)/../../../include/c++/v1"; do
-  [ -d "$cand" ] && { V1="$cand"; break; }
-done
-[ -n "$V1" ] || { echo "build_cxxio.sh: cannot locate libc++ <v1> headers" >&2; exit 1; }
+[ -d "$V1" ] || { echo "build_cxxio.sh: vendored libc++ not found at $V1 (run libcxx/vendor_libcxx.sh)" >&2; exit 1; }
 
-# The same recipe the C++ conformance fixtures use (run_conformance.sh): our
-# freestanding <__config_site> (LOCALIZATION 1 + NEWLIB 1) via -I "$HERE"; the
-# vendored src's private headers via libcxx-src/include; libc++ and picolibc as
-# explicit -isystem dirs, libc++ FIRST so its wrapper <cstdio>/<cstring>/... win
+# Compile against the VENDORED libc++ ($V1) — independent of the host's libc++.
+# Our freestanding <__config_site> (LOCALIZATION 1 + NEWLIB 1) via -I "$HERE" wins
+# over the vendored tree's; the src's private headers via libcxx/src/include;
+# picolibc as -isystem AFTER libc++ so libc++'s wrapper <cstdio>/<cstring>/... win
 # and their #include_next reaches picolibc. picolibc MUST be -isystem (NOT
-# -idirafter): -idirafter would place it BELOW the host C library, so on the
-# linux-clang/linux-gcc CI runners glibc's /usr/include/string.h is found first
-# and fails ("bits/libc-header-start.h"/"bits/wordsize.h" — no i386-elf multiarch).
-# A bare-metal host (no /usr/include) doesn't expose the bug, which is why it
-# only fires on the Linux CI. See ci-runs-failing.
+# -idirafter): -idirafter would place it BELOW the host C library, so glibc's
+# /usr/include/string.h would be found first on Linux ("bits/libc-header-start.h").
+# (Now that libc++ is vendored too, the version-skew that previously broke the
+# Linux CI is gone — any clang 21+ compiles this. See ci-runs-failing.)
 CXXFLAGS=(--target=i386-elf -ffreestanding -std=c++23 -fno-rtti -mlong-double-64
           -nostdinc++ -isystem "$V1"
           -I "$HERE" -I "$SRC/include" -isystem "$PICO_INC"
           -D_LIBCPP_BUILDING_LIBRARY -D_GNU_SOURCE -DNDEBUG
           -emit-llvm -gline-tables-only "$OPT")
 
-# The vendored TUs (must match runtime/lib/libcxx-src/*.cpp).
+# The vendored TUs (must match runtime/lib/libcxx/src/*.cpp).
 SOURCES=(locale ios ios.instantiations iostream ostream fstream
          system_error error_category)
 

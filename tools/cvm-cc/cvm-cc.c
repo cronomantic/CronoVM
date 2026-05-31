@@ -506,24 +506,26 @@ static int compile_c_to_bc(const struct cli *cli, const char *clang,
     if (is_cpp_src(input)) {
         cargv[n++] = (char *)"-x";
         cargv[n++] = (char *)"c++";
-        /* libc++ headers. By default use the toolchain clang's own libc++
-         * (-stdlib=libc++ self-locates them — always version-matched, the most
-         * portable choice since libc++ is co-versioned with clang). The
-         * runtime dir (added via rtinc as -I, highest priority) supplies our
-         * freestanding <__config_site> + <__external_threading> overrides, so
-         * they win over the toolchain's. --libcxx-dir pins an explicit v1 tree
-         * instead (for a vendored/hermetic build): point clang at it with
-         * -nostdinc++ -isystem and drop -stdlib. The C library headers
-         * (picolibc/SDK) must be passed by the caller via -idirafter so
-         * libc++'s wrapper headers shadow them and #include_next through. */
-        if (cli->libcxx_dir) {
-            cargv[n++] = (char *)"-nostdinc++";
-            cargv[n++] = (char *)"-isystem";
+        /* libc++ headers. CronoVM is a HERMETIC toolchain: it VENDORS libc++
+         * (runtime/lib/libcxx/, like it vendors picolibc) so the C++ surface is
+         * independent of whatever libc++ the host clang ships — any reasonably
+         * recent clang (~21+) compiles against the SAME pinned headers, so the
+         * result is reproducible across distros (a system-libc++ dependency broke
+         * the linux CI when its clang-21 met our 22.x src). Use it via
+         * `-nostdinc++ -isystem <runtime>/libcxx/include/v1`; the runtime dir
+         * (rtinc, -I, highest priority) supplies our freestanding <__config_site>
+         * + <__external_threading> overrides, which win over the vendored tree's.
+         * --libcxx-dir overrides the vendored tree with an explicit v1 (e.g. to
+         * test another libc++). The C library headers (picolibc/SDK) are passed
+         * by the caller via -isystem so libc++'s wrappers #include_next through. */
+        cargv[n++] = (char *)"-nostdinc++";
+        cargv[n++] = (char *)"-isystem";
+        if (cli->libcxx_dir)
             snprintf(libcxxinc, sizeof libcxxinc, "%s", cli->libcxx_dir);
-            cargv[n++] = libcxxinc;
-        } else {
-            cargv[n++] = (char *)"-stdlib=libc++";
-        }
+        else
+            snprintf(libcxxinc, sizeof libcxxinc, "%s/libcxx/include/v1",
+                     cli->runtime_dir);
+        cargv[n++] = libcxxinc;
         /* Default to C++20 (modern STL; <compare> etc.) unless the user set
          * -std explicitly (forwarded via passthru). */
         if (!cli->has_std)

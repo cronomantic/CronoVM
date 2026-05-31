@@ -40,23 +40,10 @@ fi
 RTLIB="$HERE/../../runtime/lib"
 PICO_INC="$HERE/../../external/picolibc/libc/include"
 PICOLIBC_BC="$RTLIB/picolibc.bc"
-# conf_pico_cpp_iostream builds cxxio.bc from the VENDORED libc++ src subset
-# (runtime/lib/libcxx-src/), which is pinned to libc++ 22.1.x — its internal
-# symbols (e.g. __atoms_offset / __stage2_int_loop's signature) differ across
-# libc++ majors, so it only compiles with a 22.x toolchain. The linux-clang /
-# linux-gcc CI runners pin clang-21 (libc++ 21), so the fixture is SKIPPED there
-# (like conf_alias on Darwin); it still runs wherever the toolchain matches the
-# vendored src (the dev box, and CI once it moves to clang-22). Detect the
-# toolchain's libc++ major from its <__config>.
-SKIP_IOSTREAM=""
-if printf '%s\n' "${fixtures[@]}" | grep -q 'conf_pico_cpp_iostream'; then
-  libcxx_v1="$(cd "$(dirname "$CLANG")/../include/c++/v1" 2>/dev/null && pwd)"
-  libcxx_ver="$(grep -hoE '_LIBCPP_VERSION[[:space:]]+[0-9]+' "$libcxx_v1/__config" 2>/dev/null | grep -oE '[0-9]+$' | head -1)"
-  if [[ ! "$libcxx_ver" =~ ^22 ]]; then
-    SKIP_IOSTREAM="vendored cxxio.bc src needs libc++ 22.x; toolchain is ${libcxx_ver:-unknown}"
-  fi
-fi
-
+# cxxio.bc (the libc++ iostream/locale library) is built from the VENDORED libc++
+# (runtime/lib/libcxx/, headers + src) — independent of the host's libc++, so it
+# compiles with any clang ~21+ and no version guard is needed (this used to skip
+# on the clang-21 CI when libc++ was the system's; see ci-runs-failing).
 if printf '%s\n' "${fixtures[@]}" | grep -q 'conf_pico'; then
   LLVM_LINK="$(dirname "$CLANG")/llvm-link"
   [[ -x "$LLVM_LINK" || -x "$LLVM_LINK.exe" ]] || LLVM_LINK="llvm-link"
@@ -65,7 +52,7 @@ if printf '%s\n' "${fixtures[@]}" | grep -q 'conf_pico'; then
   # cvm-cc auto-links on the CVM_PROBE_IOSTREAM probe bit. Build both then —
   # unless the iostream fixture is being skipped (toolchain libc++ != 22.x).
   pico_flags=(--with-stdio)
-  if printf '%s\n' "${fixtures[@]}" | grep -q 'conf_pico_cpp_iostream' && [[ -z "$SKIP_IOSTREAM" ]]; then
+  if printf '%s\n' "${fixtures[@]}" | grep -q 'conf_pico_cpp_iostream'; then
     pico_flags+=(--with-locale)
     if ! CLANG="$CLANG" LLVM_LINK="$LLVM_LINK" bash "$RTLIB/build_cxxio.sh" >/dev/null; then
       echo "run_conformance.sh: failed to build cxxio.bc" >&2; exit 1
@@ -89,34 +76,22 @@ for src in "${fixtures[@]}"; do
   if [[ "$name" == "conf_alias" && "$(uname -s)" == Darwin ]]; then
     printf 'SKIP       %-22s (alias attribute unsupported on darwin)\n' "$name"; continue
   fi
-  # conf_pico_cpp_iostream needs a libc++ 22.x toolchain (see SKIP_IOSTREAM above).
-  if [[ "$name" == "conf_pico_cpp_iostream" && -n "$SKIP_IOSTREAM" ]]; then
-    printf 'SKIP       %-22s (%s)\n' "$name" "$SKIP_IOSTREAM"; continue
-  fi
 
   # picolibc fixtures additionally link picolibc.bc + the machine-port stub on
   # the VM side, with picolibc's headers on the include path. The native oracle
   # uses the host libc (no picolibc include path, so host headers win).
-  # C++ fixtures must pass picolibc's C headers with -idirafter (NOT -I) so
-  # libc++'s wrapper <math.h>/<cstring>/... shadow them and #include_next through;
   # -I RTLIB stays high-priority (our __config_site / __external_threading win).
   pico=()
   if [[ "$name" == conf_pico* ]]; then
     pico=( "$HERE/pico_machine.c" "$PICOLIBC_BC" -I "$RTLIB" )
     if [[ "$src" == *.cpp ]]; then
-      # C++: put libc++ AND picolibc as explicit -isystem dirs, libc++ FIRST, so
-      # both sit above any HOST C library (glibc in /usr/include on Linux). Then
-      # libc++'s wrapper <string.h>/<cmath>/... win and their #include_next
-      # reaches picolibc — NOT the host headers (which broke the Linux CI:
-      # /usr/include/string.h pulling bits/libc-header-start.h). --libcxx-dir
-      # makes cvm-cc emit `-nostdinc++ -isystem <v1>`; the -isystem PICO_INC then
-      # follows it. Derive the toolchain's libc++ v1 dir from the fixture clang.
-      libcxx_v1="$(cd "$(dirname "$CLANG")/../include/c++/v1" 2>/dev/null && pwd)"
-      if [[ -n "$libcxx_v1" ]]; then
-        pico+=( --libcxx-dir="$libcxx_v1" -isystem "$PICO_INC" )
-      else
-        pico+=( -idirafter "$PICO_INC" )   # bare-metal clang: no host C lib to shadow
-      fi
+      # C++: cvm-cc already compiles against the VENDORED libc++ by default
+      # (-nostdinc++ -isystem <vendored v1>), independent of the host. We only add
+      # picolibc as -isystem AFTER it, so libc++'s wrapper <string.h>/<cmath>/...
+      # win and their #include_next reaches picolibc — NOT the host glibc (the
+      # bug that broke the Linux CI). No --libcxx-dir (that would override the
+      # vendored tree with the system's).
+      pico+=( -isystem "$PICO_INC" )
     else
       pico+=( -I "$PICO_INC" )
     fi
