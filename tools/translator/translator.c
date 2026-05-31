@@ -150,6 +150,7 @@ static const char *opcode_name(LLVMOpcode op) {
 static int cg_type_is_i64(LLVMTypeRef t);
 static int cg_type_is_f64(LLVMTypeRef t);
 static int cg_type_is_wide(LLVMTypeRef t);
+static int cg_type_is_vector(LLVMTypeRef t);  /* fixed integer vector <N x iM> */
 static int cg_wide_const_words(LLVMValueRef v, uint32_t *lo, uint32_t *hi);
 static int cg_is_eh_value(LLVMValueRef v);   /* C++ EH {ptr,i32} pad value */
 
@@ -231,9 +232,32 @@ static int type_in_subset(LLVMTypeRef t, char *err, size_t errlen) {
         }
         return 1;
     }
-    case LLVMVectorTypeKind:
+    case LLVMVectorTypeKind: {
+        /* Fixed vectors of integer elements are legalised by scalarisation:
+         * the value lives in N consecutive 32-bit frame slots (one lane each),
+         * each vector op lowered to per-lane scalar ops. Only what libc++'s
+         * num_get movemask idiom needs is actually lowered (insertelement /
+         * shufflevector-splat / vector-icmp / bitcast<Nxi1>->iN); any other
+         * vector op ERRs loudly in cg_emit_vec_def. Element must be an integer
+         * i1..i32 (the lane fits a register); float/double lanes are out. */
+        LLVMTypeRef et = LLVMGetElementType(t);
+        if (LLVMGetTypeKind(et) != LLVMIntegerTypeKind
+            || LLVMGetIntTypeWidth(et) > 32) {
+            snprintf(err, errlen,
+                     "only fixed integer vectors (i1..i32 elements) are in the "
+                     "subset");
+            return 0;
+        }
+        unsigned lanes = LLVMGetVectorSize(t);
+        if (lanes == 0 || lanes > 256) {
+            snprintf(err, errlen, "vector lane count %u out of range (1..256)",
+                     lanes);
+            return 0;
+        }
+        return 1;
+    }
     case LLVMScalableVectorTypeKind:
-        snprintf(err, errlen, "vector types not in the subset");
+        snprintf(err, errlen, "scalable vector types not in the subset");
         return 0;
     case LLVMFloatTypeKind:
         /* IEEE 754 binary32 — first-class in the ISA (see CVM_OP_F* in
@@ -303,6 +327,10 @@ static int opcode_in_subset(LLVMOpcode op) {
      * because they only apply to double, which we reject. */
     case LLVMFAdd: case LLVMFSub: case LLVMFMul: case LLVMFDiv:
     case LLVMFNeg: case LLVMFCmp:
+    /* Vector ops — scalarised per lane (see cg_emit_vec_def). Only the integer
+     * vector idiom libc++ num_get emits is actually lowered; anything else ERRs
+     * at codegen, not here. */
+    case LLVMExtractElement: case LLVMInsertElement: case LLVMShuffleVector:
     case LLVMSIToFP: case LLVMUIToFP: case LLVMFPToSI: case LLVMFPToUI:
     /* FPExt (float->double) and FPTrunc (double->float) are now accepted —
      * they only arise with f64, which the codegen legalises via soft-float. */
@@ -346,13 +374,22 @@ static void validate_function(LLVMValueRef fn) {
         ERR(fn_name, "return type rejected: %s", err);
     /* i64/f64 params and returns ARE supported (the 64-bit calling
      * convention: a wide value occupies two argument words — R-pair or two
-     * stack words — and returns in R0:R1). */
+     * stack words — and returns in R0:R1). Vectors, however, are scalarised
+     * into frame slots and have no calling-convention encoding, so a vector
+     * crossing a call boundary is rejected (it never does in the libc++ num_get
+     * idiom — char_traits::find is inlined, so the vector stays function-local). */
+    if (cg_type_is_vector(ret_ty))
+        ERR(fn_name, "vector return type not supported (vectors are "
+                     "function-local only)");
 
     unsigned param_count = LLVMCountParams(fn);
     for (unsigned i = 0; i < param_count; ++i) {
         LLVMTypeRef pt = LLVMTypeOf(LLVMGetParam(fn, i));
         if (!type_in_subset(pt, err, sizeof(err)))
             ERR(fn_name, "parameter %u rejected: %s", i, err);
+        if (cg_type_is_vector(pt))
+            ERR(fn_name, "vector parameter %u not supported (vectors are "
+                         "function-local only)", i);
     }
 
     LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn);
@@ -911,6 +948,16 @@ struct cg {
                              * overflow flag. extractvalue reads from these. Like
                              * i64_slot it occupies no register. Parallel to
                              * vals/regs. */
+    uint16_t     *vec_slot; /* vector legalisation: if != CG_NO_SLOT, this SSA
+                             * value is a fixed <N x iM> vector scalarised into N
+                             * consecutive value-spill slots (one lane per slot,
+                             * lane k at vec_slot+k). Each lane holds the element
+                             * value canonically sign-extended to 32 bits. Like
+                             * i64_slot it occupies no register. Lane count + elem
+                             * width come from LLVMTypeOf(value). Parallel to
+                             * vals/regs. Only the libc++ num_get movemask idiom
+                             * (insertelement/shufflevector-splat/vector-icmp/
+                             * bitcast<Nxi1>->iN) produces these. */
     int           map_count;
     int           map_cap;
     int           next_reg;
@@ -1174,8 +1221,10 @@ static uint8_t cg_assign(struct cg *cg, LLVMValueRef v, uint8_t r) {
                                       cg->map_cap * sizeof(*cg->i64_slot));
         cg->agg_slot = (uint16_t *)realloc(cg->agg_slot,
                                       cg->map_cap * sizeof(*cg->agg_slot));
+        cg->vec_slot = (uint16_t *)realloc(cg->vec_slot,
+                                      cg->map_cap * sizeof(*cg->vec_slot));
         if (!cg->vals || !cg->regs || !cg->val_slot || !cg->i64_slot
-            || !cg->agg_slot) {
+            || !cg->agg_slot || !cg->vec_slot) {
             perror("realloc"); exit(1);
         }
     }
@@ -1184,6 +1233,7 @@ static uint8_t cg_assign(struct cg *cg, LLVMValueRef v, uint8_t r) {
     cg->val_slot[cg->map_count] = CG_NO_SLOT;
     cg->i64_slot[cg->map_count] = CG_NO_SLOT;
     cg->agg_slot[cg->map_count] = CG_NO_SLOT;
+    cg->vec_slot[cg->map_count] = CG_NO_SLOT;
     cg->map_count++;
     return r;
 }
@@ -2000,6 +2050,211 @@ static int cg_ldw_sp_off(struct cg *cg, uint8_t dst_reg, int32_t offset) {
 static int32_t cg_val_slot_off(struct cg *cg, uint16_t slot) {
     return (int32_t)cg->alloca_bytes + (int32_t)cg->spill_bytes
          + (int32_t)slot * 4;
+}
+
+/* --- vector legalisation (scalarisation) helpers ------------------------- */
+
+/* A fixed integer vector <N x iM> (M <= 32). Scalarised into N consecutive
+ * value-spill slots, one lane per slot. (type_in_subset already vetted the
+ * element type / lane count, so this is the same predicate.) */
+static int cg_type_is_vector(LLVMTypeRef t) {
+    if (LLVMGetTypeKind(t) != LLVMVectorTypeKind) return 0;
+    LLVMTypeRef et = LLVMGetElementType(t);
+    return LLVMGetTypeKind(et) == LLVMIntegerTypeKind
+        && LLVMGetIntTypeWidth(et) <= 32;
+}
+
+static unsigned cg_vec_lanes(LLVMTypeRef t)     { return LLVMGetVectorSize(t); }
+static unsigned cg_vec_elem_bits(LLVMTypeRef t) {
+    return LLVMGetIntTypeWidth(LLVMGetElementType(t));
+}
+
+/* Read lane `lane` of vector value `v` into a fresh register. Handles undef /
+ * zeroinitializer (-> 0), constant data vectors (materialise the lane constant,
+ * sign-extended from the element width), and SSA vectors (LDW from the value's
+ * per-lane frame slot). The result holds the element value sign-extended to 32
+ * bits for constants and as-produced for SSA lanes; consumers (vector icmp /
+ * bitcast<Nxi1>) re-normalise to the element width as needed. */
+static uint8_t cg_vec_read_lane(struct cg *cg, LLVMValueRef v, unsigned lane) {
+    if (LLVMIsUndef(v) || LLVMIsAConstantAggregateZero(v)) {
+        uint8_t r = cg_alloc_reg(cg); if (cg->had_error) return 0;
+        cg_emit(cg, enc_i16(CVM_OP_MOVI, r, 0));
+        return r;
+    }
+    if (LLVMIsConstant(v)) {
+        LLVMValueRef e = LLVMGetAggregateElement(v, lane);
+        int32_t val = 0;
+        if (e && !LLVMIsUndef(e) && LLVMIsAConstantInt(e)) {
+            unsigned eb = cg_vec_elem_bits(LLVMTypeOf(v));
+            uint64_t z = LLVMConstIntGetZExtValue(e);
+            if (eb >= 1 && eb < 32) {            /* sign-extend from eb bits */
+                uint64_t sbit = (uint64_t)1 << (eb - 1);
+                z = (z ^ sbit) - sbit;
+            }
+            val = (int32_t)z;
+        }
+        uint8_t r = cg_alloc_reg(cg); if (cg->had_error) return 0;
+        cg_emit_load_const32(cg, r, val);
+        return r;
+    }
+    int idx = cg_lookup(cg, v);
+    if (idx < 0 || cg->vec_slot[idx] == CG_NO_SLOT) {
+        ERR(cg->fn_name, "internal: vector operand without a frame slot");
+        cg->had_error = 1; return 0;
+    }
+    int32_t off = cg_val_slot_off(cg, cg->vec_slot[idx]) + (int32_t)lane * 4;
+    uint8_t r = cg_alloc_reg(cg); if (cg->had_error) return 0;
+    if (cg_ldw_sp_off(cg, r, off)) { cg->had_error = 1; return 0; }
+    return r;
+}
+
+static void cg_vec_write_lane(struct cg *cg, int idx, unsigned lane, uint8_t reg) {
+    int32_t off = cg_val_slot_off(cg, cg->vec_slot[idx]) + (int32_t)lane * 4;
+    if (cg_stw_sp_off(cg, off, reg)) cg->had_error = 1;
+}
+
+/* Normalise a just-read lane register to its element width `w`, exactly as
+ * cg_icmp_operand does for scalars: sign-extend (signed) or zero-mask (unsigned).
+ * Returns `src` unchanged when w >= 32. */
+static uint8_t cg_norm_reg_width(struct cg *cg, uint8_t src, unsigned w,
+                                 int is_signed) {
+    if (w >= 32) return src;
+    uint8_t dst = cg_alloc_reg(cg); if (cg->had_error) return src;
+    if (is_signed) {
+        int16_t sh = (int16_t)(32u - w);
+        cg_emit(cg, enc_i16(CVM_OP_MOVI, (uint8_t)CG_REG_SCRATCH, sh));
+        cg_emit(cg, enc_r(CVM_OP_SHL, dst, src, (uint8_t)CG_REG_SCRATCH));
+        cg_emit(cg, enc_r(CVM_OP_SAR, dst, dst, (uint8_t)CG_REG_SCRATCH));
+    } else {
+        uint32_t mask = (uint32_t)(((uint64_t)1 << w) - 1u);
+        cg_emit_load_const32(cg, (uint8_t)CG_REG_SCRATCH, (int32_t)mask);
+        cg_emit(cg, enc_r(CVM_OP_AND, dst, src, (uint8_t)CG_REG_SCRATCH));
+    }
+    return dst;
+}
+
+/* Scalarise a vector-RESULT instruction: lower it to per-lane scalar ops over
+ * the value's N frame slots (vec_slot[ridx]..+N-1). Only the libc++ num_get
+ * movemask idiom is handled — insertelement / shufflevector / vector-icmp /
+ * element-wise sext|zext|trunc. Anything else ERRs loudly. Vector-CONSUMING ops
+ * with a scalar/void result (bitcast<Nxi1>->iN, extractelement) are handled in
+ * the main switch, not here.
+ *
+ * Register pressure is bounded regardless of lane count: each lane is
+ * independent (its result is STW'd to a frame slot, not held in a register), so
+ * we rewind the emit-scratch cursor (cg->next_reg) before every lane and reuse
+ * the same handful of scratch registers. */
+static void cg_emit_vec_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
+    int ridx = cg_lookup(cg, i);
+    if (ridx < 0 || cg->vec_slot[ridx] == CG_NO_SLOT) {
+        ERR(cg->fn_name, "internal: vector result without a frame slot");
+        cg->had_error = 1; return;
+    }
+    unsigned N = cg_vec_lanes(LLVMTypeOf(i));
+    unsigned saved = (unsigned)cg->next_reg;
+
+    switch (op) {
+    case LLVMInsertElement: {
+        /* result lane l = (l == idx) ? scalar : base[l]; idx must be constant. */
+        LLVMValueRef base = LLVMGetOperand(i, 0);
+        LLVMValueRef elt  = LLVMGetOperand(i, 1);
+        LLVMValueRef idxv = LLVMGetOperand(i, 2);
+        if (!LLVMIsAConstantInt(idxv)) {
+            ERR(cg->fn_name,
+                "insertelement: non-constant lane index not supported");
+            cg->had_error = 1; return;
+        }
+        unsigned ins = (unsigned)LLVMConstIntGetZExtValue(idxv);
+        for (unsigned l = 0; l < N; ++l) {
+            cg->next_reg = saved;
+            uint8_t r = (l == ins) ? cg_reg_for(cg, elt)
+                                   : cg_vec_read_lane(cg, base, l);
+            if (cg->had_error) return;
+            cg_vec_write_lane(cg, ridx, l, r);
+            if (cg->had_error) return;
+        }
+        break;
+    }
+    case LLVMShuffleVector: {
+        /* result lane l = mask[l] picks a lane of operand 0 (lanes 0..na-1) or
+         * operand 1 (na..); an undef mask element -> 0. The splat (mask all 0)
+         * broadcasts operand-0 lane 0. */
+        LLVMValueRef a = LLVMGetOperand(i, 0);
+        LLVMValueRef b = LLVMGetOperand(i, 1);
+        unsigned na = cg_vec_lanes(LLVMTypeOf(a));
+        int undef_elem = LLVMGetUndefMaskElem();
+        for (unsigned l = 0; l < N; ++l) {
+            cg->next_reg = saved;
+            int m = LLVMGetMaskValue(i, l);
+            uint8_t r;
+            if (m == undef_elem) {
+                r = cg_alloc_reg(cg); if (cg->had_error) return;
+                cg_emit(cg, enc_i16(CVM_OP_MOVI, r, 0));
+            } else if ((unsigned)m < na) {
+                r = cg_vec_read_lane(cg, a, (unsigned)m);
+            } else {
+                r = cg_vec_read_lane(cg, b, (unsigned)m - na);
+            }
+            if (cg->had_error) return;
+            cg_vec_write_lane(cg, ridx, l, r);
+            if (cg->had_error) return;
+        }
+        break;
+    }
+    case LLVMICmp: {
+        /* per-lane scalar compare; result lanes are i1 (0/1). */
+        LLVMIntPredicate p = LLVMGetICmpPredicate(i);
+        int swap = 0;
+        int op2 = icmp_to_op(p, &swap);
+        if (op2 < 0) {
+            ERR(cg->fn_name, "vector icmp: unsupported predicate");
+            cg->had_error = 1; return;
+        }
+        LLVMValueRef o0 = LLVMGetOperand(i, 0);
+        LLVMValueRef o1 = LLVMGetOperand(i, 1);
+        unsigned ow = cg_vec_elem_bits(LLVMTypeOf(o0));
+        int is_signed = (p == LLVMIntSLT || p == LLVMIntSLE ||
+                         p == LLVMIntSGT || p == LLVMIntSGE);
+        for (unsigned l = 0; l < N; ++l) {
+            cg->next_reg = saved;
+            uint8_t la = cg_vec_read_lane(cg, o0, l); if (cg->had_error) return;
+            uint8_t lb = cg_vec_read_lane(cg, o1, l); if (cg->had_error) return;
+            la = cg_norm_reg_width(cg, la, ow, is_signed); if (cg->had_error) return;
+            lb = cg_norm_reg_width(cg, lb, ow, is_signed); if (cg->had_error) return;
+            uint8_t d = cg_alloc_reg(cg); if (cg->had_error) return;
+            if (swap) cg_emit(cg, enc_r((uint8_t)op2, d, lb, la));
+            else      cg_emit(cg, enc_r((uint8_t)op2, d, la, lb));
+            cg_vec_write_lane(cg, ridx, l, d);
+            if (cg->had_error) return;
+        }
+        break;
+    }
+    case LLVMSExt: case LLVMZExt: case LLVMTrunc: {
+        /* element-wise integer width conversion (same lane count). -O0 emits
+         * `sext <Nxi1> to <Nxi8>` for the compare body; included for generality. */
+        LLVMValueRef src = LLVMGetOperand(i, 0);
+        unsigned sw = cg_vec_elem_bits(LLVMTypeOf(src));
+        for (unsigned l = 0; l < N; ++l) {
+            cg->next_reg = saved;
+            uint8_t s = cg_vec_read_lane(cg, src, l); if (cg->had_error) return;
+            uint8_t d;
+            if (op == LLVMSExt)      d = cg_norm_reg_width(cg, s, sw, 1);
+            else if (op == LLVMZExt) d = cg_norm_reg_width(cg, s, sw, 0);
+            else                     d = s;   /* trunc: keep low bits */
+            if (cg->had_error) return;
+            cg_vec_write_lane(cg, ridx, l, d);
+            if (cg->had_error) return;
+        }
+        break;
+    }
+    default:
+        ERR(cg->fn_name,
+            "vector op '%s' not supported (only the num_get movemask idiom: "
+            "insertelement / shufflevector / icmp / sext / zext / trunc)",
+            opcode_name(op));
+        cg->had_error = 1;
+        return;
+    }
 }
 
 /* --- i64 legalisation ----------------------------------------------------
@@ -2933,6 +3188,15 @@ static void cg_pre_alloc_function(struct cg *cg, LLVMValueRef fn) {
                 int idx = cg->map_count - 1;
                 cg->i64_slot[idx] = (uint16_t)cg->val_spill_count;
                 cg->val_spill_count += 2;
+            } else if (cg_type_is_vector(ty)) {
+                /* fixed <N x iM> vector result: claim N consecutive value-spill
+                 * slots, one lane per slot. Lives purely in memory (like the
+                 * wide values above) — cg_emit_vec_def reads/writes the lanes via
+                 * cg->vec_slot. No register, no caller-save participation. */
+                cg_assign(cg, i, (uint8_t)CG_REG_SPILLED);
+                int idx = cg->map_count - 1;
+                cg->vec_slot[idx] = (uint16_t)cg->val_spill_count;
+                cg->val_spill_count += cg_vec_lanes(ty);
             } else if (LLVMGetTypeKind(ty) != LLVMVoidTypeKind
                        && !cg_is_eh_value(i)) {
                 /* EH-pad values (landingpad / phi / select of {ptr,i32}) carry
@@ -4163,6 +4427,21 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
             }
             /* A 64-bit-returning USER/indirect call falls through to the
              * generic LLVMCall handler (the R0:R1 return ABI). */
+
+            /* Vector-RESULT instruction: scalarise it per lane into its frame
+             * slots and skip the register-based switch entirely (its result
+             * never occupies a register). Call/Invoke are excluded — a
+             * vector-returning call is rejected at validate_function; PHI/select
+             * and any unhandled vector op fall into cg_emit_vec_def's default
+             * and ERR loudly (no silent miscompile). Vector-CONSUMING ops with a
+             * scalar/void result (bitcast<Nxi1>->iN, extractelement) keep their
+             * scalar result and are handled inside the switch. */
+            if (op != LLVMCall && op != LLVMInvoke
+                && cg_type_is_vector(LLVMTypeOf(i))) {
+                cg_emit_vec_def(cg, i, op);
+                if (cg->had_error) break;
+                continue;
+            }
 
             /* Spilled-DEF setup: if this instruction's result was spilled to
              * a frame slot, give the handler a transient register to compute
@@ -5407,10 +5686,66 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
             case LLVMIntToPtr:
             case LLVMBitCast:
             case LLVMFreeze: { /* identity for i32/f32/ptr (wide handled above) */
+                /* MOVEMASK: `bitcast <N x i1> to iN` packs the boolean lanes into
+                 * an integer — lane k -> bit k. This is how libc++ num_get's
+                 * char_traits::find reduces a vector compare to a scalar mask
+                 * (then __countr_zero finds the first match). The vector operand
+                 * lives in N frame slots; OR each lane's low bit, shifted to its
+                 * position, into the result. */
+                LLVMValueRef bo = LLVMGetOperand(i, 0);
+                if (op == LLVMBitCast
+                    && LLVMGetTypeKind(LLVMTypeOf(bo)) == LLVMVectorTypeKind) {
+                    unsigned eb = cg_vec_elem_bits(LLVMTypeOf(bo));
+                    unsigned n  = cg_vec_lanes(LLVMTypeOf(bo));
+                    uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                    if (eb != 1) {
+                        ERR(cg->fn_name, "bitcast of a non-i1 vector to integer "
+                                         "not supported");
+                        cg->had_error = 1; break;
+                    }
+                    unsigned saved = (unsigned)cg->next_reg;
+                    cg_emit(cg, enc_i16(CVM_OP_MOVI, dst, 0));
+                    for (unsigned l = 0; l < n; ++l) {
+                        cg->next_reg = saved;
+                        uint8_t lane = cg_vec_read_lane(cg, bo, l);
+                        if (cg->had_error) break;
+                        cg_emit(cg, enc_i16(CVM_OP_MOVI,
+                                            (uint8_t)CG_REG_SCRATCH, 1));
+                        cg_emit(cg, enc_r(CVM_OP_AND, lane, lane,
+                                          (uint8_t)CG_REG_SCRATCH));
+                        if (l) {
+                            cg_emit(cg, enc_i16(CVM_OP_MOVI,
+                                      (uint8_t)CG_REG_SCRATCH, (int16_t)l));
+                            cg_emit(cg, enc_r(CVM_OP_SHL, lane, lane,
+                                      (uint8_t)CG_REG_SCRATCH));
+                        }
+                        cg_emit(cg, enc_r(CVM_OP_OR, dst, dst, lane));
+                    }
+                    break;
+                }
                 uint8_t src = cg_reg_for(cg, LLVMGetOperand(i, 0));
                 uint8_t dst = cg->regs[cg_lookup(cg, i)];
                 if (src != dst)
                     cg_emit(cg, enc_r(CVM_OP_MOV, dst, src, 0));
+                break;
+            }
+
+            /* extractelement: a scalar lane of a vector. The lane index must be
+             * constant (clang emits it so). Reads the lane's frame slot. Not in
+             * the -O1 movemask idiom but trivial and needed for -O0 shapes. */
+            case LLVMExtractElement: {
+                LLVMValueRef vec  = LLVMGetOperand(i, 0);
+                LLVMValueRef idxv = LLVMGetOperand(i, 1);
+                if (!LLVMIsAConstantInt(idxv)) {
+                    ERR(cg->fn_name,
+                        "extractelement: non-constant lane index not supported");
+                    cg->had_error = 1; break;
+                }
+                unsigned lane = (unsigned)LLVMConstIntGetZExtValue(idxv);
+                uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                uint8_t r = cg_vec_read_lane(cg, vec, lane);
+                if (cg->had_error) break;
+                if (r != dst) cg_emit(cg, enc_r(CVM_OP_MOV, dst, r, 0));
                 break;
             }
 

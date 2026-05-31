@@ -96,7 +96,8 @@ builds with `-gline-tables-only`), e.g.
 | ---- | ------ |
 | integers wider than `i65` | not in the subset (`i33`..`i65` are legalised; see below) |
 | `half`, `fp128`, `x86_fp80`, etc. (`float` and `double` excepted) | not in the subset (`float` is first-class; `double` is legalised) |
-| vectors (`<N x T>`) | not in the subset; programs target scalars |
+| fixed integer vectors `<N x iM>` (`M ≤ 32`) | legalised by per-lane scalarisation (see below); function-local only |
+| floating-point / scalable vectors | not in the subset |
 | address spaces other than 0 | not supported |
 | `token`, `x86_amx`, target_ext | not in the subset |
 
@@ -254,6 +255,39 @@ Currently lowered `i64` operations:
 - **params / returns / calls** — see "64-bit calling convention" below
 
 The i64 surface is complete.
+
+### Fixed integer vector legalisation (scalarisation)
+
+The same "value lives in N consecutive frame slots" idea legalises **fixed
+integer vectors** `<N x iM>` (`M ≤ 32`). Each lane occupies one slot
+(`vec_slot[idx]` .. `+ N - 1`); a vector value never occupies a register and is
+invisible to the spill machinery (it already lives in memory). Every vector op
+is lowered to per-lane scalar ops, rewinding the emit-scratch cursor before each
+lane so register pressure is bounded regardless of `N`.
+
+This exists for the SIMD *movemask* idiom clang emits for libc++
+`std::char_traits<char>::find` — which `std::num_get` uses to scan the digit
+atoms when parsing a number from a stream — **even though the target has no
+SIMD**: a scalar splat (`insertelement` lane 0 + `shufflevector` with an
+all-zero mask), a vector compare (`icmp eq <N x i8>` → `<N x i1>`), then a
+`bitcast <N x i1>` to an integer mask that `__countr_zero` turns into the match
+index. Lowered vector operations:
+
+- **`insertelement`** — copy each base lane, overwrite the (constant-index) lane
+  with the scalar; **`extractelement`** — read one (constant-index) lane
+- **`shufflevector`** — result lane `l` picks `mask[l]` from operand 0 (lanes
+  `0..na-1`) or operand 1 (`na..`); an undef mask element → 0. The splat
+  (all-zero mask) broadcasts operand-0 lane 0
+- **`icmp`** — per-lane scalar compare, each operand lane normalised to the
+  element width (signed or unsigned, as `cg_icmp_operand` does); result lanes
+  are `i1` (0/1)
+- **element-wise `sext`/`zext`/`trunc`** between same-lane-count integer vectors
+- **`bitcast <N x i1> → iN`** — the **movemask**: OR each lane's low bit shifted
+  to its position (`lane k → bit k`)
+
+Vectors are **function-local only** — they have no calling-convention encoding,
+so a vector parameter or return is rejected. Any vector op outside the list
+above is rejected loudly (never silently miscompiled).
 
 ### f64 (double) legalisation
 
@@ -511,7 +545,7 @@ catch-all / cleanup sentinel).
 | MSVC/SEH exceptions | `catchpad`, `cleanuppad`, `catchswitch`, `catchret`, `cleanupret` | only the Itanium model (`invoke`/`landingpad`/`resume`) is supported |
 | EH filter clauses | `landingpad ... filter [...]` | dynamic exception specifications not supported |
 | atomics/fences | `cmpxchg`, `atomicrmw`, `fence` | not in subset |
-| vectors | `extractelement`, `shufflevector`, ... | not in subset |
+| integer vectors | `insertelement`, `extractelement`, `shufflevector`, vector `icmp`/casts, `bitcast <N x i1>→iN` | scalarised per lane (function-local) |
 | variadic | `va_arg` | not in subset |
 | indirect calls | `indirectbr`, `callbr` | not in subset |
 | `freeze`, `addrspacecast` | | not yet supported |

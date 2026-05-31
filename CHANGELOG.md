@@ -10,6 +10,24 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **Translator: fixed integer vectors via per-lane scalarisation.** Clang lowers
+  libc++ `std::char_traits<char>::find` (used by `std::num_get` to scan the digit
+  atoms when parsing a number from a stream) to a SIMD *movemask* idiom even for a
+  non-SIMD target: a scalar splat (`insertelement` + `shufflevector`), a vector
+  compare (`icmp eq <N x i8>` → `<N x i1>`), and a `bitcast <N x i1>` to an
+  integer mask. The translator now legalises a fixed `<N x iM>` integer vector
+  (`M ≤ 32`) by scalarising it into `N` consecutive frame slots (one lane per
+  slot, like the `i64`/`i65` wide values), lowering each vector op to per-lane
+  scalar ops: `insertelement`, `shufflevector` (incl. the splat), `extractelement`,
+  vector `icmp`, element-wise `sext`/`zext`/`trunc`, and `bitcast <N x i1> → iN`
+  (the movemask: lane *k* → bit *k*). Register pressure stays bounded regardless
+  of lane count (each lane's result is stored to its slot, so the emit-scratch
+  cursor is rewound per lane). Vectors are function-local only (no
+  calling-convention encoding — rejected across a call boundary); any unhandled
+  vector op is rejected loudly rather than miscompiled. Guarded by the
+  `conf_vector_movemask` differential fixture (32- and 16-lane). General SIMD
+  scalarisation — hardens the VM for any C++ that hits a vector idiom, not just
+  the Exult port that surfaced it.
 - **Translator: 33..65-bit integer legalisation (`sadd.with.overflow.i33` /
   `.i65`).** The translator now lowers the odd wide integer widths clang emits
   for libc++ `std::num_get`'s overflow-checked stream parsing — an `int` is
