@@ -21,7 +21,8 @@ int errno;
 /* sbrk: hand out a contiguous static arena linearly. picolibc's malloc grows the
  * heap by calling this; returning (void *)-1 + errno=ENOMEM signals exhaustion,
  * exactly as a real machine port over the cron heap would. */
-#define PICO_HEAP_BYTES (1u << 18)        /* 256 KiB — ample for the fixture */
+#define PICO_HEAP_BYTES (1u << 21)        /* 2 MiB — ample (iostream/locale init
+                                           * + several stream buffers add up) */
 #define ENOMEM 12
 static char  g_heap[PICO_HEAP_BYTES] __attribute__((aligned(16)));
 static size_t g_brk = 0;
@@ -49,6 +50,22 @@ int __isnand(double x) { return x != x; }
 /* strerror: picolibc omits it (it would take the _user_strerror hook address);
  * the embedder supplies it (cron_sys.c in a cart). picolibc's perror() calls it. */
 char *strerror(int n) { (void)n; return (char *)"error"; }
+
+/* strerror_r: same reason — libc++ <system_error>/<locale> need it but picolibc's
+ * strerror_r routes through the _user_strerror hook the translator rejects. The
+ * embedder supplies it (POSIX form: write into buf, return 0 on success). */
+int strerror_r(int n, char *buf, unsigned long len) {
+    (void)n;
+    const char *m = "error";
+    unsigned long i = 0;
+    if (len) { for (; m[i] && i + 1 < len; ++i) buf[i] = m[i]; buf[i] = 0; }
+    return 0;
+}
+
+/* tzset: the VM has no TZ environment, so the timezone is fixed GMT (tzvars.c's
+ * defaults). strftime() calls tzset() for %Z/%z; a no-op keeps the GMT defaults
+ * and avoids picolibc's TZ/getenv-parsing tzset.c. (cron_sys.c does the same.) */
+void tzset(void) {}
 
 #define PICO_FILE_BYTES (1u << 16)
 static unsigned char g_file[PICO_FILE_BYTES];

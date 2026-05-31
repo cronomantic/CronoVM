@@ -78,6 +78,8 @@
 #define CVM_PROBE_I64    20   /* uses i64 div/rem -> link the i64 runtime */
 #define CVM_PROBE_CXXSTL 64   /* references the std exception ABI -> link
                                * cvm_cxxstl (bit-disjoint from F64|I64) */
+#define CVM_PROBE_IOSTREAM 128 /* references the libc++ iostream/locale ABI ->
+                               * link the prebuilt cxxio.bc (implies cxxstl) */
 
 /* Basenames of the soft runtime TUs, auto-linked on demand. They live in the
  * runtime dir and are never hand-listed by the user. */
@@ -526,6 +528,17 @@ static int compile_c_to_bc(const struct cli *cli, const char *clang,
          * -std explicitly (forwarded via passthru). */
         if (!cli->has_std)
             cargv[n++] = (char *)"-std=c++20";
+        /* libc++ with localization (for <iostream>/<locale>) dispatches its
+         * locale facets to picolibc's POSIX xlocale `*_l` functions (newlocale,
+         * strtod_l, toupper_l, …). picolibc gates those behind __GNU_VISIBLE,
+         * which -std=c++NN turns OFF (it sets __STRICT_ANSI__); _GNU_SOURCE
+         * re-exposes them. Define it for ALL C++ (harmless when iostream is
+         * unused — it only widens the visible C surface). NOT defined for C
+         * carts, which opt in deliberately. -mlong-double-64 makes `long double`
+         * == double so libc++/picolibc never form an x86_fp80 the VM rejects
+         * (and strtold_l degenerates to strtod_l). */
+        cargv[n++] = (char *)"-D_GNU_SOURCE";
+        cargv[n++] = (char *)"-mlong-double-64";
     }
     cargv[n++] = (char *)"-emit-llvm";
     /* Line tables only: enough for the translator to report file:line on
@@ -627,6 +640,7 @@ int main(int argc, char **argv) {
      * the helpers. Integer-only programs link nothing extra. A runtime the user
      * already listed is left alone (no duplicate-symbol llvm-link error). */
     int need_cxxstl = 0;   /* module references the std exception ABI */
+    int need_iostream = 0; /* module references the libc++ iostream/locale ABI */
     if (!fail) {
         struct { int bit; const char *tu; int listed; } rts[2] = {
             { CVM_PROBE_F64, CVM_F64_RUNTIME_TU, 0 },
@@ -647,7 +661,8 @@ int main(int argc, char **argv) {
             pargv[pn++] = bc_paths[i];
             pargv[pn]   = NULL;
             int prc = run_cmd(&cli, pargv);
-            if (prc & ~(CVM_PROBE_F64 | CVM_PROBE_I64 | CVM_PROBE_CXXSTL)) {
+            if (prc & ~(CVM_PROBE_F64 | CVM_PROBE_I64 | CVM_PROBE_CXXSTL
+                        | CVM_PROBE_IOSTREAM)) {
                 fprintf(stderr, "cvm-cc: runtime probe failed on %s "
                         "(exit %d)\n", bc_paths[i], prc);
                 fail = 1;
@@ -658,6 +673,7 @@ int main(int argc, char **argv) {
              * reference (the f64/i64 scan is cheap). */
         }
         need_cxxstl = (need & CVM_PROBE_CXXSTL) != 0;
+        need_iostream = (need & CVM_PROBE_IOSTREAM) != 0;
 
         for (int j = 0; j < 2 && !fail; ++j) {
             if (!(need & rts[j].bit) || rts[j].listed) continue;
@@ -724,6 +740,37 @@ int main(int argc, char **argv) {
             bc_paths[bc_count] = bc;
             bc_owned[bc_count] = 1;
             ++bc_count;
+        }
+    }
+
+    /* Auto-link the PREBUILT iostream/locale library cxxio.bc when the program
+     * references the libc++ stream/locale ABI (CVM_PROBE_IOSTREAM). Unlike the
+     * other runtimes, cxxio is NOT compiled on the fly — it is the vendored
+     * libc++ src subset, built once into runtime_dir/cxxio.bc by build_cxxio.sh
+     * (like picolibc.bc). It depends on cvm_cxxstl (basic_string + std
+     * exceptions, linked above since the probe implies cxxstl) and on the cart's
+     * picolibc.bc being built with the locale `*_l` functions (--with-locale). */
+    if (!fail && need_iostream) {
+        int listed = 0;
+        for (int i = 0; i < cli.input_count; ++i)
+            if (strcmp(basename_of(cli.inputs[i]), "cxxio.bc") == 0) listed = 1;
+        if (!listed) {
+            static char cxxio[1100];
+            snprintf(cxxio, sizeof cxxio, "%s/cxxio.bc", cli.runtime_dir);
+            if (!file_exists(cxxio)) {
+                fprintf(stderr, "cvm-cc: the program uses <iostream>/<locale> but "
+                        "%s is missing — build it with runtime/lib/build_cxxio.sh\n",
+                        cxxio);
+                fail = 1;
+            } else if (bc_count >= bc_cap) {
+                fprintf(stderr, "cvm-cc: too many inputs to auto-link cxxio.bc "
+                        "(max %d)\n", bc_cap);
+                fail = 1;
+            } else {
+                bc_paths[bc_count] = cxxio;   /* prebuilt; not owned */
+                bc_owned[bc_count] = 0;
+                ++bc_count;
+            }
         }
     }
 

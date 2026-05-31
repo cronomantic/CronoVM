@@ -29,7 +29,9 @@
  * cart's C library (picolibc / SDK). */
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -155,3 +157,51 @@ const void* std::__shared_weak_count::__get_deleter(const std::type_info&) const
  * We have no dylib, so force the instantiation HERE; this emits every member
  * once into cvm_cxxstl.bc, satisfying the extern references from cart code. */
 template class std::basic_string<char, std::char_traits<char>, std::allocator<char> >;
+
+/* operator+(const char*, const string&) — a free function template instantiated
+ * in the dylib; force it here (the iostream/locale library references it). */
+template std::string std::operator+ <char, std::char_traits<char>, std::allocator<char> >(
+    const char*, const std::string&);
+
+/* ---- out-of-line libc++ runtime bits the iostream/locale library needs ---- *
+ * These live in the libc++ dylib (and libc++abi) on a hosted system; with no
+ * dylib we provide them here, against the toolchain headers so the mangling is
+ * ABI-exact. cxxio.bc (the vendored stream/locale TUs) pulls them. */
+
+/* libc++ internal throw helpers (versioned std::__1). They centralise the throw
+ * so callers stay small; route to the matching exception type cvm_cxxstl already
+ * defines above. */
+_LIBCPP_BEGIN_NAMESPACE_STD
+void __throw_runtime_error(const char* msg) { throw runtime_error(msg); }
+
+/* std::call_once's slow path. The VM is cooperative (no preemption), so there is
+ * no race: if the flag is not already the "complete" sentinel (~0), run the
+ * initialiser and mark it complete. (The threaded libc++ src guards with a futex;
+ * unnecessary here.) Signature matches once_flag::_State_type == unsigned long. */
+void __call_once(volatile unsigned long& flag, void* arg, void (*func)(void*)) {
+    if (flag == ~0ul) return;
+    func(arg);
+    flag = ~0ul;
+}
+_LIBCPP_END_NAMESPACE_STD
+
+/* libc++abi-level symbols clang/libc++ reference in the NON-versioned std
+ * namespace (ABI-fixed names, normally in libc++abi). We have only the minimal
+ * cvm_cxxrt ABI, so define them here. */
+namespace std {
+/* uncaught_exceptions(): used by ostream/istream sentry to decide whether to
+ * flush during stack unwinding. cvm_cxxrt tracks none across the cooperative
+ * model; 0 ("not unwinding") is the safe answer for the stream sentries. */
+int uncaught_exceptions() noexcept { return 0; }
+
+/* __throw_bad_alloc(): allocation failure. On the VM an OOM is fatal, but throw
+ * the proper bad_alloc (cvm_cxxstl defines it) so a cart's catch can run. */
+void __throw_bad_alloc() { throw bad_alloc(); }
+
+/* std::bad_cast: thrown by a failed dynamic_cast (use_facet's facet lookup uses
+ * one). Defining the key function (dtor) emits its vtable + type_info; what()
+ * gives the message. Inherits std::exception (vtable/type_info from cvm_cxxstl). */
+bad_cast::bad_cast() noexcept {}
+bad_cast::~bad_cast() noexcept {}
+const char* bad_cast::what() const noexcept { return "std::bad_cast"; }
+}

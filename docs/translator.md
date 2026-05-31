@@ -320,7 +320,10 @@ Lowered `f64` operations:
   negation for the unordered-relational / `uno` / `ueq` predicates; `true`/
   `false` fold to a constant
 - `fneg` → inline `xor` of the sign bit (no call)
-- `sitofp` / `uitofp` / `fpext` (→ `double`) → `__cvm_f_from_{i32,u32,f32}` (sret)
+- `sitofp` / `uitofp` / `fpext` (→ `double`) → `__cvm_f_from_{i32,u32,f32}` (sret).
+  An **`i64` source** uses `__cvm_f_from_{i64,u64}` (the operand is passed as a
+  wide lo/hi pair, not a 32-bit scalar), composing `hi*2^32 + lo` with a single
+  rounding — used by `(double)int64`, e.g. picolibc `strtod`'s `__atod_engine`
 - `fptosi` / `fptoui` / `fptrunc` (`double` →) → `__cvm_f_to_{i32,u32,f32}`
 - `double` constant / `load` / `store` → materialised / two-word, like `i64`.
   `double` (and `float`) **global initialisers** are serialised into the DATA

@@ -43,7 +43,17 @@ PICOLIBC_BC="$RTLIB/picolibc.bc"
 if printf '%s\n' "${fixtures[@]}" | grep -q 'conf_pico'; then
   LLVM_LINK="$(dirname "$CLANG")/llvm-link"
   [[ -x "$LLVM_LINK" || -x "$LLVM_LINK.exe" ]] || LLVM_LINK="llvm-link"
-  if ! CLANG="$CLANG" LLVM_LINK="$LLVM_LINK" bash "$RTLIB/build_picolibc.sh" --with-stdio >/dev/null; then
+  # An iostream/locale fixture needs picolibc's xlocale `*_l` functions
+  # (--with-locale) and the prebuilt libc++ stream/locale library cxxio.bc that
+  # cvm-cc auto-links on the CVM_PROBE_IOSTREAM probe bit. Build both then.
+  pico_flags=(--with-stdio)
+  if printf '%s\n' "${fixtures[@]}" | grep -q 'conf_pico_cpp_iostream'; then
+    pico_flags+=(--with-locale)
+    if ! CLANG="$CLANG" LLVM_LINK="$LLVM_LINK" bash "$RTLIB/build_cxxio.sh" >/dev/null; then
+      echo "run_conformance.sh: failed to build cxxio.bc" >&2; exit 1
+    fi
+  fi
+  if ! CLANG="$CLANG" LLVM_LINK="$LLVM_LINK" bash "$RTLIB/build_picolibc.sh" "${pico_flags[@]}" >/dev/null; then
     echo "run_conformance.sh: failed to build picolibc.bc" >&2; exit 1
   fi
 fi

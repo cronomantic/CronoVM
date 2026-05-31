@@ -36,6 +36,12 @@ extern LLVMValueRef cvm_llvm_get_switch_case_value(LLVMValueRef SI, unsigned i);
                                * cvm_cxxstl. 64 is bit-disjoint from 10|20 (so
                                * they OR cleanly) and 10|20|64=94 stays a valid
                                * 8-bit exit code. */
+#define CVM_PROBE_IOSTREAM 128 /* references the libc++ iostream/locale ABI ->
+                               * link cxxio.bc (the vendored libc++ stream/locale
+                               * library). 128 is bit-disjoint from 10|20|64;
+                               * 10|20|64|128=222 stays a valid 8-bit exit code.
+                               * Implies cvm_cxxstl (cxxio.bc uses basic_string +
+                               * the std exceptions) — cvm-cc links both. */
 
 static int g_errors = 0;
 
@@ -594,6 +600,18 @@ static int serialize_constant(const struct cg_globals *g, LLVMValueRef c,
         LLVMOpcode cop = LLVMGetConstOpcode(c);
         if (cop == LLVMPtrToInt || cop == LLVMIntToPtr || cop == LLVMBitCast)
             return serialize_constant(g, LLVMGetOperand(c, 0), out, off, cap);
+    }
+
+    /* A GlobalAlias in an initialiser — e.g. a C++ vtable slot referencing the
+     * COMPLETE-object destructor `~T` (D1), which libc++ emits as an alias to the
+     * BASE-object destructor (D2) when they're identical (no virtual bases). The
+     * aliasee may be a function (-> its FUNCS slot) or another global; resolve it
+     * and serialize that. Without this the alias falls through to the global-ptr
+     * path and is rejected (it is neither a function nor a global VARIABLE). */
+    if (LLVMIsAGlobalAlias(c)) {
+        LLVMValueRef aliasee = LLVMAliasGetAliasee(c);
+        if (aliasee) return serialize_constant(g, aliasee, out, off, cap);
+        return 1;
     }
 
     if (LLVMIsAConstantAggregateZero(c) || LLVMIsAConstantPointerNull(c)) {
@@ -3748,16 +3766,35 @@ static void cg_emit_f64_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
         break;
     }
     case LLVMSIToFP: case LLVMUIToFP: {
+        LLVMValueRef opnd = LLVMGetOperand(i, 0);
+        LLVMTypeRef  t    = LLVMTypeOf(opnd);
+        /* 64-bit source: `(double)(u)int64`. The operand lives in two frame
+         * slots, so it must be passed as a WIDE arg (lo,hi) to the 64-bit
+         * helper — NOT as a 32-bit scalar (which would read only the low word /
+         * garbage). Surfaced by picolibc strtod's __atod_engine ((double)u64).
+         * Only EXACTLY i64 takes this path; an odd wide width (33..63, kept
+         * sign-extended) has no unsigned meaning here, so reject it loudly
+         * rather than misconvert. */
+        if (cg_type_is_i64(t)) {
+            const char *name = (op == LLVMSIToFP) ? "__cvm_f_from_i64"
+                                                  : "__cvm_f_from_u64";
+            cg_emit_runtime_call(cg, i, name, &opnd, 1, NULL, slot, 0, 0);
+            break;
+        }
+        if (cg_type_is_wide_int(t)) {
+            ERR(cg->fn_name, "sitofp/uitofp from a non-64 wide integer (i%u) "
+                             "to double is not supported",
+                LLVMGetIntTypeWidth(t));
+            cg->had_error = 1;
+            break;
+        }
         const char *name = (op == LLVMSIToFP) ? "__cvm_f_from_i32"
                                               : "__cvm_f_from_u32";
-        LLVMValueRef opnd = LLVMGetOperand(i, 0);
         unsigned sw = 0;
-        if (op == LLVMSIToFP) {
-            LLVMTypeRef t = LLVMTypeOf(opnd);
-            if (LLVMGetTypeKind(t) == LLVMIntegerTypeKind) {
-                unsigned w = LLVMGetIntTypeWidth(t);
-                if (w < 32) sw = w;   /* narrow signed -> needs sign-extension */
-            }
+        if (op == LLVMSIToFP
+            && LLVMGetTypeKind(t) == LLVMIntegerTypeKind) {
+            unsigned w = LLVMGetIntTypeWidth(t);
+            if (w < 32) sw = w;   /* narrow signed -> needs sign-extension */
         }
         cg_emit_runtime_call(cg, i, name, NULL, 0, opnd, slot, 0, sw);
         break;
@@ -6144,6 +6181,49 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     break;
                 }
 
+                /* llvm.ctlz.i64(%x, is_zero_undef) — count leading zeros of a
+                 * 64-bit value (libc++ __to_chars_integral counts digits this
+                 * way for a 64-bit int). The i64 operand is two words {hi:lo};
+                 * clz64 = (hi != 0) ? clz32(hi) : 32 + clz32(lo). The result is
+                 * 0..64, so it fits the low word; the high result word is 0. Each
+                 * clz32 is the same shift loop as ctlz.i32. */
+                if (strcmp(name, "llvm.ctlz.i64") == 0) {
+                    int idx = cg_lookup(cg, i);
+                    uint8_t lo, hi;
+                    if (cg_i64_read(cg, LLVMGetOperand(i, 0), &lo, &hi)) break;
+                    uint8_t one = cg_alloc_reg(cg);
+                    uint8_t k32 = cg_alloc_reg(cg);
+                    uint8_t clo = cg_alloc_reg(cg);
+                    uint8_t chi = cg_alloc_reg(cg);
+                    uint8_t x   = cg_alloc_reg(cg);
+                    uint8_t res = cg_alloc_reg(cg);
+                    if (cg->had_error) break;
+                    cg_emit(cg, enc_i16(CVM_OP_MOVI, one, 1));
+                    cg_emit(cg, enc_i16(CVM_OP_MOVI, k32, 32));
+                    /* clo = clz32(lo) */
+                    cg_emit(cg, enc_r  (CVM_OP_MOV,  x, lo, 0));
+                    cg_emit(cg, enc_i16(CVM_OP_MOVI, clo, 0));
+                    cg_emit(cg, enc_br (CVM_OP_BEQ, x, cg->zero_reg, 3));
+                    cg_emit(cg, enc_r  (CVM_OP_SHR, x, x, one));
+                    cg_emit(cg, enc_r  (CVM_OP_ADD, clo, clo, one));
+                    cg_emit(cg, enc_i24(CVM_OP_JMP, -4));
+                    cg_emit(cg, enc_r  (CVM_OP_SUB, clo, k32, clo));   /* 32 - n */
+                    /* chi = clz32(hi) */
+                    cg_emit(cg, enc_r  (CVM_OP_MOV,  x, hi, 0));
+                    cg_emit(cg, enc_i16(CVM_OP_MOVI, chi, 0));
+                    cg_emit(cg, enc_br (CVM_OP_BEQ, x, cg->zero_reg, 3));
+                    cg_emit(cg, enc_r  (CVM_OP_SHR, x, x, one));
+                    cg_emit(cg, enc_r  (CVM_OP_ADD, chi, chi, one));
+                    cg_emit(cg, enc_i24(CVM_OP_JMP, -4));
+                    cg_emit(cg, enc_r  (CVM_OP_SUB, chi, k32, chi));   /* 32 - n */
+                    /* res = (hi != 0) ? chi : 32 + clo */
+                    cg_emit(cg, enc_r  (CVM_OP_ADD, res, k32, clo));   /* 32 + clo */
+                    cg_emit(cg, enc_br (CVM_OP_BEQ, hi, cg->zero_reg, 1)); /* hi==0 -> skip the MOV (keep 32+clo) */
+                    cg_emit(cg, enc_r  (CVM_OP_MOV, res, chi, 0));     /* else res = chi */
+                    cg_i64_write(cg, idx, res, cg->zero_reg);
+                    break;
+                }
+
                 /* llvm.ctpop.iN(%x) — population count (set bits). No POPCNT
                  * opcode, so lower with Kernighan's loop (one iteration per set
                  * bit): n=0; while (x) { x &= x-1; n++; }. clang folds power-of-
@@ -6998,10 +7078,16 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     }
                 }
 
-                /* Lifetime markers are pure metadata in our world: they
-                 * tell the optimiser when an alloca is in/out of use, but
-                 * have no runtime effect. Drop them silently. */
-                if (strncmp(name, "llvm.lifetime.", 14) == 0) {
+                /* Lifetime + invariant markers are pure metadata in our world:
+                 * they tell the optimiser when an alloca is in/out of use or
+                 * when memory is invariant (libc++ marks the classic locale
+                 * invariant after init — locale::classic), but have no runtime
+                 * effect. Drop them silently. invariant.start returns a token
+                 * ptr consumed only by invariant.end (also dropped), so its
+                 * unwritten result is dead. */
+                if (strncmp(name, "llvm.lifetime.", 14) == 0 ||
+                    strncmp(name, "llvm.invariant.start", 20) == 0 ||
+                    strncmp(name, "llvm.invariant.end", 18) == 0) {
                     break;
                 }
 
@@ -7618,6 +7704,30 @@ static int cg_name_is_std_exc(const char *n) {
     return 0;
 }
 
+/* True if `name` is a libc++ iostream/locale ABI symbol that cxxio.bc provides
+ * (the stream classes, the locale facets/objects, the global cin/cout). The
+ * mangled class tokens are unique to that library and DISTINCT from the
+ * basic_string / exception tokens cg_name_is_std_exc matches (those are
+ * cvm_cxxstl). A module with an UNDEFINED reference to one of these pulls in the
+ * iostream/locale library, so cvm-cc auto-links cxxio.bc (+ cvm_cxxstl, which it
+ * depends on) only then — C carts and iostream-free C++ never pay. */
+static int cg_name_is_iostream(const char *n) {
+    static const char *const toks[] = {
+        /* stream classes (length-prefixed mangled component names). */
+        "13basic_istream", "13basic_ostream", "14basic_iostream",
+        "15basic_streambuf", "12basic_filebuf", "14basic_ifstream",
+        "14basic_ofstream", "13basic_fstream",
+        "13basic_stringbuf", "18basic_istringstream",
+        "18basic_ostringstream", "18basic_stringstream",
+        /* base + locale machinery. */
+        "8ios_base", "6locale", "7num_get", "7num_put", "5ctype",
+    };
+    if (!n) return 0;
+    for (unsigned i = 0; i < sizeof toks / sizeof toks[0]; ++i)
+        if (strstr(n, toks[i])) return 1;
+    return 0;
+}
+
 static int module_runtime_needs(LLVMModuleRef mod) {
     int need = 0;
     /* std exception ABI: any UNDEFINED reference (function or global — typeinfo
@@ -7631,6 +7741,20 @@ static int module_runtime_needs(LLVMModuleRef mod) {
              g; g = LLVMGetNextGlobal(g))
             if (LLVMIsDeclaration(g) && cg_name_is_std_exc(LLVMGetValueName(g)))
                 { need |= CVM_PROBE_CXXSTL; break; }
+
+    /* iostream/locale ABI: any UNDEFINED reference (function or global — the
+     * stream vtables, locale facet ids and the cin/cout objects are globals) to
+     * the libc++ stream/locale classes => link cxxio.bc. It depends on the std
+     * string + exception ABI, so imply CVM_PROBE_CXXSTL too (cvm-cc links both). */
+    for (LLVMValueRef fn = LLVMGetFirstFunction(mod);
+         fn; fn = LLVMGetNextFunction(fn))
+        if (LLVMIsDeclaration(fn) && cg_name_is_iostream(LLVMGetValueName(fn)))
+            { need |= CVM_PROBE_IOSTREAM | CVM_PROBE_CXXSTL; break; }
+    if (!(need & CVM_PROBE_IOSTREAM))
+        for (LLVMValueRef g = LLVMGetFirstGlobal(mod);
+             g; g = LLVMGetNextGlobal(g))
+            if (LLVMIsDeclaration(g) && cg_name_is_iostream(LLVMGetValueName(g)))
+                { need |= CVM_PROBE_IOSTREAM | CVM_PROBE_CXXSTL; break; }
 
     for (LLVMValueRef fn = LLVMGetFirstFunction(mod);
          fn; fn = LLVMGetNextFunction(fn))
@@ -7800,9 +7924,10 @@ int main(int argc, char **argv) {
      * returned 1, so the probe codes can't collide with those.) */
     if (probe_runtime) {
         int need = module_runtime_needs(mod);
-        if (need & CVM_PROBE_F64)    printf("f64\n");
-        if (need & CVM_PROBE_I64)    printf("i64\n");
-        if (need & CVM_PROBE_CXXSTL) printf("cxxstl\n");
+        if (need & CVM_PROBE_F64)      printf("f64\n");
+        if (need & CVM_PROBE_I64)      printf("i64\n");
+        if (need & CVM_PROBE_CXXSTL)   printf("cxxstl\n");
+        if (need & CVM_PROBE_IOSTREAM) printf("iostream\n");
         LLVMDisposeModule(mod);
         LLVMContextDispose(ctx);
         return need;

@@ -10,6 +10,28 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **C++ `<iostream>`/`<sstream>`/`<fstream>`/`<locale>` support** (the vendored
+  libc++ stream/locale library). `__config_site` now enables `LOCALIZATION` +
+  `FILESYSTEM` and selects the NEWLIB locale dispatch (to picolibc's xlocale
+  `*_l`); a matching libc++-22.1.6 `src/` subset (locale/ios/iostream/ostream/
+  fstream/system_error/error_category) is vendored under `runtime/lib/libcxx-src/`
+  and built by `build_cxxio.sh` into `cxxio.bc`. `cvm-cc` auto-links `cxxio.bc`
+  when a program references the stream/locale ABI — a new `--probe-runtime` bit
+  `CVM_PROBE_IOSTREAM` (implies `CXXSTL`); C programs and iostream-free C++ never
+  pay for it. The cart's `picolibc.bc` supplies the locale `*_l` functions when
+  built `--with-locale` (`build_picolibc.sh`). cvm-cc compiles C++ with
+  `-D_GNU_SOURCE -mlong-double-64` so picolibc's xlocale is visible and no
+  x86_fp80 long double is formed. New `conf_pico_cpp_iostream` differential
+  fixture (num_get/num_put parse+format, `long long`, `double`, fstream
+  round-trip). Known minor gap: `eofbit` after a parse that lands exactly on EOF
+  differs on the VM (cosmetic; `if (in)` / `while (in >> x)` are correct).
+- **Translator: `llvm.ctlz.i64`** (count-leading-zeros of a 64-bit value),
+  lowered as `hi ? clz32(hi) : 32 + clz32(lo)`. Emitted by libc++
+  `__to_chars_integral` (64-bit number formatting).
+- **Translator: `llvm.invariant.start`/`llvm.invariant.end`** dropped as no-ops
+  (pure memory hints, alongside `llvm.lifetime.*`). libc++ marks the classic
+  locale invariant after init.
+
 - **Translator: fixed integer vectors via per-lane scalarisation.** Clang lowers
   libc++ `std::char_traits<char>::find` (used by `std::num_get` to scan the digit
   atoms when parsing a number from a stream) to a SIMD *movemask* idiom even for a
@@ -52,6 +74,20 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Fixed
 
+- **Translator: `sitofp`/`uitofp` from `i64` to `double`** now reads the full
+  64-bit operand. It was always lowered as a 32-bit conversion
+  (`__cvm_f_from_i32`/`u32`), so `(double)int64` read only the low word / garbage
+  (e.g. `(double)(uint64_t)25` returned ~3e5). The i64 source now routes to new
+  soft-float helpers `__cvm_f_from_i64`/`__cvm_f_from_u64` with the operand passed
+  as a wide (lo,hi) pair; the helpers compose the result from the 32-bit
+  primitives as `hi*2^32 + lo` (exact halves, single rounding). Surfaced by
+  picolibc `strtod`'s `__atod_engine` (it builds the mantissa in a `uint64_t`),
+  which had made every `>> double` / `strtod` return garbage.
+- **Translator: GlobalAlias in a constant initialiser** (e.g. a C++ vtable slot
+  for the complete-object destructor `~T`, which libc++ emits as an alias to the
+  base-object destructor when identical) is now resolved to its aliasee instead
+  of being rejected (it is neither a function nor a global variable). Unblocked
+  the libc++ locale facet vtables.
 - **Translator: `zext iN -> i32` now masks to the source width** instead of being
   a bare register MOV. The MOV relied on the invariant that narrow values are
   always zero-extended in their register (true for `LDB`/`LDH` loads and `Trunc`,

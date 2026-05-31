@@ -2,3 +2,6 @@
 # to one i386-elf bitcode module). Regenerated from the external/picolibc
 # submodule + picolibc.h; never committed.
 picolibc.bc
+# Build artifact produced by build_cxxio.sh (the vendored libc++ iostream/locale
+# subset in libcxx-src/, linked to one bitcode module). Regenerated; not committed.
+cxxio.bc

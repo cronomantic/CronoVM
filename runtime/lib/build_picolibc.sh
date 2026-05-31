@@ -32,11 +32,13 @@ KEEP_LL=0
 VERBOSE=0
 WITH_MALLOC=1
 WITH_STDIO=0
+WITH_LOCALE=0
 for a in "$@"; do
   case "$a" in
     -O*) OPT="$a" ;;
     --no-malloc) WITH_MALLOC=0 ;;
     --with-stdio) WITH_STDIO=1 ;;
+    --with-locale) WITH_LOCALE=1 ;;
     --keep-ll) KEEP_LL=1 ;;
     -v|--verbose) VERBOSE=1 ;;
     *) echo "build_picolibc.sh: unknown arg '$a'" >&2; exit 2 ;;
@@ -58,6 +60,11 @@ INC=(-I"$HERE" -I"$L/include"
 
 CFLAGS=(--target=i386-elf -ffreestanding -emit-llvm -gline-tables-only "$OPT"
         -D_LIBC -DNDEBUG -U_FORTIFY_SOURCE "${INC[@]}")
+# --with-locale: make `long double` == `double` (matches cvm-cc's C++ flag), so
+# strtold/strtold_l degenerate to the double path and no x86_fp80 long-double
+# engine (__atold_engine etc., which the VM rejects) is pulled. Scoped to the
+# locale build so non-iostream picolibc.bc stays byte-identical.
+[ "$WITH_LOCALE" = 1 ] && CFLAGS+=(-mlong-double-64)
 
 # --- Source manifest: "<subdir>/<file>" relative to libc/, no .c suffix. ----
 # Curated to the standard C surface the ports need; extend as engines demand.
@@ -128,6 +135,52 @@ if [ "$WITH_STDIO" = 1 ]; then
     stdio/clearerr stdio/feof stdio/ferror stdio/fileno stdio/perror
     stdio/posixiob_stdin stdio/posixiob_stdout stdio/posixiob_stderr
     stdio/sflags stdio/fdevopen
+  )
+fi
+
+# xlocale + locale-aware `*_l` (OPTIONAL, --with-locale). Needed by the libc++
+# iostream/locale library (cxxio.bc): its facets dispatch to picolibc's POSIX
+# locale API. Only the NON-wide surface (WIDE_CHARACTERS is off in libc++). The
+# locale objects are trivial ("C"-only) in picolibc, so this is small. Implies
+# --with-stdio for the number facets. Exactly the undefined `_l`/locale symbols
+# cxxio.bc leaves (see build_cxxio.sh) plus their transitive picolibc closure.
+if [ "$WITH_LOCALE" = 1 ]; then
+  SOURCES+=(
+    # the locale objects + query (newlocale/uselocale/freelocale/setlocale/…).
+    # localedata.c owns BOTH the global locale (__global_locale = locale_C) and
+    # the thread-local current locale (_locale) — posix_locale.c only duplicates
+    # _locale, so it is deliberately NOT included (symbol-multiply-defined).
+    # locale_names.c provides __locale_names + __find_locale (setlocale/newlocale).
+    locale/newlocale locale/uselocale locale/freelocale locale/duplocale
+    locale/setlocale locale/localeconv locale/localedata locale/locale_names
+    locale/locale_ctype_ptr locale/locale_ctype_ptr_l locale/locale_mb_cur_max
+    # the `*_l` ctype variants (non-wide)
+    ctype/tolower_l ctype/toupper_l
+    # the `*_l` number parsers the num_get facet calls + their non-_l bases
+    # (picolibc keeps strto*_l under stdio/ alongside its dtoa engine, not stdlib/).
+    stdio/strtod_l stdio/strtof_l stdio/strtold_l
+    stdio/strtod stdio/strtof stdio/strtold
+    # collation + time formatting `*_l` the locale facets reference. strftime
+    # pulls the time tables (timedata) + the tz name/info globals (tzvars: GMT
+    # defaults); tzset() is a no-op in the machine port (no TZ env on the VM), so
+    # picolibc's tzset.c (TZ/getenv parsing) is intentionally NOT linked.
+    string/strcoll_l string/strxfrm_l
+    time/strftime locale/timedata time/tzvars
+    # vasprintf (the number-format facets) + its alloc-stream backend +
+    # __d_snprintf (the double->string helper strftime/strfromd use).
+    stdio/vasprintf stdio/filestrputalloc stdio/snprintfd
+    # fstream's basic_filebuf::setbuf -> setbuf -> setvbuf -> __bufio_setvbuf.
+    stdio/setbuf stdio/setvbuf stdio/bufio_setvbuf
+    # float classification leaves the dtoa/format engine pulls (__fpclassifyd/f,
+    # __isnanf). __isnand stays the machine port's (see pico_machine.c), so
+    # s_isnan.c is NOT added here (it would duplicate __isnand).
+    ../libm/common/s_fpclassify ../libm/common/sf_fpclassify
+    ../libm/common/sf_isnan
+    # NOTE: strerror_r (system_error/error_category) is NOT taken from picolibc —
+    # its strerror.c takes the address of the weak _user_strerror hook, which the
+    # translator rejects (extern address-of), the same reason string/strerror is
+    # omitted above. The embedder supplies strerror_r (pico_machine.c for the
+    # conformance fixture; cron_sys.c for a real cart), like strerror.
   )
 fi
 

@@ -50,9 +50,24 @@
 #define _LIBCPP_HAS_TERMINAL 0
 #define _LIBCPP_HAS_MUSL_LIBC 0
 #define _LIBCPP_HAS_VENDOR_AVAILABILITY_ANNOTATIONS 0
-#define _LIBCPP_HAS_FILESYSTEM 0
+// FILESYSTEM is ON because libc++ guards <fstream> behind it (basic_filebuf has
+// a filesystem::path overload) — Exult's file layer is built on std::ifstream.
+// The <filesystem> ALGORITHMS (directory_iterator, etc.) live in the vendored
+// filesystem TUs only if a program uses them; the path TYPE used by fstream's
+// open() overload is header-only, so enabling this does not by itself pull the
+// filesystem library (a cart that calls std::filesystem operations would).
+#define _LIBCPP_HAS_FILESYSTEM 1
 #define _LIBCPP_HAS_RANDOM_DEVICE 0
-#define _LIBCPP_HAS_LOCALIZATION 0
+// LOCALIZATION is ON so <istream>/<ostream>/<sstream>/<fstream>/<locale> are
+// available (Exult's file layer is built on std::istream). The locale facets
+// dispatch to picolibc's xlocale `*_l` C functions via libc++'s NEWLIB support
+// header (_LIBCPP_LIBC_NEWLIB below) — picolibc's own PICOLIBC support path
+// lacks the ctype rune table in this libc++, so NEWLIB is the working knob.
+// WIDE_CHARACTERS / UNICODE stay OFF (no cart needs the wchar facets, and they
+// pull a much larger `_l` surface). The iostream/locale library code lives in
+// cxxio.bc, auto-linked only when a program references it (CVM_PROBE_IOSTREAM),
+// so C carts and C++ carts that don't touch iostream never pay for it.
+#define _LIBCPP_HAS_LOCALIZATION 1
 #define _LIBCPP_HAS_UNICODE 0
 #define _LIBCPP_HAS_WIDE_CHARACTERS 0
 #define _LIBCPP_HAS_TIME_ZONE_DATABASE 0
@@ -65,8 +80,12 @@
 #define _LIBCPP_HARDENING_MODE_DEFAULT 2
 #define _LIBCPP_ASSERTION_SEMANTIC_DEFAULT 2
 
-// The C library underneath is picolibc.
-#define _LIBCPP_LIBC_PICOLIBC 1
-#define _LIBCPP_LIBC_NEWLIB 0
+// The C library underneath is picolibc. For LOCALE dispatch we select libc++'s
+// NEWLIB support header (<__locale_dir/support/newlib.h>): it pulls <clocale>
+// and calls the real picolibc `*_l` functions (toupper_l/strtod_l/…), which
+// picolibc provides. The PICOLIBC support path is NOT used — in this libc++ it
+// has no default ctype rune table ("unknown rune table for this platform").
+#define _LIBCPP_LIBC_PICOLIBC 0
+#define _LIBCPP_LIBC_NEWLIB 1
 
 #endif // _LIBCPP___CONFIG_SITE

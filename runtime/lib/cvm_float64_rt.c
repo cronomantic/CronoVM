@@ -51,6 +51,29 @@ uint32_t __cvm_f_to_u32(cvm_f64 x)    { return cvm_d_to_u32(x); }
 cvm_f64  __cvm_f_from_f32(float f)    { return cvm_d_from_f32(f); }   /* sret */
 float    __cvm_f_to_f32(cvm_f64 x)    { return cvm_d_to_f32(x); }
 
+/* 64-bit integer -> double (sret). Composed from the 32-bit primitives so this
+ * TU never forms a native f64 (no bootstrap) and never re-invokes the i64->f64
+ * conversion it backs. Split into two 32-bit halves and combine as
+ *     hi * 2^32 + lo.
+ * `cvm_d_from_u32(hi/lo)` is exact (both < 2^32 <= 2^53) and multiplying by a
+ * power of two only adjusts the exponent, so `hi * 2^32` is exact too — only
+ * the final add rounds, giving a SINGLE correctly-rounded 64-bit result (no
+ * double rounding). Used by `(double)(u)int64`, e.g. picolibc strtod's
+ * `__atod_engine` (it accumulates the mantissa in a uint64_t). */
+cvm_f64 __cvm_f_from_u64(uint64_t v) {
+    uint32_t lo = (uint32_t)v;
+    uint32_t hi = (uint32_t)(v >> 32);
+    cvm_f64 dlo = cvm_d_from_u32(lo);
+    if (hi == 0u) return dlo;                  /* value fits in 32 bits */
+    cvm_f64 k16 = cvm_d_from_u32(0x10000u);    /* 2^16 */
+    cvm_f64 thi = cvm_d_mul(cvm_d_mul(cvm_d_from_u32(hi), k16), k16); /* hi*2^32 (exact) */
+    return cvm_d_add(thi, dlo);
+}
+cvm_f64 __cvm_f_from_i64(int64_t v) {
+    if (v < 0) return cvm_d_neg(__cvm_f_from_u64((uint64_t)(-(uint64_t)v)));
+    return __cvm_f_from_u64((uint64_t)v);
+}
+
 /* --- sqrt (llvm.sqrt.f64) ---------------------------------------------- *
  * Newton–Raphson y' = (y + x/y)/2 on a seed that halves x's exponent (so it
  * is within ~a factor of sqrt(2) of the answer for any magnitude). From a
