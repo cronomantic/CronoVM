@@ -192,7 +192,18 @@ static int type_in_subset(LLVMTypeRef t, char *err, size_t errlen) {
         return 1;
     case LLVMIntegerTypeKind: {
         unsigned bits = LLVMGetIntTypeWidth(t);
-        if (bits == 1 || bits == 8 || bits == 16 || bits == 32) return 1;
+        /* Any 1..32-bit integer lives in a single 32-bit register. The codegen
+         * is width-generic, NOT hardcoded to 8/16/32: Trunc masks to the target
+         * width (mask = (1<<w)-1), SExt sign-extends from `src_w` via SHL/SAR by
+         * (32-src_w), ZExt is a bare MOV (narrow values are kept zero-extended),
+         * and icmp/shift operands are normalised to their width. So odd widths
+         * (e.g. i14 from clang -O1 narrowing a COUNT in UQM comm.c text layout,
+         * or any C23 _BitInt / bitfield extraction) translate correctly. The
+         * only width-specific paths are load/store, which still accept i1/8/16/32
+         * only and cleanly REJECT (named error, not a miscompile) an arbitrary-
+         * width memory access — clang never emits one for normal C, since memory
+         * is byte-addressable and bitfields go through i8/i16/i32 + mask/shift. */
+        if (bits >= 1 && bits <= 32) return 1;
         /* i64 is legalised in codegen: a 64-bit value lives in two 32-bit
          * frame slots and every i64 operation is lowered to explicit lo/hi
          * word arithmetic (see cg_emit_i64_def). The ISA stays 32-bit. i64
@@ -542,6 +553,15 @@ static int serialize_constant(const struct cg_globals *g, LLVMValueRef c,
 
     if (LLVMIsAConstantAggregateZero(c) || LLVMIsAConstantPointerNull(c)) {
         /* out is calloc/zeroed already; nothing to write. */
+        return 0;
+    }
+    if (LLVMIsUndef(c)) {
+        /* undef / poison — a "don't care" slot, so any byte pattern is valid.
+         * clang -O1 fills the UNREACHABLE entries of a switch lookup table with
+         * poison (e.g. @switch.table.AngryHomeArilou = [i32 40, i32 poison, ...]
+         * in UQM comm dialogue): the table is only indexed for the cases that
+         * CAN occur, so the poison slots are never read. Leave them zeroed.
+         * (LLVMIsUndef matches both UndefValue and its PoisonValue subclass.) */
         return 0;
     }
     if (LLVMIsAConstantInt(c)) {
@@ -4060,6 +4080,41 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 case LLVMOr:   cv = CVM_OP_OR;   break;
                 case LLVMXor:  cv = CVM_OP_XOR;  break;
                 default:       cv = CVM_OP_ADD;  break; /* unreachable */
+                }
+                /* Narrow (iN, N<32) shift-right needs the shiftee normalised to
+                 * N bits FIRST. The VM SHR/SAR work on the full 32-bit register,
+                 * but a narrow value may carry garbage above bit N-1 after a
+                 * prior add/sub/mul/shl (the "kept zero-extended" invariant only
+                 * holds straight out of a load or trunc). So:
+                 *   LShr: zero-extend  -> AND lhs with (1<<N)-1, then SHR
+                 *   AShr: sign-extend  -> SHL/SAR lhs by (32-N), then SAR
+                 * Without this, `lshr iN` shifts stray high bits down and
+                 * `ashr iN` replicates bit 31 instead of bit N-1 — a silent
+                 * miscompile, exposed by _BitInt and by clang -O1 narrowing a
+                 * value to an odd width (e.g. the i14 in UQM comm.c text layout).
+                 * Shl needs no fixup (consumers re-normalise); N==32 is exact. */
+                if (op == LLVMLShr || op == LLVMAShr) {
+                    unsigned rw = LLVMGetIntTypeWidth(LLVMTypeOf(i));
+                    if (rw < 32) {
+                        uint8_t nl = cg_alloc_reg(cg);
+                        if (cg->had_error) break;
+                        if (op == LLVMLShr) {
+                            uint32_t mask = (uint32_t)(((uint64_t)1 << rw) - 1u);
+                            cg_emit_load_const32(cg, (uint8_t)CG_REG_SCRATCH,
+                                                 (int32_t)mask);
+                            cg_emit(cg, enc_r(CVM_OP_AND, nl, lhs,
+                                              (uint8_t)CG_REG_SCRATCH));
+                        } else {
+                            int16_t sh = (int16_t)(32u - rw);
+                            cg_emit(cg, enc_i16(CVM_OP_MOVI,
+                                                (uint8_t)CG_REG_SCRATCH, sh));
+                            cg_emit(cg, enc_r(CVM_OP_SHL, nl, lhs,
+                                              (uint8_t)CG_REG_SCRATCH));
+                            cg_emit(cg, enc_r(CVM_OP_SAR, nl, nl,
+                                              (uint8_t)CG_REG_SCRATCH));
+                        }
+                        lhs = nl;
+                    }
                 }
                 cg_emit(cg, enc_r(cv, dst, lhs, rhs));
                 break;

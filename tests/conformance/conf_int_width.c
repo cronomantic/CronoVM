@@ -24,6 +24,37 @@ static uint64_t NOINLINE shl64(uint64_t a, int n) { return a << n; }
 static uint64_t NOINLINE shr64(uint64_t a, int n) { return a >> n; }
 static int64_t  NOINLINE sar64(int64_t a, int n)  { return a >> n; }
 
+/* Arbitrary (non-power-of-2) integer widths via _BitInt, kept as REGISTER SSA
+ * (no address taken, so no iN load/store — matching how clang -O1 narrows a
+ * value into an odd width, e.g. the i14 it derives in UQM comm.c text layout).
+ * Exercises trunc i32->iN, iN add/mul/ashr/lshr, signed + unsigned iN compares,
+ * and sext/zext iN->i32 — all the width-generic codegen paths. The values are
+ * N-bit so host-64 and VM-32 agree bit-for-bit. */
+typedef          _BitInt(14) bi14;
+typedef unsigned _BitInt(14) bu14;
+typedef          _BitInt(7)  bi7;
+typedef          _BitInt(13) bi13;
+
+static int32_t NOINLINE w14(int32_t a, int32_t b, int n) {
+    bi14 x = (bi14)a, y = (bi14)b;   /* trunc i32 -> i14 (signed) */
+    x = x + y;                       /* add  i14 */
+    x = x * (bi14)3;                 /* mul  i14 */
+    x = x >> (n & 13);               /* ashr i14 (arithmetic) */
+    bu14 u = (bu14)a;                /* trunc i32 -> i14 (unsigned) */
+    u = u >> (n & 13);               /* lshr i14 (logical) */
+    int cs = (x < y);                /* signed   icmp i14 */
+    int cu = (u < (bu14)b);          /* unsigned icmp i14 */
+    return (int32_t)x + (int32_t)u * 7 + cs * 101 + cu * 1009; /* sext/zext i14->i32 */
+}
+static int32_t NOINLINE w7(int32_t a, int n) {
+    bi7 x = (bi7)a; x = x + (bi7)5; x = x >> (n & 6);
+    return (int32_t)x;               /* sext i7->i32 */
+}
+static int32_t NOINLINE w13(int32_t a, int32_t b) {
+    bi13 x = (bi13)a, y = (bi13)b; x = x * y;
+    return (int32_t)x;               /* mul i13 + sext */
+}
+
 static volatile int32_t seeds[8] = { 0, 1, -1, 7, -7, 30000, -30000, 1234567 };
 
 int conf_main(void) {
@@ -64,6 +95,13 @@ int conf_main(void) {
             MIX64(shr64((uint64_t)a, j));
             MIX64(sar64(a, j));
         }
+
+        /* arbitrary (non-power-of-2) widths (reuses `n` from the rotates above) */
+        for (int j = 0; j < 8; ++j) {
+            MIX(w14(x, seeds[j], n));
+            MIX(w13(x, seeds[j]));
+        }
+        MIX(w7(x, n));
     }
 
     #undef MIX
