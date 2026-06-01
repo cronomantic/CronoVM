@@ -57,7 +57,12 @@ command -v "$LLVM_LINK" >/dev/null || { echo "llvm-link not found" >&2; exit 1; 
 # /usr/include/string.h would be found first on Linux ("bits/libc-header-start.h").
 # (Now that libc++ is vendored too, the version-skew that previously broke the
 # Linux CI is gone — any clang 21+ compiles this. See ci-runs-failing.)
-CXXFLAGS=(--target=i386-elf -ffreestanding -std=c++23 -fno-rtti -mlong-double-64
+# RTTI ON: a real C++ program (e.g. the Exult engine) subclasses the iostream
+# classes (custom streambuf for a ROM/SDL_IOStream source) and uses dynamic_cast,
+# so the library must emit the iostream/locale class type_info — like a normal
+# libc++ build. (-fno-rtti here left those externally-undefined: "typeinfo for
+# std::basic_istream<char> has no initializer".)
+CXXFLAGS=(--target=i386-elf -ffreestanding -std=c++23 -mlong-double-64
           -nostdinc++ -isystem "$V1"
           -I "$HERE" -I "$SRC/include" -isystem "$PICO_INC"
           -D_LIBCPP_BUILDING_LIBRARY -D_GNU_SOURCE -DNDEBUG

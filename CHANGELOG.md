@@ -10,6 +10,14 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **`cxxio.bc` now builds with RTTI** (dropped `-fno-rtti` from `build_cxxio.sh`),
+  so the vendored libc++ iostream/locale classes emit their `type_info`. A real
+  C++ program (the Exult port) subclasses the iostream classes — a custom
+  `std::streambuf` over a ROM/`SDL_IOStream` source — and uses `dynamic_cast`,
+  which needs the base classes' RTTI; `-fno-rtti` left it externally undefined
+  ("typeinfo for `std::basic_istream<char>` has no initializer"). Toolchain-only
+  (no C cart links `cxxio.bc`); conformance corpus still 32/32.
+
 - **Translator: `cvm_sys_*` host syscalls under C++ exception handling.** When a
   syscall call site sits in an EH scope, clang emits it as an `invoke` (any
   `extern "C"` callee is assumed to be able to throw), but the translator only
