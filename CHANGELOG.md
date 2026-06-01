@@ -10,6 +10,19 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **Translator: `cvm_sys_*` host syscalls under C++ exception handling.** When a
+  syscall call site sits in an EH scope, clang emits it as an `invoke` (any
+  `extern "C"` callee is assumed to be able to throw), but the translator only
+  recognised the `cvm_sys_` syscall form on the plain-`call` path — so the
+  `invoke` form failed with "extern is not supported". A host syscall cannot throw
+  a C++ exception, so the invoke's unwind edge is dead: the syscall lowering is
+  now factored into `cg_emit_syscall_body` and shared by both the `call` dispatch
+  and the `invoke` handler, the latter emitting the `SYSCALL` and branching
+  straight to the normal successor (no EH frame). Surfaced by the first C++ cart
+  (the Exult port) calling a `cron_*`/`cvm_sys_*` wrapper inside an iostream
+  scope. (The differential conformance corpus has no host syscalls, so this is
+  covered by the C++-cart toolchain smoke rather than a `conf_*` fixture.)
+
 - **C++ `<iostream>`/`<sstream>`/`<fstream>`/`<locale>` support** (the vendored
   libc++ stream/locale library). `__config_site` now enables `LOCALIZATION` +
   `FILESYSTEM` and selects the NEWLIB locale dispatch (to picolibc's xlocale

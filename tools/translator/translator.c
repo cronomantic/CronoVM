@@ -4003,6 +4003,42 @@ static long cg_emit_eh_desc(struct cg *cg, LLVMValueRef lp) {
     return (long)desc_off;
 }
 
+/* Lower a call/invoke to a cvm_sys_* host syscall: args in R0..R(narg-1), a
+ * SYSCALL with the import index, scalar result back from R0. Shared by the
+ * plain-`call` dispatch and the `invoke` handler — a syscall can't throw a C++
+ * exception, so clang may emit it as an `invoke` (any extern "C" callee inside
+ * an EH scope) but the unwind edge is dead. Returns 1 on error (sets had_error). */
+static int cg_emit_syscall_body(struct cg *cg, LLVMValueRef i,
+                                LLVMValueRef callee, const char *name) {
+    unsigned narg = LLVMGetNumArgOperands(i);
+    if (narg > 8) {
+        ERR(cg->fn_name, "syscall '%s' has %u args; max 8", name, narg);
+        cg->had_error = 1; return 1;
+    }
+    int sid = cg_import_lookup_or_add(cg, callee, name);
+    if (sid > 0xFFFF) {
+        ERR(cg->fn_name, "more than 65536 imports");
+        cg->had_error = 1; return 1;
+    }
+    /* Read all arg sources before any MOV, so cg_reg_for for constants emits
+     * MOVI ahead of the arg moves. */
+    uint8_t arg_regs[8];
+    for (unsigned k = 0; k < narg; ++k)
+        arg_regs[k] = cg_reg_for(cg, LLVMGetOperand(i, k));
+    if (cg->had_error) return 1;
+    for (unsigned k = 0; k < narg; ++k)
+        if (arg_regs[k] != k)
+            cg_emit(cg, enc_r(CVM_OP_MOV, (uint8_t)k, arg_regs[k], 0));
+    cg_emit(cg, enc_i16(CVM_OP_SYSCALL, 0, (int16_t)sid));
+    LLVMTypeRef rty = LLVMTypeOf(i);
+    if (LLVMGetTypeKind(rty) != LLVMVoidTypeKind) {
+        uint8_t dst = cg->regs[cg_lookup(cg, i)];
+        if (dst != 0)
+            cg_emit(cg, enc_r(CVM_OP_MOV, dst, 0, 0));
+    }
+    return 0;
+}
+
 /* Emit the calling sequence for a user/indirect/coro call instruction `i`
  * (callee/callee_fn/name precomputed by the dispatch in case LLVMCall). Shared
  * by plain `call` and by `invoke` (whose EH wrapper calls this for the actual,
@@ -5281,6 +5317,23 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 if (callee_fn) { size_t nl; iname = LLVMGetValueName2(callee_fn, &nl); }
                 LLVMBasicBlockRef normal_bb = LLVMGetNormalDest(i);
                 LLVMBasicBlockRef unwind_bb = LLVMGetUnwindDest(i);
+
+                /* A cvm_sys_* host syscall cannot throw a C++ exception, but
+                 * clang still emits it as an `invoke` when the call site sits in
+                 * an EH scope (any extern "C" callee — e.g. an Exult C++ TU
+                 * calling a cron_ wrapper / cvm_sys_ syscall). The unwind edge
+                 * is dead, so:
+                 * lower it as a plain SYSCALL and branch straight to the normal
+                 * successor, skipping all the EH-frame machinery below. */
+                if (callee_fn && iname && strncmp(iname, "cvm_sys_", 8) == 0) {
+                    if (cg_emit_syscall_body(cg, i, callee, iname)) break;
+                    cg_emit_phi_moves(cg, cg->cur_block, normal_bb);
+                    if (cg->had_error) break;
+                    cg_queue_fixup(cg, cg->count, normal_bb, 8, 24);
+                    cg_emit(cg, enc_i24(CVM_OP_JMP, 0));
+                    break;
+                }
+
                 LLVMValueRef lp = cg_block_landingpad(unwind_bb);
                 if (!lp) {
                     ERR(cg->fn_name,
@@ -6975,38 +7028,9 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
 
                 /* Calls to cvm_sys_* lower to SYSCALL with the matching
                  * import index. Args go in R0..R(narg-1); return value
-                 * comes back in R0. */
+                 * comes back in R0. (Shared with the invoke handler.) */
                 if (strncmp(name, "cvm_sys_", 8) == 0) {
-                    unsigned narg = LLVMGetNumArgOperands(i);
-                    if (narg > 8) {
-                        ERR(cg->fn_name,
-                            "syscall '%s' has %u args; max 8", name, narg);
-                        cg->had_error = 1;
-                        break;
-                    }
-                    int sid = cg_import_lookup_or_add(cg, callee, name);
-                    if (sid > 0xFFFF) {
-                        ERR(cg->fn_name, "more than 65536 imports");
-                        cg->had_error = 1;
-                        break;
-                    }
-                    /* Read all arg sources before any MOV, so cg_reg_for
-                     * for constants emits MOVI ahead of the arg moves. */
-                    uint8_t arg_regs[8];
-                    for (unsigned k = 0; k < narg; ++k)
-                        arg_regs[k] = cg_reg_for(cg, LLVMGetOperand(i, k));
-                    if (cg->had_error) break;
-                    for (unsigned k = 0; k < narg; ++k)
-                        if (arg_regs[k] != k)
-                            cg_emit(cg, enc_r(CVM_OP_MOV,
-                                              (uint8_t)k, arg_regs[k], 0));
-                    cg_emit(cg, enc_i16(CVM_OP_SYSCALL, 0, (int16_t)sid));
-                    LLVMTypeRef rty = LLVMTypeOf(i);
-                    if (LLVMGetTypeKind(rty) != LLVMVoidTypeKind) {
-                        uint8_t dst = cg->regs[cg_lookup(cg, i)];
-                        if (dst != 0)
-                            cg_emit(cg, enc_r(CVM_OP_MOV, dst, 0, 0));
-                    }
+                    cg_emit_syscall_body(cg, i, callee, name);
                     break;
                 }
 
