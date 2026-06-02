@@ -10,6 +10,15 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **`cvm_cxxstl.cpp`: `std::bad_function_call` out-of-line members.** libc++ makes
+  this exception's destructor its key function (the vtable + `type_info` live in the
+  dylib), so any cart that invokes a possibly-empty `std::function` referenced
+  `_ZTINSt3__117bad_function_callE` externally → "extern not supported". The
+  destructor and `what()` are now defined here (under the same availability macros
+  the libc++ headers use), emitting the vtable + `type_info` locally — same pattern
+  as `bad_cast`/`bad_alloc`. Surfaced by the Exult port installing its file-stream
+  factories as `std::function`. C++-only (no C cart links `cvm_cxxstl`).
+
 - **`cxxio.bc` now builds with RTTI** (dropped `-fno-rtti` from `build_cxxio.sh`),
   so the vendored libc++ iostream/locale classes emit their `type_info`. A real
   C++ program (the Exult port) subclasses the iostream classes — a custom

@@ -30,6 +30,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -183,6 +184,20 @@ void __call_once(volatile unsigned long& flag, void* arg, void (*func)(void*)) {
     func(arg);
     flag = ~0ul;
 }
+
+/* std::bad_function_call (versioned std::__1): thrown when an empty std::function
+ * is invoked. Exult installs its file-stream factories (U7set_*_factory) as
+ * std::function, so the empty-call guard instantiates this type and references
+ * its vtable/type_info — externally, since libc++ makes the dtor the key function
+ * (it lives in the dylib we don't have). Defining the out-of-line members the
+ * headers declare (under the same availability macros) emits the vtable + the
+ * type_info locally. Inherits std::exception (vtable/type_info from above). */
+#if _LIBCPP_AVAILABILITY_HAS_BAD_FUNCTION_CALL_KEY_FUNCTION
+bad_function_call::~bad_function_call() noexcept {}
+#endif
+#if _LIBCPP_AVAILABILITY_HAS_BAD_FUNCTION_CALL_GOOD_WHAT_MESSAGE
+const char* bad_function_call::what() const noexcept { return "std::bad_function_call"; }
+#endif
 _LIBCPP_END_NAMESPACE_STD
 
 /* libc++abi-level symbols clang/libc++ reference in the NON-versioned std
