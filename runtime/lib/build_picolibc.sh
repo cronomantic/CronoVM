@@ -96,10 +96,13 @@ SOURCES=(
   ctype/isupper ctype/islower ctype/isxdigit ctype/toupper ctype/tolower
   # libm (math.h, double precision) — added on demand. UQM's planet-surface
   # generator (plangen/pl_stuff) needs exp() + acos(); acos pulls sqrt, both pull
-  # the error helpers + exp's data table. f64 lowers to the soft-float runtime.
+  # the error helpers + exp's data table. Exult's gamma table (gamma.h) needs
+  # pow(); pow's core is common/pow.c with its own pow_log_data table (it reuses
+  # exp_data) and calls fabs() (s_fabs). f64 lowers to the soft-float runtime.
   # (Paths are ../libm relative to libc/; the loop normalises them.) __isnand
   # (referenced transitively) is the embedder's, in cron_sys.c.
   ../libm/math/s_exp ../libm/math/s_acos ../libm/math/s_sqrt ../libm/math/s_log
+  ../libm/math/s_pow ../libm/math/s_fabs ../libm/common/pow_log_data
   ../libm/common/exp_data ../libm/common/log_data
   ../libm/common/math_err_oflow ../libm/common/math_err_uflow
   ../libm/common/math_err_invalid ../libm/common/math_err_divzero
