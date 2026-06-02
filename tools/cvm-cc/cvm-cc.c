@@ -171,6 +171,9 @@ static void usage(FILE *f) {
         "                             Use for the C library (picolibc/SDK)\n"
         "                             headers when compiling C++ so libc++'s\n"
         "                             wrapper headers win and #include_next.\n"
+        "  -include <file>            force-include <file> before each TU\n"
+        "                             (a freestanding prelude of headers an\n"
+        "                             upstream's own headers assume; repeatable)\n"
         "  -D<macro>[=val]            predefine a macro (repeatable)\n"
         "  -std=<std>                 language standard (C++ defaults to c++20)\n"
         "  -O0|-O1|-O2|-O3|-Os        optimisation level (default -O1)\n"
@@ -402,10 +405,15 @@ static int parse_argv(int argc, char **argv, struct cli *cli) {
                 return 2;
             }
             cli->defines[cli->define_count++] = a;
-        } else if (strcmp(a, "-isystem") == 0 || strcmp(a, "-idirafter") == 0) {
-            /* Two-token clang include flags, forwarded verbatim (in order).
+        } else if (strcmp(a, "-isystem") == 0 || strcmp(a, "-idirafter") == 0
+                   || strcmp(a, "-include") == 0) {
+            /* Two-token clang flags, forwarded verbatim (in order).
              * -idirafter is how a C++ build demotes the C library headers
-             * below libc++ (see struct cli). */
+             * below libc++ (see struct cli). -include force-includes a header
+             * before each TU — used to supply a freestanding "prelude" of
+             * transitively-assumed standard headers (e.g. <cctype>) that an
+             * upstream engine's own headers expect to already be visible,
+             * without patching that engine's source. */
             if (i + 1 >= argc) { usage(stderr); return 2; }
             if (cli->passthru_count + 2 > MAX_PASSTHRU) {
                 fprintf(stderr, "cvm-cc: too many passthrough args (max %d)\n",
