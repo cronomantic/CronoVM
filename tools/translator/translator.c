@@ -1818,42 +1818,86 @@ static void cg_phi_write_from(struct cg *cg, unsigned dst_loc, uint8_t src) {
     }
 }
 
-/* Resolve a WIDE (i64/f64) phi source's lo/hi word locations: slot locs for a
- * wide SSA value, materialised registers for a wide constant, the zero
- * register for undef. Mirrors cg_phi_src_loc for the two-word case. */
-static void cg_phi_wide_src_locs(struct cg *cg, LLVMValueRef src,
-                                 unsigned *lo, unsigned *hi) {
-    int idx = cg_lookup(cg, src);
-    if (idx >= 0 && cg->i64_slot[idx] != CG_NO_SLOT) {
-        *lo = PHI_SLOT_FLAG | cg->i64_slot[idx];
-        *hi = PHI_SLOT_FLAG | (unsigned)(cg->i64_slot[idx] + 1);
-        return;
+/* Emit ONE location-to-location copy (register or value-spill slot on either
+ * side). A slot->slot copy stages through `stage` (a scratch register). R254 is
+ * used internally by the slot LDW/STW address arithmetic, so `stage` must not be
+ * R254 (cg_alloc_reg never hands out R254). Used by the parallel-copy
+ * sequentializer (cg_emit_phi_moves' conflict path). */
+static void cg_phi_copy_loc(struct cg *cg, unsigned dst, unsigned src,
+                            uint8_t stage) {
+    if (src == dst) return;
+    int ss = cg_loc_is_slot(src), ds = cg_loc_is_slot(dst);
+    if (ss && ds) {                 /* slot -> slot: via the staging register */
+        cg_phi_read_to(cg, src, stage);
+        cg_phi_write_from(cg, dst, stage);
+    } else if (ss) {                /* slot -> register */
+        cg_phi_read_to(cg, src, (uint8_t)dst);
+    } else if (ds) {                /* register -> slot */
+        cg_phi_write_from(cg, dst, (uint8_t)src);
+    } else {                        /* register -> register */
+        cg_emit(cg, enc_r(CVM_OP_MOV, (uint8_t)dst, (uint8_t)src, 0));
     }
-    uint32_t clo, chi;
-    if (cg_wide_const_words(src, &clo, &chi) == 0) {
-        uint8_t rlo = cg_alloc_reg(cg); if (cg->had_error) return;
-        cg_emit_load_const32(cg, rlo, (int32_t)clo);
-        uint8_t rhi = cg_alloc_reg(cg); if (cg->had_error) return;
-        cg_emit_load_const32(cg, rhi, (int32_t)chi);
-        *lo = rlo; *hi = rhi;
-        return;
+}
+
+/* Intern a location (register id or PHI_SLOT_FLAG|slot) into the parallel arrays
+ * Lv[]/loc_cur[]/loc_pred[], returning its compact index. New locations start
+ * with no current value (loc_cur=-1) and no defining move (loc_pred=-1). */
+static int cg_loc_intern(unsigned *Lv, int *loc_cur, int *loc_pred,
+                         int *nL, unsigned v) {
+    for (int k = 0; k < *nL; ++k) if (Lv[k] == v) return k;
+    int k = (*nL)++;
+    Lv[k] = v; loc_cur[k] = -1; loc_pred[k] = -1;
+    return k;
+}
+
+/* Materialise a non-location phi source (constant / global address / fp / null)
+ * into a fresh transient via cg_reg_for, then write it to `dst`, RECYCLING the
+ * transient (next_reg snapshot/restore) so it is dead the instant the move
+ * completes. An edge with many constant phi sources therefore uses O(1) scratch
+ * — not one persistent transient per constant, which exhausted the 23-register
+ * emit scratch window when the constants were materialised up front (Exult's
+ * BilinearScalerInternal_2x: 24 constant phi inputs on one back-edge at
+ * near-full register pressure). Constants are dependency-free in the parallel
+ * copy (a constant is never a destination, so no move reads it), so deferring
+ * their materialisation to emit time changes nothing about ordering. */
+static void cg_phi_emit_const(struct cg *cg, unsigned dst, LLVMValueRef cv) {
+    int saved = cg->next_reg;
+    uint8_t r = cg_reg_for(cg, cv);
+    if (!cg->had_error) cg_phi_write_from(cg, dst, r);
+    cg->next_reg = saved;
+}
+
+/* Materialise a 32-bit immediate (one word of a wide constant, or 0 for undef)
+ * into `dst`, recycling via `stage` for a slot destination. */
+static void cg_phi_emit_word(struct cg *cg, unsigned dst, int32_t w,
+                             uint8_t stage) {
+    if (cg_loc_is_slot(dst)) {
+        cg_emit_load_const32(cg, stage, w);
+        cg_phi_write_from(cg, dst, stage);
+    } else {
+        cg_emit_load_const32(cg, (uint8_t)dst, w);
     }
-    if (LLVMIsUndef(src)) { *lo = cg->zero_reg; *hi = cg->zero_reg; return; }
-    ERR(cg->fn_name, "internal: wide phi source without a slot or constant");
-    cg->had_error = 1;
 }
 
 static void cg_emit_phi_moves(struct cg *cg,
                               LLVMBasicBlockRef from, LLVMBasicBlockRef to)
 {
-    /* A large function (e.g. a loop carrying hundreds of values) can have
-     * many phis on one edge; size generously. The no-conflict path emits
-     * each move through at most one transient, so an arbitrary count is
-     * fine. The conflict (rotation) path stages through temps and is
-     * bounded by the emit scratch window — a pathological rotation wider
-     * than the window errors loudly rather than corrupting. */
-    struct { unsigned src; unsigned dst; } moves[1024];
+    /* Collect this edge's phi moves as a PARALLEL COPY, then sequentialize it.
+     * Each move's source is one of:
+     *   SRC_LOC   a live location (SSA register or value-spill slot); these are
+     *             the only sources that participate in the copy's dependency
+     *             graph (a move's destination may be another move's source).
+     *   SRC_CONST a constant / global / fp / null value, materialised lazily at
+     *             emit time (cg_phi_emit_const) — dependency-free.
+     *   SRC_WORD  a 32-bit immediate word of a wide (i64/f64) constant, or 0 for
+     *             an undef wide source — dependency-free.
+     * Nothing is materialised into a register during collection, so the scratch
+     * demand is O(1) regardless of how many constants the edge carries. */
+    enum { SRC_LOC = 0, SRC_CONST = 1, SRC_WORD = 2 };
+    struct { unsigned dst; unsigned src; int kind; int32_t word;
+             LLVMValueRef cv; } moves[1024];
     int nmoves = 0;
+    const int MAXM = (int)(sizeof moves / sizeof moves[0]);
 
     for (LLVMValueRef inst = LLVMGetFirstInstruction(to);
          inst && LLVMGetInstructionOpcode(inst) == LLVMPHI;
@@ -1872,92 +1916,157 @@ static void cg_emit_phi_moves(struct cg *cg,
                 return;
             }
             LLVMValueRef sval = LLVMGetIncomingValue(inst, k);
-            if (nmoves + 2 > (int)(sizeof moves / sizeof moves[0])) {
+            if (nmoves + 2 > MAXM) {
                 ERR(cg->fn_name,
                     "internal: too many phi moves on a single edge");
                 cg->had_error = 1;
                 return;
             }
             if (cg->i64_slot[phi_idx] != CG_NO_SLOT) {
-                /* Wide (i64/f64) phi: two parallel word-moves into its slots.
-                 * They flow through the same conflict detection / staging as
-                 * scalar moves (slot locs are comparable). */
+                /* Wide (i64/f64) phi: two parallel word-moves into its slots. */
                 unsigned dlo = PHI_SLOT_FLAG | cg->i64_slot[phi_idx];
                 unsigned dhi = PHI_SLOT_FLAG |
                                (unsigned)(cg->i64_slot[phi_idx] + 1);
-                unsigned slo, shi;
-                cg_phi_wide_src_locs(cg, sval, &slo, &shi);
-                if (cg->had_error) return;
-                if (slo != dlo) { moves[nmoves].src = slo;
-                                  moves[nmoves].dst = dlo; nmoves++; }
-                if (shi != dhi) { moves[nmoves].src = shi;
-                                  moves[nmoves].dst = dhi; nmoves++; }
+                int sidx = cg_lookup(cg, sval);
+                if (sidx >= 0 && cg->i64_slot[sidx] != CG_NO_SLOT) {
+                    unsigned slo = PHI_SLOT_FLAG | cg->i64_slot[sidx];
+                    unsigned shi = PHI_SLOT_FLAG |
+                                   (unsigned)(cg->i64_slot[sidx] + 1);
+                    if (slo != dlo) { moves[nmoves].dst = dlo; moves[nmoves].src = slo;
+                                      moves[nmoves].kind = SRC_LOC; nmoves++; }
+                    if (shi != dhi) { moves[nmoves].dst = dhi; moves[nmoves].src = shi;
+                                      moves[nmoves].kind = SRC_LOC; nmoves++; }
+                } else {
+                    uint32_t clo, chi;
+                    if (cg_wide_const_words(sval, &clo, &chi) == 0) {
+                        moves[nmoves].dst = dlo; moves[nmoves].kind = SRC_WORD;
+                        moves[nmoves].word = (int32_t)clo; nmoves++;
+                        moves[nmoves].dst = dhi; moves[nmoves].kind = SRC_WORD;
+                        moves[nmoves].word = (int32_t)chi; nmoves++;
+                    } else if (LLVMIsUndef(sval)) {
+                        moves[nmoves].dst = dlo; moves[nmoves].src = cg->zero_reg;
+                        moves[nmoves].kind = SRC_LOC; nmoves++;
+                        moves[nmoves].dst = dhi; moves[nmoves].src = cg->zero_reg;
+                        moves[nmoves].kind = SRC_LOC; nmoves++;
+                    } else {
+                        ERR(cg->fn_name,
+                            "internal: wide phi source without a slot or constant");
+                        cg->had_error = 1; return;
+                    }
+                }
                 break;
             }
             unsigned dst_loc = cg_phi_dst_loc(cg, phi_idx);
-            unsigned src_loc = cg_phi_src_loc(cg, sval);
-            if (cg->had_error) return;
-            if (src_loc == dst_loc) break;       /* no-op */
-            moves[nmoves].src = src_loc;
-            moves[nmoves].dst = dst_loc;
-            nmoves++;
+            int sidx = cg_lookup(cg, sval);
+            if (sidx >= 0) {                 /* an SSA value: a real location */
+                unsigned src_loc = cg_phi_src_loc(cg, sval);
+                if (cg->had_error) return;
+                if (src_loc == dst_loc) break;        /* no-op */
+                moves[nmoves].dst = dst_loc; moves[nmoves].src = src_loc;
+                moves[nmoves].kind = SRC_LOC; nmoves++;
+            } else if (LLVMIsUndef(sval)) {  /* undef -> zero register (a loc) */
+                if (cg->zero_reg == dst_loc) break;
+                moves[nmoves].dst = dst_loc; moves[nmoves].src = cg->zero_reg;
+                moves[nmoves].kind = SRC_LOC; nmoves++;
+            } else {                         /* constant: materialise at emit */
+                moves[nmoves].dst = dst_loc; moves[nmoves].kind = SRC_CONST;
+                moves[nmoves].cv = sval; nmoves++;
+            }
             break;
         }
     }
 
-    /* Conflict iff any destination is also a source in the same batch
-     * (register or slot — see PHI_SLOT_FLAG). */
-    int conflict = 0;
-    for (int i = 0; i < nmoves && !conflict; ++i)
-        for (int j = 0; j < nmoves && !conflict; ++j)
-            if (i != j && moves[i].dst == moves[j].src) conflict = 1;
+    if (nmoves == 0) return;
 
-    if (!conflict) {
-        /* No write feeds a later read: emit each copy directly. A
-         * register destination that is itself a constant-materialised
-         * transient source is impossible (dsts are SSA homes/slots), so
-         * direct emission preserves order. */
-        for (int i = 0; i < nmoves; ++i) {
-            if (!cg_loc_is_slot(moves[i].src)
-                && !cg_loc_is_slot(moves[i].dst)) {
-                cg_phi_write_from(cg, moves[i].dst, (uint8_t)moves[i].src);
-            } else {
-                /* Through one transient: LDW/MOV src -> tmp, then tmp ->
-                 * dst (MOV/STW). Each move is independent (no conflict), and
-                 * the transient is dead the instant the move completes, so we
-                 * snapshot/restore next_reg to RECYCLE one scratch register
-                 * across all moves — otherwise a loop carrying hundreds of
-                 * spilled phis would walk next_reg off the end of the window. */
-                int saved = cg->next_reg;
-                uint8_t tmp = cg_alloc_reg(cg);
-                if (cg->had_error) return;
-                cg_phi_read_to(cg, moves[i].src, tmp);
-                cg_phi_write_from(cg, moves[i].dst, tmp);
-                cg->next_reg = saved;
-            }
-            if (cg->had_error) return;
+    /* Sequentialize the parallel copy with O(1) scratch (Boissinot et al.,
+     * Revisiting Out-of-SSA Translation, 2009): emit any move whose destination
+     * is no longer read; when only cycles remain among the location sources,
+     * save one cycle node to `spare` (reused across cycles — each cycle is
+     * fully drained before the next is broken) so its readers see the pre-edge
+     * value, freeing that node. `stage` carries slot<->slot copies. This
+     * replaces the previous "read every source into its own temp" conflict path
+     * (one scratch register per move) and the separate no-conflict fast path;
+     * the unified algorithm uses at most two scratch registers either way.
+     *
+     * Lv[k] is location k; loc_cur[k] is the location-index currently holding
+     * the value belonging to Lv[k] (Boissinot's loc[]); predmove[k] is the index
+     * of the move whose destination is Lv[k], or -1. Constant/word sources are
+     * not interned as locations (they are dependency-free). */
+    uint8_t spare = cg_alloc_reg(cg); if (cg->had_error) return;
+    uint8_t stage = cg_alloc_reg(cg); if (cg->had_error) return;
+
+    enum { MAXLOC = 2 * 1024 + 1 };           /* 2*MAXM + spare */
+    unsigned Lv[MAXLOC];
+    int  loc_cur[MAXLOC], predmove[MAXLOC];
+    char done[MAXLOC], inready[MAXLOC];
+    int  ready[MAXLOC], todo[MAXLOC];
+    int  nL = 0, rn = 0, tn = 0;
+    memset(done, 0, sizeof done);
+    memset(inready, 0, sizeof inready);
+
+    int spare_idx = cg_loc_intern(Lv, loc_cur, predmove, &nL, spare);
+    (void)spare_idx;
+
+    /* pred[dst]=move; loc[src]=src (location sources only); to_do.push(dst). */
+    for (int m = 0; m < nmoves; ++m) {
+        int di = cg_loc_intern(Lv, loc_cur, predmove, &nL, moves[m].dst);
+        predmove[di] = m;
+        todo[tn++] = di;
+        if (moves[m].kind == SRC_LOC) {
+            int si = cg_loc_intern(Lv, loc_cur, predmove, &nL, moves[m].src);
+            loc_cur[si] = si;
         }
-        return;
+    }
+    /* ready: every dst not also read as a source (its value is unneeded). */
+    for (int m = 0; m < nmoves; ++m) {
+        int di = cg_loc_intern(Lv, loc_cur, predmove, &nL, moves[m].dst);
+        if (loc_cur[di] == -1 && !inready[di]) { ready[rn++] = di; inready[di] = 1; }
     }
 
-    /* Conflict: read every source into its own temp, then write every
-     * destination. Reads see pre-edge values, satisfying parallel phi
-     * semantics even for rotations (a:=b; b:=a) and slot-to-slot feeds.
-     * The temps come from the emit scratch window (cg_alloc_reg), which is
-     * bounded; a rotation wider than the window errors loudly there rather
-     * than corrupting. Real code rarely rotates more than a handful of
-     * values on one edge. */
-    uint8_t temps[1024];
-    for (int i = 0; i < nmoves; ++i) {
-        temps[i] = cg_alloc_reg(cg);
+#define CG_PHI_PUSH(x) do {                                                   \
+        int _x = (x);                                                         \
+        if (!done[_x] && !inready[_x]) {                                      \
+            if (rn >= MAXLOC) { ERR(cg->fn_name,                              \
+                "internal: phi-copy ready overflow"); cg->had_error = 1;      \
+                return; }                                                     \
+            ready[rn++] = _x; inready[_x] = 1;                                \
+        }                                                                     \
+    } while (0)
+
+    while (tn > 0) {
+        while (rn > 0) {
+            int b = ready[--rn]; inready[b] = 0;
+            if (done[b]) continue;
+            int m = predmove[b];
+            if (m < 0) { done[b] = 1; continue; }   /* defensive */
+            if (moves[m].kind == SRC_CONST) {
+                cg_phi_emit_const(cg, Lv[b], moves[m].cv);
+                if (cg->had_error) return;
+                done[b] = 1;
+            } else if (moves[m].kind == SRC_WORD) {
+                cg_phi_emit_word(cg, Lv[b], moves[m].word, stage);
+                if (cg->had_error) return;
+                done[b] = 1;
+            } else {                                /* SRC_LOC */
+                int a = cg_loc_intern(Lv, loc_cur, predmove, &nL, moves[m].src);
+                int c = loc_cur[a];
+                cg_phi_copy_loc(cg, Lv[b], Lv[c], stage);
+                if (cg->had_error) return;
+                done[b] = 1;
+                loc_cur[a] = b;                     /* src's value now at Lv[b] */
+                if (a == c && predmove[a] >= 0) CG_PHI_PUSH(a);
+            }
+        }
+        int b = todo[--tn];
+        if (done[b]) continue;
+        /* Lv[b] is still read by a pending move -> it sits in a cycle. Save it
+         * to `spare`; readers then see the pre-edge value, freeing Lv[b]. */
+        cg_phi_copy_loc(cg, spare, Lv[b], stage);
         if (cg->had_error) return;
-        cg_phi_read_to(cg, moves[i].src, temps[i]);
-        if (cg->had_error) return;
+        loc_cur[b] = spare_idx;
+        CG_PHI_PUSH(b);
     }
-    for (int i = 0; i < nmoves; ++i) {
-        cg_phi_write_from(cg, moves[i].dst, temps[i]);
-        if (cg->had_error) return;
-    }
+#undef CG_PHI_PUSH
 }
 
 /* True if `to` carries phi moves on an edge from any predecessor — i.e. it
@@ -4982,30 +5091,39 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                      * ONE edge, so when BOTH successors carry moves we add a
                      * local skip to isolate the second. */
                     if (true_phi && false_phi) {
-                        /* Both edges carry moves: fully isolate.
-                         *   BNE cond -> (skip the false section)   cond!=0=true
-                         *   <false moves>; JMP false_bb            cond==0=false
-                         *   <true moves>;  JMP true_bb             (skip lands here) */
-                        uint32_t bne_idx = cg->count;
-                        cg_emit(cg, enc_br(CVM_OP_BNE, cond_reg, cg->zero_reg, 0));
+                        /* Both edges carry moves: isolate with a fall-through
+                         * plus an UNCONDITIONAL imm24 local skip.
+                         *   BEQ cond, zero, +1   ; cond==0 (false): fall through
+                         *   JMP true_section     ; cond!=0 (true): skip the below
+                         *   <false moves>; JMP false_bb
+                         *  true_section:
+                         *   <true moves>;  JMP true_bb
+                         * Using a JMP (imm24) rather than a conditional imm8 skip
+                         * lets the false section be arbitrarily long — the old
+                         * imm8 form capped it at 127 instructions, which a heavy
+                         * edge (Exult's BilinearScalerInternal_2x carries
+                         * hundreds of spilled phis) overflows. The JMP carries no
+                         * fixup (its target is a local offset, not a block), and
+                         * the false section between it and true_section is
+                         * fixed-size phi moves with no imm8 fixups, so branch
+                         * relaxation never inserts an instruction there — the
+                         * emit-time relative offset stays correct. */
+                        cg_emit(cg, enc_br(CVM_OP_BEQ, cond_reg, cg->zero_reg, 1));
+                        uint32_t jskip_idx = cg->count;
+                        cg_emit(cg, enc_i24(CVM_OP_JMP, 0));    /* patched below */
                         cg_emit_phi_moves(cg, cg->cur_block, false_bb);
                         cg_queue_fixup(cg, cg->count, false_bb, 8, 24);
                         cg_emit(cg, enc_i24(CVM_OP_JMP, 0));
-                        int32_t skip = (int32_t)cg->count - (int32_t)(bne_idx + 1u);
-                        if (skip < -128 || skip > 127) {
-                            /* This BNE carries no fixup (its target is a local
-                             * offset, not a block) so relaxation can't lift it;
-                             * fail loudly rather than emit a wrong skip. Only a
-                             * pathological count of phi moves on the false edge
-                             * could trigger this. */
+                        int32_t skip = (int32_t)cg->count - (int32_t)(jskip_idx + 1u);
+                        if (skip < 0 || skip > 0x7FFFFF) {
+                            /* JMP offset is a signed 24-bit immediate; a function
+                             * with millions of instructions between the two edges
+                             * is impossible in practice — fail loudly. */
                             ERR(cg->fn_name,
-                                "phi-isolation skip %d out of imm8 range "
-                                "(too many phi moves on one edge)", skip);
+                                "phi-isolation skip %d out of imm24 range", skip);
                             cg->had_error = 1;
                         } else {
-                            cg->code[bne_idx] =
-                                enc_br(CVM_OP_BNE, cond_reg, cg->zero_reg,
-                                       (int8_t)skip);
+                            cg->code[jskip_idx] = enc_i24(CVM_OP_JMP, skip);
                         }
                         cg_emit_phi_moves(cg, cg->cur_block, true_bb);
                         cg_queue_fixup(cg, cg->count, true_bb, 8, 24);
