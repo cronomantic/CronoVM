@@ -5445,6 +5445,14 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                  * successor, skipping all the EH-frame machinery below. */
                 if (callee_fn && iname && strncmp(iname, "cvm_sys_", 8) == 0) {
                     if (cg_emit_syscall_body(cg, i, callee, iname)) break;
+                    /* Same dead-post-switch-store issue as the EH path below:
+                     * persist a spilled scalar syscall result to its slot here,
+                     * before the JMP that terminates this block. */
+                    if (result_spilled) {
+                        int32_t roff = cg_val_slot_off(cg,
+                                                       cg->val_slot[result_idx]);
+                        if (cg_stw_sp_off(cg, roff, def_reg)) break;
+                    }
                     cg_emit_phi_moves(cg, cg->cur_block, normal_bb);
                     if (cg->had_error) break;
                     cg_queue_fixup(cg, cg->count, normal_bb, 8, 24);
@@ -5530,6 +5538,19 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 if (scalar_res
                     && cg_ldw_sp_off(cg, res_reg, (int32_t)cg->eh_frame_off))
                     break;
+                /* Persist a SPILLED scalar result to its value slot HERE, on the
+                 * normal path. The generic spilled-DEF store (after the switch)
+                 * is unreachable for an invoke: this handler is a terminator and
+                 * has already emitted the JMP to normal_bb / unwind_bb below, so
+                 * the post-switch STW is dead code. Without this, a spilled
+                 * invoke result (e.g. a pointer kept live across later calls in a
+                 * big function) reloads as garbage. Wide results are already
+                 * stored to their slots inside cg_emit_user_call (normal path);
+                 * a register-homed result was MOV'd there too. */
+                if (scalar_res && result_spilled) {
+                    int32_t roff = cg_val_slot_off(cg, cg->val_slot[result_idx]);
+                    if (cg_stw_sp_off(cg, roff, res_reg)) break;
+                }
                 cg_emit_phi_moves(cg, cg->cur_block, normal_bb);
                 if (cg->had_error) break;
                 cg_queue_fixup(cg, cg->count, normal_bb, 8, 24);
