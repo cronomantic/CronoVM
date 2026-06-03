@@ -6494,6 +6494,34 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     break;
                 }
 
+                /* llvm.{floor,ceil,trunc}.f32(x) = round to integral value.
+                 * No closed-form bit trick (unlike fabs/copysign), so each
+                 * lowers to a single native opcode whose host evaluates
+                 * floorf/ceilf/truncf (correct across the full range incl.
+                 * NaN/inf and |x| >= 2^23). Surfaced by libc++'s std::ceil in
+                 * the unordered_map rehash (max-load-factor) — e.g. Exult's
+                 * FontManager. (f64 variants legalise via the soft-float
+                 * runtime instead and are handled on the wide path.) */
+                {
+                    int rnd_op = (strcmp(name, "llvm.floor.f32") == 0) ? CVM_OP_FFLOOR
+                               : (strcmp(name, "llvm.ceil.f32")  == 0) ? CVM_OP_FCEIL
+                               : (strcmp(name, "llvm.trunc.f32") == 0) ? CVM_OP_FTRUNC
+                                                                       : -1;
+                    if (rnd_op >= 0) {
+                        if (LLVMGetNumArgOperands(i) != 1) {
+                            ERR(cg->fn_name, "%s expects 1 arg, got %u", name,
+                                LLVMGetNumArgOperands(i));
+                            cg->had_error = 1;
+                            break;
+                        }
+                        uint8_t x   = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                        uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                        if (cg->had_error) break;
+                        cg_emit(cg, enc_r((uint8_t)rnd_op, dst, x, 0));
+                        break;
+                    }
+                }
+
                 /* llvm.copysign.f32(x, y) = (x & 0x7FFFFFFF) | (y & 0x80000000) */
                 if (strcmp(name, "llvm.copysign.f32") == 0) {
                     uint8_t x     = cg_reg_for(cg, LLVMGetOperand(i, 0));

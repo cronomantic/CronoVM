@@ -406,6 +406,17 @@ enum cvm_opcode {
      * RUNNING/DEAD, CVM_E_BAD_ADDR on bad buf or self-swap. The translator
      * lowers `__cvm_coro_swap_raw(from, to)` to this. */
     CVM_OP_CORO_SWAP = 0x3C,
+
+    /* Single-precision rounding to integral value, A=rd, B=rs1. The float
+     * round-to-integral family that has no closed-form bit trick (unlike
+     * fabs/copysign): the host evaluates floorf/ceilf/truncf, which handle
+     * the full range correctly (NaN/inf pass through, |x| >= 2^23 is already
+     * integral). The sibling of FSQRT (also a host libm call on the shared
+     * f32 register file). The translator lowers llvm.floor/ceil/trunc.f32 —
+     * surfaced by libc++'s std::ceil in the hash-table rehash (load factor). */
+    CVM_OP_FFLOOR  = 0x3D,
+    CVM_OP_FCEIL   = 0x3E,
+    CVM_OP_FTRUNC  = 0x3F,
 };
 
 #define CVM_REG_COUNT 256

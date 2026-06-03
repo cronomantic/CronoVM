@@ -451,7 +451,7 @@ target shapes the API.
 
 | Layer | Coverage |
 | ----- | -------- |
-| Interpreter | 55 opcodes (HALT, MOVI, MOV, ADD/SUB/MUL, LDW/STW, JMP, BEQ, BNE, SYSCALL, 6×CMP, DIV/DIVU/MOD/MODU, SHL/SHR/SAR, AND/OR/XOR, CALL/RET/CALLR, LDB/STB/LDH/STH, MOVHI, MEMCPY/MEMSET/MEMMOVE, MULH/MULHU, FADD/FSUB/FMUL/FDIV/FNEG, 4×FCMP, F2I_S/F2I_U, I2F_S/I2F_U, JMPR, FSQRT) — see [isa.md](isa.md) |
+| Interpreter | 64 opcodes (HALT, MOVI, MOV, ADD/SUB/MUL, LDW/STW, JMP, BEQ, BNE, SYSCALL, 6×CMP, DIV/DIVU/MOD/MODU, SHL/SHR/SAR, AND/OR/XOR, CALL/RET/CALLR, LDB/STB/LDH/STH, MOVHI, MEMCPY/MEMSET/MEMMOVE, MULH/MULHU, FADD/FSUB/FMUL/FDIV/FNEG, 4×FCMP, F2I_S/F2I_U, I2F_S/I2F_U, JMPR, FSQRT, QDIV1616/QDIV6432, SETJMP/LONGJMP, CORO_SWAP, FFLOOR/FCEIL/FTRUNC) — see [isa.md](isa.md) |
 | Loader | All 9 section types (CODE, DATA, BSS, IMPORTS, DEBUG, HEAP_RESERVE, STACK_RESERVE, FUNCS — slot 0 reserved for null-fn-ptr trap, HOST_REGION) — see [format.md](format.md) |
 | Built-ins | `cvm_sys_heap_start` / `cvm_sys_heap_size` / `cvm_sys_get_region` |
 | Codegen | Scalar i32 + control flow (`br`, `switch`, `phi`, `ret`) + globals + memory + syscalls + intrinsics + multi-function CALL/RET, recursion, R0..R7 + stacked args, alloca, indirect calls (CALLR), function values in DATA initialisers, lifetime markers, i8/i16 loads/stores; SExt via SHL/SAR; arbitrary 32-bit immediates via MOVI+MOVHI; FUNCS[1..N] with NULL-fn-ptr trap; `llvm.mem*` lowered to MEMCPY/MEMSET/MEMMOVE; per-CALL spill narrowed by liveness AND compacted (slot only for regs ever live across some call); conditional brs >±127 reach get post-emission relaxation; `switch` lowered as chained `CMP_EQ + BNE` per case (sparse) or DATA jump-table + `LDW + JMPR` (dense, n_cases ≥ 4 AND density ≥ 0.5) |

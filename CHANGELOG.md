@@ -10,6 +10,25 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **Float round-to-integral opcodes `FFLOOR` (0x3D) / `FCEIL` (0x3E) / `FTRUNC`
+  (0x3F).** Single-precision round-to-integral has no closed-form bit trick (unlike
+  `fabs`/`copysign`), so each lowers to one native opcode whose host evaluates
+  `floorf`/`ceilf`/`truncf` — correct across the full range (NaN/Inf propagate,
+  `|x| >= 2^23` is already integral), the same host-libm-call shape as `FSQRT`. The
+  translator lowers `llvm.{floor,ceil,trunc}.f32` to them. Surfaced by libc++'s
+  `std::ceil` in the `__hash_table` rehash (max-load-factor) — reached when the
+  Exult port compiles its `FontManager` (`std::unordered_map`). `f64` variants are
+  unaffected (they legalise via the soft-float runtime). Covered by `conf_float`
+  (extended with `floorf`/`ceilf`/`truncf` over signed `.5`/non-`.5` fractions).
+
+- **Vendored libc++ `hash.cpp` (`std::__next_prime`).** The `__hash_table` rehash
+  also calls `std::__next_prime` (the next-prime bucket-count helper), an out-of-line
+  library symbol the header-only toolchain doesn't ship. Added `hash.cpp` to the
+  vendored libc++ src subset (`runtime/lib/libcxx/src/`, tag `llvmorg-22.1.6`, the
+  same provenance as `locale.cpp`/`ios.cpp`/...) and to `build_cxxio.sh`, so
+  `cxxio.bc` defines it. C++-only (no C cart links `cxxio.bc`). Same Exult-FontManager
+  origin as the float-round opcodes above.
+
 - **`cvm_cxxstl.cpp`: `std::bad_function_call` out-of-line members.** libc++ makes
   this exception's destructor its key function (the vtable + `type_info` live in the
   dylib), so any cart that invokes a possibly-empty `std::function` referenced

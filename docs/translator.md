@@ -152,7 +152,9 @@ the gap is what's still being implemented:
     loops — no dedicated opcode); funnel shifts `llvm.fshl.iN` / `llvm.fshr.iN`
   - byte swaps: `llvm.bswap.i16`, `llvm.bswap.i32` (shift/mask/or)
   - f32 math: `llvm.fmuladd.f32` (→ `FMUL`+`FADD`), `llvm.fabs.f32`
-    (AND `0x7FFFFFFF`), `llvm.copysign.f32`
+    (AND `0x7FFFFFFF`), `llvm.copysign.f32`; round-to-integral
+    `llvm.floor.f32`/`llvm.ceil.f32`/`llvm.trunc.f32` (→ the `FFLOOR`/`FCEIL`/
+    `FTRUNC` opcodes, host `floorf`/`ceilf`/`truncf`)
   - f64 math: `llvm.fmuladd.f64`/`llvm.fma.f64`, `llvm.fabs.f64`,
     `llvm.copysign.f64`, `llvm.sqrt.f64` (see the f64 section)
   - block memory: `llvm.memcpy.*`, `llvm.memset.*`, `llvm.memmove.*`

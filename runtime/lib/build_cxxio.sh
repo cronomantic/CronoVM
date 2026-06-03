@@ -70,7 +70,7 @@ CXXFLAGS=(--target=i386-elf -ffreestanding -std=c++23 -mlong-double-64
 
 # The vendored TUs (must match runtime/lib/libcxx/src/*.cpp).
 SOURCES=(locale ios ios.instantiations iostream ostream fstream
-         system_error error_category)
+         system_error error_category hash)
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 BCS=(); nfail=0

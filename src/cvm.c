@@ -1,6 +1,7 @@
 #include "cvm.h"
 
-#include <math.h>     /* sqrtf() — used by CVM_OP_FSQRT. On hosts without
+#include <math.h>     /* sqrtf()/floorf()/ceilf()/truncf() — used by CVM_OP_FSQRT
+                         and the FFLOOR/FCEIL/FTRUNC family. On hosts without
                          a hardware FPU this resolves to libm/libgcc soft
                          implementation, same trade-off as the FADD/FMUL
                          family already documented for soft-float targets. */
@@ -878,6 +879,9 @@ static int cvm_exec_at(struct cvm_image *img,
         [CVM_OP_SETJMP]   = &&L_SETJMP,
         [CVM_OP_LONGJMP]  = &&L_LONGJMP,
         [CVM_OP_CORO_SWAP] = &&L_CORO_SWAP,
+        [CVM_OP_FFLOOR]  = &&L_FFLOOR,
+        [CVM_OP_FCEIL]   = &&L_FCEIL,
+        [CVM_OP_FTRUNC]  = &&L_FTRUNC,
     };
 
 #  define DISPATCH() do {                                  \
@@ -1141,6 +1145,15 @@ static int cvm_exec_at(struct cvm_image *img,
     }
     L_FSQRT:
         R[a] = cvm_f32_to_bits(sqrtf(cvm_bits_to_f32(R[b])));
+        DISPATCH();
+    L_FFLOOR:
+        R[a] = cvm_f32_to_bits(floorf(cvm_bits_to_f32(R[b])));
+        DISPATCH();
+    L_FCEIL:
+        R[a] = cvm_f32_to_bits(ceilf(cvm_bits_to_f32(R[b])));
+        DISPATCH();
+    L_FTRUNC:
+        R[a] = cvm_f32_to_bits(truncf(cvm_bits_to_f32(R[b])));
         DISPATCH();
     L_QDIV1616:
         if (R[c] == 0) return CVM_E_DIV_BY_ZERO;
@@ -1470,6 +1483,15 @@ static int cvm_exec_at(struct cvm_image *img,
         }
         case CVM_OP_FSQRT:
             R[a] = cvm_f32_to_bits(sqrtf(cvm_bits_to_f32(R[b])));
+            break;
+        case CVM_OP_FFLOOR:
+            R[a] = cvm_f32_to_bits(floorf(cvm_bits_to_f32(R[b])));
+            break;
+        case CVM_OP_FCEIL:
+            R[a] = cvm_f32_to_bits(ceilf(cvm_bits_to_f32(R[b])));
+            break;
+        case CVM_OP_FTRUNC:
+            R[a] = cvm_f32_to_bits(truncf(cvm_bits_to_f32(R[b])));
             break;
         case CVM_OP_QDIV1616:
             if (R[c] == 0) return CVM_E_DIV_BY_ZERO;

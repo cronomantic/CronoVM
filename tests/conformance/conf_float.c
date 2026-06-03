@@ -54,6 +54,14 @@ int conf_main(void) {
         if (fx != 0.0f) MIXF(10.0f / fx);
         MIXF(__builtin_fabsf(fx));            /* llvm.fabs.f32 (inlined) */
         MIXF(__builtin_copysignf(2.0f, fx));  /* llvm.copysign.f32 (inlined) */
+        /* round-to-integral family -> CVM_OP_F{FLOOR,CEIL,TRUNC} (errno-free,
+         * so clang emits the intrinsics directly). fx spans negatives and
+         * positives with a .5 fraction, where floor/ceil/trunc all differ. */
+        MIXF(__builtin_floorf(fx));           /* llvm.floor.f32 */
+        MIXF(__builtin_ceilf(fx));            /* llvm.ceil.f32  */
+        MIXF(__builtin_truncf(fx));           /* llvm.trunc.f32 */
+        { float g = (float)x * 0.3f;          /* assorted non-.5 fractions */
+          MIXF(__builtin_floorf(g)); MIXF(__builtin_ceilf(g)); MIXF(__builtin_truncf(g)); }
         /* NOTE: sqrtf/fmaf lower to libcalls (math runtime), not translator
          * intrinsics — out of scope for translator conformance; covered by the
          * f64 e2e suite + cvm-cc's auto-linked soft runtime. */
