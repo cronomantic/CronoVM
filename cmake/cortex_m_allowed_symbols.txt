@@ -31,11 +31,15 @@ memchr
 strcmp
 strncmp
 
-# --- Math (sqrtf is the only math.h symbol cvm.c references; FSQRT
-# opcode). On Cortex-M3 with -mfloat-abi=soft this resolves through
-# libgcc's soft-float helpers; on M4F+ a hardware vsqrt instruction
-# can elide it, but the import is still legitimate. ---
+# --- Math (the single-precision round-to-integral family cvm.c references
+# for the FSQRT / FFLOOR / FCEIL / FTRUNC opcodes). On Cortex-M3 with
+# -mfloat-abi=soft these resolve through libgcc/libm soft helpers; on M4F+
+# some elide to hardware instructions, but the imports are still legitimate
+# (the freestanding-host-provides class, same as sqrtf). ---
 sqrtf
+floorf
+ceilf
+truncf
 
 # --- ARM EABI helpers (libgcc-provided). The Procedure Call Standard
 # for ARM defines these as the compiler-runtime ABI; any freestanding
