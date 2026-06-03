@@ -97,13 +97,18 @@ for src in "${fixtures[@]}"; do
     fi
   fi
 
+  # -lm: the native oracle may emit libm libcalls (e.g. conf_float's floorf/
+  # ceilf/truncf — clang doesn't inline these). On Linux libm is a separate
+  # library, so the oracle link needs -lm or it fails with "undefined reference
+  # to floorf"; on Windows (ucrt/mingw) and macOS (libSystem) it's a harmless
+  # no-op. The VM side lowers these to the FFLOOR/FCEIL/FTRUNC opcodes instead.
   if [[ "$src" == *.cpp ]]; then
     # VM: cvm-cc compiles the .cpp and auto-links runtime/lib/cvm_cxxrt.cpp.
     vmlog="$("$CVMCC" "$src" "$HERE/vm_entry.c" ${pico[@]+"${pico[@]}"} -o "$bin" 2>&1)"; vmrc=$?
-    natcmd=("$CLANGXX" -O1 -x c++ "$src" -x c "$HERE/driver.c" -o "$nat")
+    natcmd=("$CLANGXX" -O1 -x c++ "$src" -x c "$HERE/driver.c" -o "$nat" -lm)
   else
     vmlog="$("$CVMCC" "$src" "$HERE/vm_entry.c" ${pico[@]+"${pico[@]}"} -o "$bin" 2>&1)"; vmrc=$?
-    natcmd=("$CLANG" -O1 "$src" "$HERE/driver.c" -o "$nat")
+    natcmd=("$CLANG" -O1 "$src" "$HERE/driver.c" -o "$nat" -lm)
   fi
 
   if [[ $vmrc -ne 0 ]]; then
