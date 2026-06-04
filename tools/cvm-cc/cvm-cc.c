@@ -136,6 +136,7 @@ struct cli {
     int lto;        /* --lto: run opt default<O2> on the (linked) module */
     int keep_bc;
     int verbose;
+    int jobs;       /* -j N: max concurrent clang compiles. 0 = auto (cores). */
 };
 
 static void usage(FILE *f) {
@@ -200,6 +201,9 @@ static void usage(FILE *f) {
         "                             (built-in default: %s)\n"
         "\n"
         "Misc:\n"
+        "  -j [N]                     compile up to N TUs in parallel (default:\n"
+        "                             online CPU count). Output is identical to a\n"
+        "                             serial build (link order is by input order).\n"
         "  --keep-bc                  don't delete the intermediate .bc\n"
         "  -v, --verbose              print every command before running\n"
         "  -h, --help                 this help\n",
@@ -268,6 +272,73 @@ static int run_cmd(const struct cli *cli, char **argv) {
     if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
     return -1;
 #endif
+}
+
+/* ---- parallel compile (-j): async spawn + wait, cross-platform ---------- *
+ * The per-input compiles are independent, so we run up to N at once. Output
+ * .bc names are indexed by input position (assigned before launch), so the
+ * llvm-link order — and thus the final module — is byte-identical to a serial
+ * build regardless of completion order. Windows uses _spawnvp(_P_NOWAIT)+_cwait;
+ * POSIX (Linux + macOS) uses fork+execvp+waitpid. Each helper waits on a
+ * SPECIFIC child, which is all the batch scheduler below needs. */
+#if defined(_WIN32)
+typedef intptr_t proc_t;
+#else
+typedef pid_t proc_t;
+#endif
+#define PROC_INVALID ((proc_t)-1)
+
+static proc_t run_cmd_async(const struct cli *cli, char **argv) {
+    if (cli->verbose) verbose_dump(argv);
+#if defined(_WIN32)
+    intptr_t r = _spawnvp(_P_NOWAIT, argv[0], (const char *const *)argv);
+    if (r == -1) {
+        fprintf(stderr, "cvm-cc: failed to spawn '%s': %s\n", argv[0], strerror(errno));
+        return PROC_INVALID;
+    }
+    return (proc_t)r;
+#else
+    pid_t pid = fork();
+    if (pid < 0) { perror("cvm-cc: fork"); return PROC_INVALID; }
+    if (pid == 0) {
+        execvp(argv[0], argv);
+        fprintf(stderr, "cvm-cc: failed to exec '%s': %s\n", argv[0], strerror(errno));
+        _exit(127);
+    }
+    return pid;
+#endif
+}
+
+/* Wait for one async child; returns its exit status (>=0), or -1 on failure. */
+static int wait_proc(proc_t h) {
+#if defined(_WIN32)
+    int status = 0;
+    if (_cwait(&status, h, 0) == -1) { perror("cvm-cc: _cwait"); return -1; }
+    return status;
+#else
+    int status = 0;
+    while (waitpid(h, &status, 0) < 0) {
+        if (errno != EINTR) { perror("cvm-cc: waitpid"); return -1; }
+    }
+    if (WIFEXITED(status))   return WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+    return -1;
+#endif
+}
+
+/* Default concurrency = online CPU count (clamped), used when -j is unset. */
+static int default_jobs(void) {
+    int n = 0;
+#if defined(_WIN32)
+    const char *e = getenv("NUMBER_OF_PROCESSORS");
+    if (e) n = atoi(e);
+#else
+    long sc = sysconf(_SC_NPROCESSORS_ONLN);
+    if (sc > 0) n = (int)sc;
+#endif
+    if (n < 1) n = 1;
+    if (n > 32) n = 32;   /* avoid oversubscribing on big hosts */
+    return n;
 }
 
 /* Build "<dirname(argv0)><sep><name>" if argv0 has a directory part. */
@@ -397,6 +468,20 @@ static int parse_argv(int argc, char **argv, struct cli *cli) {
                 return 2;
             }
             cli->include_dirs[cli->include_count++] = argv[++i];
+        } else if (strcmp(a, "-j") == 0) {
+            /* -j [N]: max concurrent clang compiles (default is serial). A bare
+             * -j (or N<=0) means auto = online CPU count, resolved now. Only
+             * swallow the next token if it looks numeric, so `-j` before a file
+             * still works. */
+            if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9') {
+                int v     = atoi(argv[++i]);
+                cli->jobs = v > 0 ? v : default_jobs();
+            } else {
+                cli->jobs = default_jobs();
+            }
+        } else if (strncmp(a, "-j", 2) == 0 && a[2] != '\0') {
+            int v     = atoi(a + 2);   /* -jN (glued) */
+            cli->jobs = v > 0 ? v : default_jobs();
         } else if (strncmp(a, "-D", 2) == 0 && a[2] != '\0') {
             /* -D<macro>[=val] (glued), forwarded verbatim to clang. Lets a build
              * select a libc feature (e.g. CVM_LIBC_ENABLE_F64 -> the f64 atof). */
@@ -492,8 +577,8 @@ static int parse_argv(int argc, char **argv, struct cli *cli) {
  * status (0 on success). The clang flags match the test fixtures: i386-elf
  * freestanding (no hosted libc, and clang emits the i32-length mem intrinsics
  * the VM expects, not the i64 ones it picks in hosted mode) + -emit-llvm. */
-static int compile_c_to_bc(const struct cli *cli, const char *clang,
-                           const char *input, const char *bc_out) {
+static proc_t compile_c_to_bc_spawn(const struct cli *cli, const char *clang,
+                                    const char *input, const char *bc_out) {
     char optflag[8];
     snprintf(optflag, sizeof optflag, "-O%s", cli->opt_level);
     char rtinc[1024];
@@ -575,7 +660,18 @@ static int compile_c_to_bc(const struct cli *cli, const char *clang,
     cargv[n++] = (char *)bc_out;
     cargv[n] = NULL;
 
-    int crc = run_cmd(cli, cargv);
+    /* _spawnvp copies the command line and fork()'d children COW the argv, so
+     * the local cargv/scratch buffers may die once we return — the child is
+     * already launched. */
+    return run_cmd_async(cli, cargv);
+}
+
+/* Serial compile (spawn + wait): used for the few auto-linked runtime TUs. */
+static int compile_c_to_bc(const struct cli *cli, const char *clang,
+                           const char *input, const char *bc_out) {
+    proc_t h = compile_c_to_bc_spawn(cli, clang, input, bc_out);
+    if (h == PROC_INVALID) return -1;
+    int crc = wait_proc(h);
     if (crc != 0)
         fprintf(stderr, "cvm-cc: clang failed on %s (exit %d)\n", input, crc);
     return crc;
@@ -618,6 +714,13 @@ int main(int argc, char **argv) {
     const char *clang = cli.clang_path ? cli.clang_path : "clang";
     size_t outlen = strlen(cli.output);
 
+    /* Pass 1: give every input a bc slot IN ORDER (so the llvm-link order, and
+     * thus the final module, is identical to a serial build). .bc inputs pass
+     * through in place; .c/.cpp get an owned temp name + a compile job. */
+    struct compile_job { const char *in; char *bc; } *cjobs =
+        (struct compile_job *)malloc((size_t)cli.input_count * sizeof *cjobs);
+    int job_count = 0;
+    if (!cjobs) { perror("malloc"); fail = 1; }
     for (int i = 0; i < cli.input_count && !fail; ++i) {
         const char *in = cli.inputs[i];
         if (has_suffix(in, ".bc")) {
@@ -629,11 +732,49 @@ int main(int argc, char **argv) {
         char *bc = (char *)malloc(outlen + 24);
         if (!bc) { perror("malloc"); fail = 1; break; }
         snprintf(bc, outlen + 24, "%s.%d.tmp.bc", cli.output, i);
-        if (compile_c_to_bc(&cli, clang, in, bc) != 0) { free(bc); fail = 1; break; }
         bc_paths[bc_count] = bc;
         bc_owned[bc_count] = 1;
+        cjobs[job_count].in = in;
+        cjobs[job_count].bc = bc;
+        ++job_count;
         ++bc_count;
     }
+
+    /* Pass 2: run the compiles up to J at a time (batched). Independent TUs, so
+     * order of completion doesn't matter — only the (already-fixed) bc_paths
+     * order feeds llvm-link. */
+    if (!fail && job_count > 0) {
+        int J = cli.jobs > 0 ? cli.jobs : 1;   /* serial unless -j was given */
+        if (J > job_count) J = job_count;
+        proc_t *h  = (proc_t *)malloc((size_t)J * sizeof *h);
+        int    *hj = (int    *)malloc((size_t)J * sizeof *hj);
+        if (!h || !hj) { perror("malloc"); fail = 1; }
+        for (int base = 0; base < job_count && !fail; base += J) {
+            int cnt      = job_count - base < J ? job_count - base : J;
+            int launched = 0;
+            for (int k = 0; k < cnt; ++k) {
+                proc_t p = compile_c_to_bc_spawn(&cli, clang, cjobs[base + k].in,
+                                                 cjobs[base + k].bc);
+                if (p == PROC_INVALID) { fail = 1; break; }
+                h[launched]  = p;
+                hj[launched] = base + k;
+                ++launched;
+            }
+            /* Reap everything we launched (even on a spawn failure) so no child
+             * is left running. */
+            for (int k = 0; k < launched; ++k) {
+                int crc = wait_proc(h[k]);
+                if (crc != 0) {
+                    fprintf(stderr, "cvm-cc: clang failed on %s (exit %d)\n",
+                            cjobs[hj[k]].in, crc);
+                    fail = 1;
+                }
+            }
+        }
+        free(h);
+        free(hj);
+    }
+    free(cjobs);
 
     /* Locate cvm-translate once: needed both for the soft-float probe below
      * and the final translate. */
