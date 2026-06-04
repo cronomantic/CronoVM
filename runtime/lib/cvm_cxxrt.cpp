@@ -49,7 +49,7 @@ void  operator delete[](void *p, size_t, std::align_val_t) noexcept  { free(p); 
 
 extern "C" {
 
-void __cxa_pure_virtual(void) { for (;;) {} }
+void __cxa_pure_virtual(void) { __builtin_trap(); }
 
 int  __cxa_guard_acquire(void *g) { return *(volatile char *)g == 0; }
 void __cxa_guard_release(void *g) { *(volatile char *)g = 1; }
@@ -158,7 +158,7 @@ extern "C" void *__dynamic_cast(const void *sub, const void * /*src_ti*/,
  * &frame.jb). No DWARF/LSDA — our own per-landingpad descriptors. */
 
 extern "C" void longjmp(int *env, int val) __attribute__((__noreturn__));
-extern "C" void __cvm_eh_terminate(void);
+extern "C" void __cvm_eh_terminate(void) __attribute__((__noreturn__));
 
 namespace {
 
@@ -216,7 +216,7 @@ bool eh_type_matches(const ti_base *thrown, const ti_base *caught) {
     }
     /* nobody caught it */
     __cvm_eh_terminate();
-    for (;;) {}
+    __builtin_trap();   /* backstop: __cvm_eh_terminate is noreturn (HALT) */
 }
 
 } /* anon */
@@ -234,7 +234,7 @@ int   __cvm_eh_typeid(const void *ti) { return (int)(long)ti; }  /* eh.typeid.fo
 /* Itanium __cxa_* surface */
 void *__cxa_allocate_exception(unsigned long size) {
     char *p = (char *)malloc(sizeof(exc_header) + (size ? size : 1));
-    if (!p) { for (;;) {} }
+    if (!p) { __builtin_trap(); }
     exc_header *h = (exc_header *)p;
     h->ti = 0; h->dtor = 0; h->handler_count = 0;
     return p + sizeof(exc_header);
@@ -285,8 +285,13 @@ void __cxa_end_catch(void) {
     eh_unwind();
 }
 
-/* Last-resort terminate. The cart has no std::terminate handler chain; trap. */
-void __cvm_eh_terminate(void) { for (;;) {} }
+/* Last-resort terminate: an uncaught exception (or a std::terminate) cannot be
+ * handled by the cart, so stop the VM cleanly. __builtin_trap lowers to the
+ * HALT opcode (translator.c, llvm.trap), returning control to the host instead
+ * of spinning a busy-loop forever (which used to peg the CPU on any uncaught
+ * throw — e.g. an Exult optional-file probe). No libc dependency, so this also
+ * works in the libc-less conformance harness. */
+void __cvm_eh_terminate(void) { __builtin_trap(); }
 
 } /* extern "C" */
 
@@ -296,5 +301,5 @@ void __cvm_eh_terminate(void) { for (;;) {} }
  * we have no <exception> header here, so define it by its mangled asm name. The
  * cart has no terminate-handler chain; trap (same as __cvm_eh_terminate). */
 extern "C" void cvm_std_terminate(void) asm("_ZSt9terminatev");
-extern "C" void cvm_std_terminate(void) { __cvm_eh_terminate(); for (;;) {} }
+extern "C" void cvm_std_terminate(void) { __cvm_eh_terminate(); }
 

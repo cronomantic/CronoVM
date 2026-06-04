@@ -175,6 +175,19 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Fixed
 
+- **C++ runtime: an uncaught exception now HALTs cleanly instead of spinning the
+  CPU forever.** `cvm_cxxrt.cpp`'s last-resort terminate path (`__cvm_eh_terminate`,
+  the no-handler tail of `eh_unwind`, `__cxa_pure_virtual`,
+  `__cxa_allocate_exception` on OOM, and `std::terminate`) used `for (;;) {}`, so
+  any throw that no frame caught pegged a core indefinitely (observed as the
+  unwinder at ~97% with no progress). They now `__builtin_trap()`, which the
+  translator lowers to `HALT` — control returns to the host with a clean stop, no
+  libc dependency (so it also works in the freestanding conformance harness).
+  Surfaced by an Exult optional-file probe whose `file_open_exception` reached a
+  context with no enclosing `try`. NOTE: this is the ONLY EH defect found — the
+  type-match walk itself (`catch (std::exception&)` over a multi-level derived
+  throw, including catch-by-library-base) was verified CORRECT in-situ and is now
+  guarded by `conf_cpp_exc_base` + `conf_pico_cpp_exc_stdexc`.
 - **Translator: `sitofp`/`uitofp` from `i64` to `double`** now reads the full
   64-bit operand. It was always lowered as a 32-bit conversion
   (`__cvm_f_from_i32`/`u32`), so `(double)int64` read only the low word / garbage
