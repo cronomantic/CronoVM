@@ -103,6 +103,10 @@ SOURCES=(
   # (referenced transitively) is the embedder's, in cron_sys.c.
   ../libm/math/s_exp ../libm/math/s_acos ../libm/math/s_sqrt ../libm/math/s_log
   ../libm/math/s_pow ../libm/math/s_fabs ../libm/common/pow_log_data
+  # lround (double->long): Exult's usecode intrinsics (Paint_map::paint) round
+  # with it. Bit-twiddle, 32-bit-long path has no i64; only extra dep is
+  # __math_set_invalid (math_err_invalid, already listed below).
+  ../libm/common/s_lround
   ../libm/common/exp_data ../libm/common/log_data
   ../libm/common/math_err_oflow ../libm/common/math_err_uflow
   ../libm/common/math_err_invalid ../libm/common/math_err_divzero

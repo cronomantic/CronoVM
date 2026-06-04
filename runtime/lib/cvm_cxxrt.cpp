@@ -33,6 +33,20 @@ void  operator delete[](void *p) noexcept         { free(p); }
 void  operator delete(void *p, size_t) noexcept   { free(p); }
 void  operator delete[](void *p, size_t) noexcept { free(p); }
 
+/* C++17 OVER-ALIGNED new/delete (std::align_val_t). clang emits these for any
+ * over-aligned type (e.g. Exult's AdvancedOptions_gump). The VM's memory is
+ * byte-addressed with no alignment-trap, so honouring the requested alignment
+ * is not required for correctness here — forward to the same C allocator and
+ * ignore the alignment (revisit with memalign if a real over-aligned datum ever
+ * needs it). align_val_t is declared locally to avoid pulling <new>. */
+namespace std { enum class align_val_t : size_t {}; }
+void *operator new(size_t n, std::align_val_t)            { return malloc(n ? n : 1); }
+void *operator new[](size_t n, std::align_val_t)          { return malloc(n ? n : 1); }
+void  operator delete(void *p, std::align_val_t) noexcept            { free(p); }
+void  operator delete[](void *p, std::align_val_t) noexcept          { free(p); }
+void  operator delete(void *p, size_t, std::align_val_t) noexcept    { free(p); }
+void  operator delete[](void *p, size_t, std::align_val_t) noexcept  { free(p); }
+
 extern "C" {
 
 void __cxa_pure_virtual(void) { for (;;) {} }

@@ -5,3 +5,6 @@ picolibc.bc
 # Build artifact produced by build_cxxio.sh (the vendored libc++ iostream/locale
 # subset in libcxx-src/, linked to one bitcode module). Regenerated; not committed.
 cxxio.bc
+# Build artifact produced by build_cxxio.sh (the vendored libc++ std::filesystem
+# subset, a separate module linked explicitly by filesystem-using carts). Not committed.
+cxxfs.bc

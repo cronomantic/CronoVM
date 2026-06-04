@@ -10,6 +10,58 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **Vendored libc++ `std::filesystem` library → a SEPARATE `cxxfs.bc`.** The
+  `llvmorg-22.1.6` filesystem `src/` subset (`operations`/`directory_iterator`/
+  `directory_entry`/`path`/`filesystem_error`/`filesystem_clock` + the private
+  headers `error.h`/`file_descriptor.h`/`posix_compat.h`/`path_parser.h`/
+  `time_utils.h`/`format_string.h`) is vendored under `runtime/lib/libcxx/src/
+  filesystem/` and built by `build_cxxio.sh` into its OWN module `cxxfs.bc` — NOT
+  `cxxio.bc`. Rationale: the filesystem TUs call a POSIX FS surface
+  (`open`/`stat`/`openat`/`lstat`/`readlink`/`statvfs`/…) that only an embedder
+  can satisfy, so folding them into `cxxio.bc` would make EVERY iostream consumer
+  (including the `conf_pico_cpp_iostream` fixture, which links no embedder) fail
+  translation on the undefined POSIX calls. `cvm-cc` does NOT auto-link `cxxfs.bc`;
+  a cart that uses `std::filesystem` links it EXPLICITLY alongside its POSIX
+  backend (real `stat`/`open` from the cart's `cron_sys.c` + a small ENOSYS shim
+  for the rest). Surfaced by the Exult port (gamedat crash-backup). C++-only.
+- **Translator: `llvm.cttz.i8` / `.i16`** (count-trailing-zeros at narrow widths).
+  `cttz` previously handled only `.i32`; generalised to i8/i16/i32 — mask the
+  operand to the value width first (like `ctpop`, so phantom sign-extended high
+  bits don't skew the count) and return the width for a zero operand. Emitted by
+  a libc++ algorithm in the Exult renderer. Covered by `conf_int_intrin` (narrow
+  `__builtin_ctzg`, incl. the zero→width path).
+- **libc++ algorithm SIMD path DISABLED** (`_LIBCPP_HAS_ALGORITHM_VECTOR_UTILS 0`
+  in the vendored `__algorithm/simd_utils.h`). libc++ EXPLICITLY vectorises
+  `find`/`count`/`mismatch`/… with `ext_vector_type` + a movemask, emitting
+  `load/store <N x iM>` the VM has no types for (only the num_get movemask idiom
+  is legalised). Forcing it off makes those algorithms use scalar loops. VM-wide,
+  hermetic (no `-D`); a one-line marked `[CRONOPIO]` edit. Rebuilds `cxxio.bc`.
+- **`cvm_cxxrt.cpp`: C++17 over-aligned `operator new`/`delete` (`std::align_val_t`).**
+  clang emits these for any over-aligned type (e.g. Exult's `AdvancedOptions_gump`);
+  they forward to the same C allocator (the VM's memory is byte-addressed with no
+  alignment trap, so the requested alignment is not honoured — revisit with
+  `memalign` if a real over-aligned datum needs it). All six forms (new/new[] +
+  plain/sized delete, each with `align_val_t`).
+- **Vendored libc++ `hash.cpp`: `std::__hash_memory`** (the ABI-exported murmur2/
+  cityhash memory hasher). With our headers `_LIBCPP_AVAILABILITY_HAS_HASH_MEMORY`
+  is set, so the header only declares it; the definition (its upstream home, built
+  `-D_LIBCPP_BUILDING_LIBRARY` so the `_LIBCPP_NOESCAPE`/`_NOEXCEPT` signature
+  matches) now lives in `hash.cpp` next to `__next_prime`, both `std::unordered_map`
+  dependencies in `cxxio.bc`. Reached via libc++'s `std::hash`. C++-only.
+- **Vendored libc++ `regex.cpp`** (added to `build_cxxio.sh`): `std::regex`
+  matcher-node vtables/`regex_error` for `std::regex_replace` (Exult `game.cc`
+  mod-name cleanup). One marked `[CRONOPIO]` edit narrows the ClassNames ctype-mask
+  table through `unsigned char` (picolibc's signed `ctype_base::mask`). C++-only.
+- **`cvm_cxxstl.cpp`: `std::bad_weak_ptr`, `std::to_string(int/long/long long)`,
+  `std::stoi`, `std::chrono::steady_clock::now()`.** Out-of-line library symbols the
+  header-only toolchain doesn't ship, reached by the Exult engine. Free functions
+  are defined in the versioned `std::__1` inline namespace (else they mangle
+  non-versioned and don't satisfy libc++'s `_ZNSt3__1…` decls). `steady_clock::now`
+  returns a monotonic counter (no guaranteed hardware clock). C++-only.
+- **picolibc: `lround`** (`libm/common/s_lround`, double→long). Exult's usecode
+  intrinsics (`Paint_map::paint`) round with it; the 32-bit-`long` path is bit
+  manipulation (no i64), `double` legalises via the soft-float runtime.
+
 - **Float round-to-integral opcodes `FFLOOR` (0x3D) / `FCEIL` (0x3E) / `FTRUNC`
   (0x3F).** Single-precision round-to-integral has no closed-form bit trick (unlike
   `fabs`/`copysign`), so each lowers to one native opcode whose host evaluates

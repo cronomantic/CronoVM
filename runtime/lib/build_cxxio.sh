@@ -68,24 +68,51 @@ CXXFLAGS=(--target=i386-elf -ffreestanding -std=c++23 -mlong-double-64
           -D_LIBCPP_BUILDING_LIBRARY -D_GNU_SOURCE -DNDEBUG
           -emit-llvm -gline-tables-only "$OPT")
 
-# The vendored TUs (must match runtime/lib/libcxx/src/*.cpp).
+# The vendored iostream/locale TUs -> cxxio.bc (auto-linked by cvm-cc on the
+# iostream probe, so EVERY iostream cart links it). MUST stay free of any
+# embedder/POSIX dependency.
 SOURCES=(locale ios ios.instantiations iostream ostream fstream
-         system_error error_category hash)
+         system_error error_category hash regex)
+
+# The vendored std::filesystem library -> a SEPARATE cxxfs.bc. It calls a POSIX
+# FS surface (open/stat/openat/lstat/readlink/...) that only an embedder (a
+# cart's cron_sys.c + a small ENOSYS shim) can satisfy, so it must NOT live in
+# cxxio.bc — otherwise every iostream consumer (incl. the conformance iostream
+# fixture, which links no cron_sys.c) would fail translation on the undefined
+# POSIX calls. cvm-cc does NOT auto-link cxxfs.bc; a cart that uses
+# std::filesystem links it EXPLICITLY (Exult's build does) alongside its POSIX
+# backend. See exult-gamewin-phase1 / fs_posix_stubs.c.
+FS_SOURCES=(filesystem/operations filesystem/directory_iterator
+            filesystem/directory_entry filesystem/path
+            filesystem/filesystem_error filesystem/filesystem_clock)
+FS_OUT="$HERE/cxxfs.bc"
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
-BCS=(); nfail=0
-for s in "${SOURCES[@]}"; do
-  src="$SRC/$s.cpp"
-  if [ ! -f "$src" ]; then echo "  SKIP (no source): $s" >&2; continue; fi
-  bc="$WORK/$(echo "$s" | tr ./ __).bc"
-  [ "$VERBOSE" = 1 ] && echo "$CLANGXX ${CXXFLAGS[*]} -c $src -o $bc"
-  if "$CLANGXX" "${CXXFLAGS[@]}" -c "$src" -o "$bc" 2>"$bc.err"; then
-    BCS+=("$bc")
-  else
-    echo "  FAIL: $s" >&2; grep -m3 'error:' "$bc.err" >&2 || true; nfail=$((nfail+1))
-  fi
-done
+
+# Compile a source group into bitcode, appending each .bc to the named array.
+# Usage: compile_group <array_name> <sources...>
+nfail=0
+compile_group() {
+  local _arr="$1"; shift
+  local s src bc
+  for s in "$@"; do
+    src="$SRC/$s.cpp"
+    if [ ! -f "$src" ]; then echo "  SKIP (no source): $s" >&2; continue; fi
+    bc="$WORK/$(echo "$s" | tr ./ __).bc"
+    [ "$VERBOSE" = 1 ] && echo "$CLANGXX ${CXXFLAGS[*]} -c $src -o $bc"
+    if "$CLANGXX" "${CXXFLAGS[@]}" -c "$src" -o "$bc" 2>"$bc.err"; then
+      eval "$_arr+=(\"\$bc\")"
+    else
+      echo "  FAIL: $s" >&2; grep -m3 'error:' "$bc.err" >&2 || true; nfail=$((nfail+1))
+    fi
+  done
+}
+
+BCS=();  compile_group BCS  "${SOURCES[@]}"
+FSBCS=(); compile_group FSBCS "${FS_SOURCES[@]}"
 [ "$nfail" -eq 0 ] || { echo "build_cxxio.sh: $nfail source(s) failed" >&2; exit 1; }
 
 "$LLVM_LINK" "${BCS[@]}" -o "$OUT"
 echo "build_cxxio.sh: wrote $OUT (${#BCS[@]} sources)"
+"$LLVM_LINK" "${FSBCS[@]}" -o "$FS_OUT"
+echo "build_cxxio.sh: wrote $FS_OUT (${#FSBCS[@]} sources, std::filesystem — link explicitly)"

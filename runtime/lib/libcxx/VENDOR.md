@@ -14,11 +14,29 @@ the system libc++ broke the linux-clang/linux-gcc CI when it ran clang-21 agains
 - `include/v1/` — the full libc++ header tree (`__config_site` excepted: CronoVM's
   freestanding override lives in `runtime/lib/__config_site` and wins via `-I`).
 - `src/` — the out-of-line library TUs CronoVM needs that the toolchain ships only
-  as headers: the `<iostream>`/`<locale>` library (`locale.cpp`, `ios*.cpp`,
-  `iostream.cpp`, `ostream.cpp`, `fstream.cpp`, `system_error.cpp`,
-  `error_category.cpp`) + their private `include/`. Built into `cxxio.bc` by
-  `build_cxxio.sh`. (The STL exception/string out-of-line bits are hand-written in
-  `cvm_cxxstl.cpp`, not vendored.)
+  as headers. Built by `build_cxxio.sh` into TWO modules:
+  - **`cxxio.bc`** (auto-linked by `cvm-cc` on the iostream/locale probe): the
+    `<iostream>`/`<locale>` library (`locale.cpp`, `ios*.cpp`, `iostream.cpp`,
+    `ostream.cpp`, `fstream.cpp`, `system_error.cpp`, `error_category.cpp`),
+    `hash.cpp` (`__next_prime` + `__hash_memory`, the `std::unordered_map` deps),
+    and `regex.cpp` (`std::regex`) + their private `include/`.
+  - **`cxxfs.bc`** (NOT auto-linked — a cart that uses `std::filesystem` links it
+    EXPLICITLY, plus a POSIX backend): the `filesystem/` subset (`operations.cpp`,
+    `directory_iterator.cpp`, `directory_entry.cpp`, `path.cpp`,
+    `filesystem_error.cpp`, `filesystem_clock.cpp` + the private `filesystem/*.h`).
+    Kept out of `cxxio.bc` because its POSIX FS calls (`open`/`stat`/`openat`/…)
+    can only be satisfied by an embedder, so folding it in would break every
+    iostream consumer (e.g. the `conf_pico_cpp_iostream` fixture).
+  (The STL exception/string out-of-line bits are hand-written in `cvm_cxxstl.cpp`,
+  not vendored.)
+
+- **Local `[CRONOPIO]` edits to the vendored tree** (grep `[CRONOPIO]`; re-apply on
+  every bump):
+  - `include/v1/__algorithm/simd_utils.h` — `_LIBCPP_HAS_ALGORITHM_VECTOR_UTILS`
+    forced to 0 (the VM has no vector types; libc++'s SIMD `find`/`count`/… would
+    emit `<N x iM>` ops it can't lower).
+  - `src/regex.cpp` — ClassNames ctype-mask table narrowed through `unsigned char`
+    (picolibc's `ctype_base::mask` is signed; `blank`=0x80 would sign-extend).
 
 ## Version
 

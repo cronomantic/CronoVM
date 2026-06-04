@@ -446,4 +446,17 @@ size_t __next_prime(size_t n) {
   }
 }
 
+#if _LIBCPP_AVAILABILITY_HAS_HASH_MEMORY
+// [CRONOPIO] Out-of-line definition of the ABI-exported memory hasher. With our
+// vendored libc++ headers _LIBCPP_AVAILABILITY_HAS_HASH_MEMORY is set, so
+// <__functional/hash.h>:245 only DECLARES __hash_memory and the definition must
+// live in this TU (its upstream home — built with -D_LIBCPP_BUILDING_LIBRARY, so
+// the signature macros _LIBCPP_NOESCAPE/_NOEXCEPT match the declaration exactly).
+// Body is the header's own #else inline branch. unordered_map reaches it via
+// std::hash; __next_prime above is the same TU's other unordered_map dependency.
+size_t __hash_memory(_LIBCPP_NOESCAPE const void* __ptr, size_t __size) _NOEXCEPT {
+  return __murmur2_or_cityhash<size_t>()(__ptr, __size);
+}
+#endif
+
 _LIBCPP_END_NAMESPACE_STD

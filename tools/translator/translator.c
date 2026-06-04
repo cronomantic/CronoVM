@@ -6644,12 +6644,21 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     }
                 }
 
-                /* llvm.cttz.i32(%x, is_zero_undef) — count trailing zeros. No
-                 * CTTZ opcode; lower to a loop counting low zero bits (result
-                 * 32 for x==0, matching the is_zero_undef=false semantics).
-                 * clang folds power-of-two log2 idioms (e.g. the renderer's
-                 * MaskForNum) into this. Mirrors the ctlz loop. */
-                if (strcmp(name, "llvm.cttz.i32") == 0) {
+                /* llvm.cttz.iN(%x, is_zero_undef) — count trailing zeros (N =
+                 * 8/16/32). No CTTZ opcode; lower to a loop counting low zero
+                 * bits (result N for x==0, matching the is_zero_undef=false
+                 * semantics). clang folds power-of-two log2 idioms (e.g. the
+                 * renderer's MaskForNum, and Game_render::increment_bbox_index
+                 * for the i8 form) into this. Mirrors the ctlz loop. Narrow
+                 * widths live in 32-bit regs possibly sign-extended, so mask to
+                 * the value width first (like ctpop) — else phantom high zero
+                 * bits would make the x==0 test miss and the count run to 32. */
+                {
+                    int cttz_bits = 0;
+                    if      (strcmp(name, "llvm.cttz.i32") == 0) cttz_bits = 32;
+                    else if (strcmp(name, "llvm.cttz.i16") == 0) cttz_bits = 16;
+                    else if (strcmp(name, "llvm.cttz.i8")  == 0) cttz_bits = 8;
+                if (cttz_bits) {
                     uint8_t src = cg_reg_for(cg, LLVMGetOperand(i, 0));
                     uint8_t dst = cg->regs[cg_lookup(cg, i)];
                     uint8_t x   = cg_alloc_reg(cg);
@@ -6657,18 +6666,26 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                     uint8_t one = cg_alloc_reg(cg);
                     uint8_t t   = cg_alloc_reg(cg);
                     if (cg->had_error) break;
-                    cg_emit(cg, enc_r  (CVM_OP_MOV,  x, src, 0));     /* 0 */
-                    cg_emit(cg, enc_i16(CVM_OP_MOVI, n, 0));          /* 1 */
-                    cg_emit(cg, enc_i16(CVM_OP_MOVI, one, 1));        /* 2 */
-                    cg_emit(cg, enc_br (CVM_OP_BEQ, x, cg->zero_reg, 5)); /* 3: x==0 -> n=32 */
-                    cg_emit(cg, enc_r  (CVM_OP_AND, t, x, one));      /* 4: loop top */
-                    cg_emit(cg, enc_br (CVM_OP_BNE, t, cg->zero_reg, 4)); /* 5: low bit set -> done */
-                    cg_emit(cg, enc_r  (CVM_OP_SHR, x, x, one));      /* 6 */
-                    cg_emit(cg, enc_r  (CVM_OP_ADD, n, n, one));      /* 7 */
-                    cg_emit(cg, enc_i24(CVM_OP_JMP, -5));             /* 8: back to 4 */
-                    cg_emit(cg, enc_i16(CVM_OP_MOVI, n, 32));         /* 9: x==0 case */
-                    cg_emit(cg, enc_r  (CVM_OP_MOV, dst, n, 0));      /* 10: done */
+                    cg_emit(cg, enc_r  (CVM_OP_MOV,  x, src, 0));
+                    if (cttz_bits < 32) {     /* mask to width (emitted before the loop;
+                                               * the loop's relative offsets are unaffected) */
+                        uint8_t m = cg_alloc_reg(cg);
+                        if (cg->had_error) break;
+                        cg_emit_load_const32(cg, m, (int32_t)((1u << cttz_bits) - 1u));
+                        cg_emit(cg, enc_r(CVM_OP_AND, x, x, m));
+                    }
+                    cg_emit(cg, enc_i16(CVM_OP_MOVI, n, 0));              /* L+0 */
+                    cg_emit(cg, enc_i16(CVM_OP_MOVI, one, 1));            /* L+1 */
+                    cg_emit(cg, enc_br (CVM_OP_BEQ, x, cg->zero_reg, 5)); /* L+2: x==0 -> n=N */
+                    cg_emit(cg, enc_r  (CVM_OP_AND, t, x, one));          /* L+3: loop top */
+                    cg_emit(cg, enc_br (CVM_OP_BNE, t, cg->zero_reg, 4)); /* L+4: low bit set -> done */
+                    cg_emit(cg, enc_r  (CVM_OP_SHR, x, x, one));          /* L+5 */
+                    cg_emit(cg, enc_r  (CVM_OP_ADD, n, n, one));          /* L+6 */
+                    cg_emit(cg, enc_i24(CVM_OP_JMP, -5));                 /* L+7: back to L+3 */
+                    cg_emit(cg, enc_i16(CVM_OP_MOVI, n, cttz_bits));      /* L+8: x==0 case */
+                    cg_emit(cg, enc_r  (CVM_OP_MOV, dst, n, 0));          /* L+9: done */
                     break;
+                }
                 }
 
                 /* Funnel-shift intrinsics — clang -O1 emits these for the

@@ -27,6 +27,8 @@
  * operator new/delete, __cxa_*, the EH unwinder and the RTTI abi vtables live in
  * cvm_cxxrt.cpp; this file depends on them. malloc/free/str* come from the
  * cart's C library (picolibc / SDK). */
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -110,6 +112,10 @@ std::out_of_range::~out_of_range() noexcept {}
 std::range_error::~range_error() noexcept {}
 std::overflow_error::~overflow_error() noexcept {}
 std::underflow_error::~underflow_error() noexcept {}
+/* std::regex_error + the regex node vtables are provided by the vendored
+ * libc++ regex.cpp (built into cxxio.bc), NOT hand-rolled here — Exult's game.cc
+ * uses std::regex_replace, which instantiates regex matcher nodes whose vtables
+ * reference regex.cpp's out-of-line virtuals. See runtime/lib/build_cxxio.sh. */
 
 /* ---- <new> exceptions --------------------------------------------------- */
 /* copy ctor + operator= are in-class defaulted in libc++ — do NOT redefine.
@@ -122,6 +128,12 @@ const char* std::bad_alloc::what() const noexcept { return "std::bad_alloc"; }
 std::bad_array_new_length::bad_array_new_length() noexcept {}
 std::bad_array_new_length::~bad_array_new_length() noexcept {}
 const char* std::bad_array_new_length::what() const noexcept { return "std::bad_array_new_length"; }
+
+/* std::bad_weak_ptr (<memory>): thrown by shared_ptr(weak_ptr) on an expired
+ * weak_ptr. Its key function emits the vtable + type_info the shared_ptr code
+ * references. */
+std::bad_weak_ptr::~bad_weak_ptr() noexcept {}
+const char* std::bad_weak_ptr::what() const noexcept { return "std::bad_weak_ptr"; }
 
 /* ---- std::shared_ptr control block (libc++ src/memory.cpp) --------------- *
  * __shared_count / __shared_weak_count are libc++'s reference-count base
@@ -199,6 +211,55 @@ bad_function_call::~bad_function_call() noexcept {}
 const char* bad_function_call::what() const noexcept { return "std::bad_function_call"; }
 #endif
 _LIBCPP_END_NAMESPACE_STD
+
+/* ---- libc++ <string> / <chrono> library functions ------------------------
+ * These live in libc++'s string.cpp / chrono.cpp — TUs we don't vendor
+ * (cvm_cxxstl hand-rolls the STL out-of-line surface). FREE functions must be
+ * defined in the INLINE versioned namespace std::__1 (else they mangle as
+ * _ZSt... and don't satisfy libc++'s _ZNSt3__1... declarations — unlike class
+ * members, which carry their class's namespace). General CronoVM hardening (any
+ * C++ cart benefits). (__hash_memory lives in the vendored hash.cpp/cxxio.bc
+ * alongside __next_prime, its sibling unordered_map dependency.) */
+namespace std {
+inline namespace __1 {
+string to_string(int val) {
+    char b[16];
+    return string(b, (size_t)snprintf(b, sizeof b, "%d", val));
+}
+string to_string(long val) {
+    char b[24];
+    return string(b, (size_t)snprintf(b, sizeof b, "%ld", val));
+}
+string to_string(long long val) {
+    char b[24];
+    return string(b, (size_t)snprintf(b, sizeof b, "%lld", val));
+}
+
+int stoi(const string& str, size_t* idx, int base) {
+    const char* p = str.c_str();
+    char*       end = nullptr;
+    long        r   = strtol(p, &end, base);
+    if (end == p) {
+        throw invalid_argument("stoi");
+    }
+    if (idx) {
+        *idx = (size_t)(end - p);
+    }
+    return (int)r;
+}
+
+namespace chrono {
+/* No hardware clock syscall is guaranteed on the VM; return a monotonic counter
+ * (+1ms/call) so steady_clock is non-decreasing (gump animation timing). A real
+ * host-tick source can replace this later. */
+steady_clock::time_point steady_clock::now() noexcept {
+    static long long ns = 0;
+    ns += 1000000;    // +1 ms
+    return steady_clock::time_point(steady_clock::duration(ns));
+}
+}    // namespace chrono
+}    // inline namespace __1
+}    // namespace std
 
 /* libc++abi-level symbols clang/libc++ reference in the NON-versioned std
  * namespace (ABI-fixed names, normally in libc++abi). We have only the minimal

@@ -26,6 +26,12 @@ static int     NOINLINE pop32(uint32_t v) { return __builtin_popcount(v); }
 static int16_t NOINLINE bswap16i(uint16_t v) { return (int16_t)__builtin_bswap16(v); }
 static int8_t  NOINLINE bitrev8 (uint8_t  v) { return (int8_t)__builtin_bitreverse8(v); }
 static int16_t NOINLINE bitrev16(uint16_t v) { return (int16_t)__builtin_bitreverse16(v); }
+/* Narrow count-trailing-zeros (llvm.cttz.i8/i16): __builtin_ctzg operates at the
+ * argument width (no i32 promotion), and the explicit fallback covers v==0 (the
+ * intrinsic's is_zero_undef=false path → result = width). Guards the translator's
+ * cttz generalisation to i8/i16 (it previously handled only cttz.i32). */
+static int     NOINLINE ctz8 (uint8_t  v) { return __builtin_ctzg(v, 8); }
+static int     NOINLINE ctz16(uint16_t v) { return __builtin_ctzg(v, 16); }
 
 static volatile int32_t seeds[8] = { 0, 1, -1, 7, -7, 30000, -30000, 1234567 };
 
@@ -51,6 +57,11 @@ int conf_main(void) {
         uint32_t nz = ux ? ux : 1u;
         MIX(__builtin_clz(nz));
         MIX(__builtin_ctz(nz));
+
+        /* narrow trailing zeros (llvm.cttz.i8/i16); seed 0 exercises the
+         * v==0 -> width path of the lowering. */
+        MIX(ctz8 ((uint8_t)ux));
+        MIX(ctz16((uint16_t)ux));
 
         /* byte swaps (llvm.bswap.i16/i32) */
         MIX(bswap16i((uint16_t)ux));

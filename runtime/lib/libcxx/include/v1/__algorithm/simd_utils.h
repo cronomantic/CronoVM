@@ -26,7 +26,12 @@ _LIBCPP_PUSH_MACROS
 #include <__undef_macros>
 
 // TODO: Find out how altivec changes things and allow vectorizations there too.
-#if _LIBCPP_STD_VER >= 14 && defined(_LIBCPP_COMPILER_CLANG_BASED) && !defined(__ALTIVEC__)
+// [CRONOPIO] The CronoVM translator has no vector types: libc++'s SIMD
+// algorithm path emits `load/store <N x iM>` + movemask ops it cannot lower
+// (only the single num_get movemask idiom is recognised). Force the algorithm
+// vector utils OFF so std::find/count/mismatch/... fall back to scalar loops.
+// VM-wide (every Cronopio C++ cart needs this); hermetic, no -D required.
+#if 0 && _LIBCPP_STD_VER >= 14 && defined(_LIBCPP_COMPILER_CLANG_BASED) && !defined(__ALTIVEC__)
 #  define _LIBCPP_HAS_ALGORITHM_VECTOR_UTILS 1
 #else
 #  define _LIBCPP_HAS_ALGORITHM_VECTOR_UTILS 0
