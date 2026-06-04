@@ -980,6 +980,15 @@ struct cg {
     int           map_cap;
     int           next_reg;
 
+    /* O(1) value->index acceleration for cg_lookup (was a linear scan over
+     * vals[0..map_count), which is O(values^2) per function and dominated
+     * codegen on big functions). Open-addressed pointer hash, stores the
+     * FIRST index for each value (== linear-scan-first-match semantics), so
+     * the emitted code is byte-identical. Reset (key-clear) per function. */
+    LLVMValueRef *htab_key;   /* NULL = empty slot */
+    int          *htab_idx;   /* first vals[] index for that key */
+    int           htab_cap;   /* power of two, 0 = unallocated */
+
     LLVMBasicBlockRef *blocks;
     uint32_t          *block_offsets;
     int                block_count;
@@ -1102,6 +1111,8 @@ static int cg_alloca_append(struct cg *cg, LLVMValueRef v, uint32_t off) {
 
 static void cg_reset_function_state(struct cg *cg) {
     cg->map_count = 0;
+    if (cg->htab_cap)
+        memset(cg->htab_key, 0, (size_t)cg->htab_cap * sizeof(*cg->htab_key));
     cg->next_reg = 8;
     cg->block_count = 0;
     cg->fixup_count = 0;
@@ -1220,9 +1231,41 @@ static void cg_free_reg(struct cg *cg, uint8_t r) {
 /* Forward decl: defined further down with the prologue/stack helpers. */
 static void cg_emit_load_const32(struct cg *cg, uint8_t rd, int32_t imm);
 
+/* Insert (v -> idx) into the value->index hash, FIRST occurrence winning (so a
+ * value assigned twice keeps its first index, matching the old linear scan). */
+static void cg_htab_put(struct cg *cg, LLVMValueRef v, int idx) {
+    size_t mask = (size_t)(cg->htab_cap - 1);
+    size_t h    = ((uintptr_t)v >> 4) & mask;
+    while (cg->htab_key[h]) {
+        if (cg->htab_key[h] == v) return;   /* already present — keep first */
+        h = (h + 1) & mask;
+    }
+    cg->htab_key[h] = v;
+    cg->htab_idx[h] = idx;
+}
+
+/* Grow the hash to >= min_cap slots and rehash the current function's existing
+ * vals[0..map_count) entries (called from cg_assign when the load factor rises). */
+static void cg_htab_grow(struct cg *cg, int min_cap) {
+    int cap = cg->htab_cap ? cg->htab_cap : 64;
+    while (cap < min_cap) cap <<= 1;
+    free(cg->htab_key);
+    free(cg->htab_idx);
+    cg->htab_key = (LLVMValueRef *)calloc((size_t)cap, sizeof(*cg->htab_key));
+    cg->htab_idx = (int *)malloc((size_t)cap * sizeof(*cg->htab_idx));
+    if (!cg->htab_key || !cg->htab_idx) { perror("calloc"); exit(1); }
+    cg->htab_cap = cap;
+    for (int i = 0; i < cg->map_count; ++i) cg_htab_put(cg, cg->vals[i], i);
+}
+
 static int cg_lookup(struct cg *cg, LLVMValueRef v) {
-    for (int i = 0; i < cg->map_count; ++i)
-        if (cg->vals[i] == v) return i;
+    if (!cg->htab_cap) return -1;
+    size_t mask = (size_t)(cg->htab_cap - 1);
+    size_t h    = ((uintptr_t)v >> 4) & mask;
+    while (cg->htab_key[h]) {
+        if (cg->htab_key[h] == v) return cg->htab_idx[h];
+        h = (h + 1) & mask;
+    }
     return -1;
 }
 
@@ -1252,6 +1295,10 @@ static uint8_t cg_assign(struct cg *cg, LLVMValueRef v, uint8_t r) {
     cg->i64_slot[cg->map_count] = CG_NO_SLOT;
     cg->agg_slot[cg->map_count] = CG_NO_SLOT;
     cg->vec_slot[cg->map_count] = CG_NO_SLOT;
+    /* Mirror into the O(1) lookup hash (load factor < 0.5). */
+    if (cg->htab_cap < 2 * (cg->map_count + 1))
+        cg_htab_grow(cg, 2 * (cg->map_count + 1));
+    cg_htab_put(cg, v, cg->map_count);
     cg->map_count++;
     return r;
 }
@@ -1615,44 +1662,73 @@ static int cg_resolve_table_fixups(struct cg *cg) {
  * branch out of range. Each iteration relaxes at least one fixup, so the
  * loop is bounded by the fixup count. The interpreter ABI is unchanged —
  * relaxation only re-shapes the emitted bytecode using existing opcodes. */
+/* Fenwick (binary indexed tree) over instruction positions: point-add at a
+ * position, prefix-count of positions strictly below X. Used by branch
+ * relaxation to count already-relaxed fixups before a target/pc in O(log n)
+ * instead of an O(fixups) rescan — the old triple loop was O(fixups^3). */
+static void cg_fen_add(int *bit, int n, int pos) {
+    for (int i = pos + 1; i <= n; i += i & -i) bit[i]++;
+}
+static int cg_fen_below(const int *bit, int x) {   /* count of positions < x */
+    int s = 0;
+    for (int i = x; i > 0; i -= i & -i) s += bit[i];
+    return s;
+}
+
 static int cg_relax_branches(struct cg *cg) {
     if (cg->fixup_count == 0) return 0;
 
     int *relaxed = (int *)calloc((size_t)cg->fixup_count, sizeof(int));
     if (!relaxed) { perror("calloc"); return 1; }
 
+    /* Precompute each 8-bit fixup's target block ONCE (cg_find_block is a
+     * linear scan; doing it inside the relaxation passes was O(fixups*blocks)
+     * per pass). target_b[i] = -1 for non-8-bit fixups (never relaxed). */
+    int *target_b = (int *)malloc((size_t)cg->fixup_count * sizeof(int));
+    /* Fenwick over [0, cg->count): bit set when a fixup at that position
+     * relaxes (inserts +1 instruction strictly after inst_index). */
+    int *bit = (int *)calloc((size_t)cg->count + 1u, sizeof(int));
+    if (!target_b || !bit) {
+        perror("malloc"); free(target_b); free(bit); free(relaxed); return 1;
+    }
+    for (int i = 0; i < cg->fixup_count; ++i) {
+        if (cg->fixups[i].bits != 8) { target_b[i] = -1; continue; }
+        target_b[i] = cg_find_block(cg, cg->fixups[i].target);
+        if (target_b[i] < 0) {
+            ERR(cg->fn_name, "internal: fixup target block not found");
+            free(target_b); free(bit); free(relaxed); return 1;
+        }
+    }
+
     for (int it = 0; it <= cg->fixup_count; ++it) {
         int changed = 0;
         for (int i = 0; i < cg->fixup_count; ++i) {
             if (cg->fixups[i].bits != 8 || relaxed[i]) continue;
 
-            int target_b = cg_find_block(cg, cg->fixups[i].target);
-            if (target_b < 0) {
-                ERR(cg->fn_name, "internal: fixup target block not found");
-                free(relaxed);
-                return 1;
-            }
-            uint32_t orig_target    = cg->block_offsets[target_b];
+            uint32_t orig_target    = cg->block_offsets[target_b[i]];
             uint32_t orig_pc_after  = cg->fixups[i].inst_index + 1u;
 
             /* Effective offsets after already-decided relaxations: each
              * relaxed fixup inserts +1 instruction strictly after its own
-             * inst_index, so positions ≥ inst_index+1 shift by +1. */
-            int target_displ = 0, pc_displ = 0;
-            for (int j = 0; j < cg->fixup_count; ++j) {
-                if (!relaxed[j]) continue;
-                if (cg->fixups[j].inst_index < orig_target)   target_displ++;
-                if (cg->fixups[j].inst_index < orig_pc_after) pc_displ++;
-            }
+             * inst_index, so positions ≥ inst_index+1 shift by +1. The
+             * Fenwick gives "how many relaxed fixups sit below P" in O(log n);
+             * relaxations are recorded into it as they are decided, so a
+             * same-pass relaxation at a lower i is visible here (matching the
+             * old full rescan of relaxed[]). */
+            int target_displ = cg_fen_below(bit, (int)orig_target);
+            int pc_displ     = cg_fen_below(bit, (int)orig_pc_after);
             int32_t rel = (int32_t)(orig_target + (uint32_t)target_displ)
                         - (int32_t)(orig_pc_after + (uint32_t)pc_displ);
             if (rel < -128 || rel > 127) {
                 relaxed[i] = 1;
                 changed = 1;
+                cg_fen_add(bit, (int)cg->count, (int)cg->fixups[i].inst_index);
             }
         }
         if (!changed) break;
     }
+    free(target_b);
+    free(bit);
 
     int relax_count = 0;
     for (int i = 0; i < cg->fixup_count; ++i)
@@ -1671,15 +1747,26 @@ static int cg_relax_branches(struct cg *cg) {
         return 1;
     }
 
+    /* extra[op] = number of relaxed fixups whose BEQ/BNE sits at position op
+     * (distinct fixups have distinct inst_index, so it's 0 or 1, but count to
+     * be safe). Built in O(fixups) so the rebuild below is O(old_size + fixups)
+     * instead of O(old_size * fixups). */
+    uint8_t *extra = (uint8_t *)calloc((size_t)old_size, 1);
+    if (!extra) {
+        perror("calloc"); free(new_code); free(new_pos_of); free(relaxed);
+        return 1;
+    }
+    for (int f = 0; f < cg->fixup_count; ++f)
+        if (relaxed[f]) extra[cg->fixups[f].inst_index]++;
+
     uint32_t np = 0;
     for (uint32_t op = 0; op < old_size; ++op) {
         new_pos_of[op] = np;
         new_code[np++] = cg->code[op];
-        for (int f = 0; f < cg->fixup_count; ++f) {
-            if (relaxed[f] && cg->fixups[f].inst_index == op)
-                new_code[np++] = enc_i24(CVM_OP_JMP, 0);
-        }
+        for (unsigned e = 0; e < extra[op]; ++e)
+            new_code[np++] = enc_i24(CVM_OP_JMP, 0);
     }
+    free(extra);
 
     /* Rewrite each relaxed BEQ/BNE: flip the opcode and set imm8 = +1.
      * Translator-emitted conditional brs only ever use BNE today (the
@@ -7864,6 +7951,8 @@ int cvm_fuzz_translate_buffer(const uint8_t *data, size_t len) {
         free(cg.code);
         free(cg.vals);
         free(cg.regs);
+        free(cg.htab_key);
+        free(cg.htab_idx);
         free(cg.val_slot);
         free(cg.blocks);
         free(cg.block_offsets);
@@ -8233,7 +8322,6 @@ int main(int argc, char **argv) {
             cg.funcs[k].entry_offset = cg.count;
             if (cg_function(&cg, cg.funcs[k].value, k) != 0) rc = 1;
         }
-
         /* Every translator-emitted function ends in RET, so even leaf
          * programs need at least the sentinel return PC on the stack.
          * Default to 16 KiB regardless of CALL usage; --stack-reserve
@@ -8364,6 +8452,8 @@ int main(int argc, char **argv) {
         free(cg.code);
         free(cg.vals);
         free(cg.regs);
+        free(cg.htab_key);
+        free(cg.htab_idx);
         free(cg.val_slot);
         free(cg.blocks);
         free(cg.block_offsets);
