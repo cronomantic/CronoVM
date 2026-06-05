@@ -159,6 +159,9 @@ add_subdirectory(tools/cvm-cc)
 # --- cvm-dis: bytecode disassembler, no LLVM dependency. Always built. -
 add_subdirectory(tools/cvm-dis)
 
+# --- cvm-fuzz: differential test generator, no LLVM dependency. Always built.
+add_subdirectory(tools/cvm-fuzz)
+
 # --- examples/embedder consumer test ----------------------------------
 # Validates the canonical "add_subdirectory(deps/CronoVM)" consumer
 # pattern by configuring + building + running examples/embedder/ as a

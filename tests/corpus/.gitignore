@@ -1,0 +1,4 @@
+# scratch artifacts from cvm-fuzz / run_corpus.sh / reduce.sh
+fails/
+_seed*.c
+*_min.c

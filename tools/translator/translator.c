@@ -4891,39 +4891,58 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 case LLVMXor:  cv = CVM_OP_XOR;  break;
                 default:       cv = CVM_OP_ADD;  break; /* unreachable */
                 }
-                /* Narrow (iN, N<32) shift-right needs the shiftee normalised to
-                 * N bits FIRST. The VM SHR/SAR work on the full 32-bit register,
-                 * but a narrow value may carry garbage above bit N-1 after a
-                 * prior add/sub/mul/shl (the "kept zero-extended" invariant only
-                 * holds straight out of a load or trunc). So:
-                 *   LShr: zero-extend  -> AND lhs with (1<<N)-1, then SHR
-                 *   AShr: sign-extend  -> SHL/SAR lhs by (32-N), then SAR
-                 * Without this, `lshr iN` shifts stray high bits down and
-                 * `ashr iN` replicates bit 31 instead of bit N-1 — a silent
-                 * miscompile, exposed by _BitInt and by clang -O1 narrowing a
-                 * value to an odd width (e.g. the i14 in UQM comm.c text layout).
-                 * Shl needs no fixup (consumers re-normalise); N==32 is exact. */
-                if (op == LLVMLShr || op == LLVMAShr) {
+                /* Narrow (iN, N<32) operations whose result depends on bits
+                 * ABOVE bit N-1 need their operand(s) normalised to N bits FIRST.
+                 * The VM ops work on the full 32-bit register, but a narrow value
+                 * may carry garbage above bit N-1 after a prior add/sub/mul/shl/
+                 * xor (the "kept zero-extended" invariant only holds straight out
+                 * of a load or trunc). The cases that care, and the fixup:
+                 *   LShr      : zero-extend the shiftee  (AND with (1<<N)-1)
+                 *   AShr      : sign-extend  the shiftee  (SHL/SAR by 32-N)
+                 *   UDiv/URem : zero-extend BOTH operands
+                 *   SDiv/SRem : sign-extend  BOTH operands
+                 * Without this, `lshr iN` shifts stray high bits down, `ashr iN`
+                 * replicates bit 31 not bit N-1, and a narrow divide/remainder
+                 * divides the wrong (garbage-laden) 32-bit values — a silent
+                 * miscompile. The divide case is exposed when clang -O2 narrows a
+                 * 32-bit `udiv`/`urem` to iN once it proves the operands fit (e.g.
+                 * `(uint16_t)((uint32_t)a / ((uint32_t)b | 1))` -> `udiv i16`).
+                 * add/sub/mul/and/or/xor/shl only depend on the low N bits, so
+                 * need no fixup; icmp is normalised in its own handler;
+                 * N==32 is exact. */
+                {
                     unsigned rw = LLVMGetIntTypeWidth(LLVMTypeOf(i));
-                    if (rw < 32) {
-                        uint8_t nl = cg_alloc_reg(cg);
-                        if (cg->had_error) break;
-                        if (op == LLVMLShr) {
-                            uint32_t mask = (uint32_t)(((uint64_t)1 << rw) - 1u);
-                            cg_emit_load_const32(cg, (uint8_t)CG_REG_SCRATCH,
-                                                 (int32_t)mask);
-                            cg_emit(cg, enc_r(CVM_OP_AND, nl, lhs,
-                                              (uint8_t)CG_REG_SCRATCH));
-                        } else {
-                            int16_t sh = (int16_t)(32u - rw);
-                            cg_emit(cg, enc_i16(CVM_OP_MOVI,
-                                                (uint8_t)CG_REG_SCRATCH, sh));
-                            cg_emit(cg, enc_r(CVM_OP_SHL, nl, lhs,
-                                              (uint8_t)CG_REG_SCRATCH));
-                            cg_emit(cg, enc_r(CVM_OP_SAR, nl, nl,
-                                              (uint8_t)CG_REG_SCRATCH));
+                    int is_div = (op == LLVMUDiv || op == LLVMURem ||
+                                  op == LLVMSDiv || op == LLVMSRem);
+                    int norm_lhs = (op == LLVMLShr || op == LLVMAShr || is_div);
+                    if (rw < 32 && norm_lhs) {
+                        int sext = (op == LLVMAShr || op == LLVMSDiv ||
+                                    op == LLVMSRem);
+                        uint8_t *slots[2]; int nslots = 0;
+                        slots[nslots++] = &lhs;
+                        if (is_div) slots[nslots++] = &rhs;  /* both div operands */
+                        for (int sk = 0; sk < nslots; sk++) {
+                            uint8_t nl = cg_alloc_reg(cg);
+                            if (cg->had_error) break;
+                            if (!sext) {
+                                uint32_t mask =
+                                    (uint32_t)(((uint64_t)1 << rw) - 1u);
+                                cg_emit_load_const32(cg, (uint8_t)CG_REG_SCRATCH,
+                                                     (int32_t)mask);
+                                cg_emit(cg, enc_r(CVM_OP_AND, nl, *slots[sk],
+                                                  (uint8_t)CG_REG_SCRATCH));
+                            } else {
+                                int16_t sh = (int16_t)(32u - rw);
+                                cg_emit(cg, enc_i16(CVM_OP_MOVI,
+                                                    (uint8_t)CG_REG_SCRATCH, sh));
+                                cg_emit(cg, enc_r(CVM_OP_SHL, nl, *slots[sk],
+                                                  (uint8_t)CG_REG_SCRATCH));
+                                cg_emit(cg, enc_r(CVM_OP_SAR, nl, nl,
+                                                  (uint8_t)CG_REG_SCRATCH));
+                            }
+                            *slots[sk] = nl;
                         }
-                        lhs = nl;
+                        if (cg->had_error) break;
                     }
                 }
                 cg_emit(cg, enc_r(cv, dst, lhs, rhs));

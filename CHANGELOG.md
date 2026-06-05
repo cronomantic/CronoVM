@@ -10,6 +10,24 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **Differential test corpus — `cvm-fuzz` generator + `run_corpus.sh`
+  (`tools/cvm-fuzz/`, `tests/corpus/`, `docs/corpus.md`).** A seed-reproducible
+  generator emits broad, randomised, **UB-free** C programs (each exporting
+  `int conf_main(void)` returning an int32 FNV checksum) that the runner builds
+  both natively (oracle) and on the VM (cvm-cc) and compares — catching
+  translator/VM miscompiles *proactively* instead of via a downstream game crash.
+  Uses only fixed-width types + an int32 result so the LP64 host and ILP32 VM
+  agree without a `-m32` oracle; MIT-clean (no GPL corpus vendored). Tuned to the
+  recurring bug classes (register-pressure spills, narrow-int + narrow signed
+  compares, `i64`, phi/branch/switch merges, caller-save spills, struct copy,
+  `alloca` indexing). UB-freedom is guaranteed by construction (all arithmetic in
+  an unsigned compute type, masked shifts, guarded division, in-bounds indexing,
+  no uninit reads) and verified with `clang -fsanitize=undefined`. The runner
+  builds each seed at every requested opt level (a miscompile can be `-O2`-only)
+  and saves failing programs for `reduce.sh` (ddmin) minimisation. It is a
+  fuzzer, not a default `ctest` gate. (First run already surfaced two real issues:
+  the narrow `udiv`/`urem`/`sdiv`/`srem` operand-normalisation miscompile fixed
+  below, plus an unlowered `llvm.fshl.i64` funnel-shift gap — see `docs/corpus.md`.)
 - **VM diagnostics subsystem (`docs/debugging.md`; compile flag `CVM_DIAG`, CMake
   `-DCVM_DIAG=ON`).** An opt-in, off-by-default, env-var-driven set of instruments
   built into the interpreter for chasing memory corruption and codegen miscompiles in
@@ -229,6 +247,21 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Fixed
 
+- **Translator: narrow (`iN`, N<32) `udiv`/`urem`/`sdiv`/`srem` now normalise their
+  operands to N bits before the divide.** The VM's `DIV`/`DIVU`/`MOD`/`MODU` operate
+  on the full 32-bit register, but a narrow value can carry garbage above bit N-1
+  (the kept zero/sign-extended invariant only holds straight out of a load or
+  `trunc`). For shifts this was already handled (`lshr`/`ashr`), but the
+  divide/remainder path emitted the op directly on the raw registers — and unlike
+  `add`/`mul`/`and`/`xor`, division depends on the FULL operand, so the quotient/
+  remainder was wrong. The handler now zero-extends both operands for `udiv`/`urem`
+  and sign-extends both for `sdiv`/`srem` (the same normalisation the shifts use).
+  Triggered when clang's `-O2` narrows a 32-bit divide to `iN` once it proves the
+  operands fit (`(uint16_t)((uint32_t)a / ((uint32_t)b|1)) -> udiv i16`), so it was
+  invisible at `-O1` and to a hand-written `-O1` suite — **found by the new
+  differential corpus** (`tools/cvm-fuzz`). Guard: `conf_narrow_div` (uses
+  `_BitInt(N)` to force the narrow op at the conformance `-O1` build level; fails
+  without the fix, passes with). Conformance 43/43.
 - **Translator: a SPILLED `alloca` pointer is now written to its value-spill slot
   (the real Exult egg bug).** When the register file is exhausted (a function whose
   live-SSA count reaches `CG_MAX_SSA_REG` — only giant functions such as Exult's
