@@ -247,6 +247,18 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Fixed
 
+- **Translator: `zext`/`sext iN->i64` (N<32) now normalise the narrow source to N
+  bits before forming the i64 low word.** The widening wrote the i64 low word
+  straight from the source register; a narrow `iN` value can carry garbage above
+  bit N-1 (notably because a negative narrow constant is materialised
+  sign-extended, so a prior `xor iN` with one leaves 1s up top). That garbage
+  landed in the low word and, in a subsequent `add i64`, fabricated a spurious
+  carry into the high word (an off-by-one in the high 32 bits) — while the low
+  word, masked downstream, looked correct, which hid it. Now both widenings mask
+  the source to its width first (`zext`: zero-extend; `sext`: sign-extend, which
+  also fixes `src >> 31` replicating the wrong bit). This single root cause was
+  behind a CLUSTER of ~10 differential-corpus seeds (failing at `-O1` and `-O2`).
+  Guard: `conf_zext_i64`. Conformance pass.
 - **Translator: narrow (`iN`, N<32) `udiv`/`urem`/`sdiv`/`srem` now normalise their
   operands to N bits before the divide.** The VM's `DIV`/`DIVU`/`MOD`/`MODU` operate
   on the full 32-bit register, but a narrow value can carry garbage above bit N-1

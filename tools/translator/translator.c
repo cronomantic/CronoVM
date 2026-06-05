@@ -2979,8 +2979,14 @@ static void cg_emit_i64_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
 
     switch (op) {
     case LLVMSExt: {
-        /* lo = src; hi = src >>(arith) 31  (sign replicated). */
-        uint8_t src = cg_reg_for(cg, LLVMGetOperand(i, 0));
+        /* lo = sext(src to its width); hi = src >>(arith) 31  (sign replicated).
+         * Sign-normalise a narrow source to its width FIRST: an iN (N<32) value
+         * can carry garbage above bit N-1, which would corrupt the low word AND
+         * make `src >> 31` replicate the wrong (garbage) bit instead of bit N-1. */
+        LLVMValueRef ssv = LLVMGetOperand(i, 0);
+        uint8_t src = cg_reg_for(cg, ssv);
+        if (cg->had_error) return;
+        src = cg_norm_reg_width(cg, src, LLVMGetIntTypeWidth(LLVMTypeOf(ssv)), 1);
         if (cg->had_error) return;
         uint8_t hi = cg_alloc_reg(cg); if (cg->had_error) return;
         cg_shift_imm(cg, CVM_OP_SAR, hi, src, 31);
@@ -3006,8 +3012,16 @@ static void cg_emit_i64_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
             }
             break;
         }
-        /* lo = src; hi = 0. */
-        uint8_t src = cg_reg_for(cg, LLVMGetOperand(i, 0));
+        /* lo = zext(src to its width); hi = 0. Normalise a narrow source to its
+         * width FIRST: an iN (N<32) value can carry garbage above bit N-1 (the
+         * kept-zero-extended invariant only holds straight out of a load/trunc —
+         * e.g. a sign-extended narrow constant in a prior `xor iN` leaves 1s up
+         * top), and here that garbage would land in the i64 LOW word and, in a
+         * later i64 add, fabricate a carry into the high word. */
+        LLVMValueRef zsv = LLVMGetOperand(i, 0);
+        uint8_t src = cg_reg_for(cg, zsv);
+        if (cg->had_error) return;
+        src = cg_norm_reg_width(cg, src, LLVMGetIntTypeWidth(LLVMTypeOf(zsv)), 0);
         if (cg->had_error) return;
         cg_i64_write(cg, idx, src, cg->zero_reg);
         break;
