@@ -41,6 +41,12 @@
 #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
 #  define _POSIX_C_SOURCE 200809L
 #endif
+/* On macOS, _POSIX_C_SOURCE alone restricts <unistd.h> to the POSIX namespace
+ * (under -std=c11 / __STRICT_ANSI__), hiding the non-POSIX _SC_NPROCESSORS_ONLN
+ * used by default_jobs(). _DARWIN_C_SOURCE re-exposes the full BSD namespace. */
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#  define _DARWIN_C_SOURCE 1
+#endif
 
 #include <errno.h>
 #include <stdio.h>
