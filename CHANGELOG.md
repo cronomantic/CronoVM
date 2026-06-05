@@ -10,6 +10,19 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **VM diagnostics subsystem (`docs/debugging.md`; compile flag `CVM_DIAG`, CMake
+  `-DCVM_DIAG=ON`).** An opt-in, off-by-default, env-var-driven set of instruments
+  built into the interpreter for chasing memory corruption and codegen miscompiles in
+  carts: a **redzone allocator** (`CVM_REDZONE` + `CVM_RZ_MALLOC/FREE/REALLOC/CALLOC`)
+  that traps the first out-of-bounds heap store with a backtrace, holder scan, register
+  dump and stack-frame window; **write/value watchpoints** (`CVM_WADDR`, `CVM_WVAL`); a
+  **misaligned-pointer-write detector** (`CVM_MISP` + `_TARGET/_FUNC/_AND3`, covering
+  `memcpy` too); **slot write-history ring buffers** (`CVM_RING_A/B`); **register
+  trip-wires** (`CVM_TRIP_PC` + `CVM_TRIP_SP`); an instruction dump (`CVM_PCDUMP` +
+  `_RB/_R1/_SP`); and a per-word last-writer-PC map. `PRIVATE` to the `cvm` target — no
+  ABI or `cvm.h` impact, zero overhead when off. Cracked the Exult `Usecode_internal::
+  run()` spilled-alloca heap corruption (a 1.4M-element relocate over-walking the heap
+  from a garbage near-NULL vector `this`); the worked example is in `docs/debugging.md`.
 - **`cvm-dis` — a bytecode disassembler (`tools/cvm-dis/`).** Decodes the CODE
   section of a `.crom`/`.bin` image into readable instructions and labels function
   entry points and `CALL` targets via the optional `<image>.sym` sidecar (written by

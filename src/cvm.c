@@ -738,6 +738,422 @@ static inline uint32_t cvm_f32_to_u32_sat(float f) {
 #  endif
 #endif
 
+/* ===========================================================================
+ *  VM diagnostics subsystem  (compile flag: CVM_DIAG; CMake: -DCVM_DIAG=ON)
+ * ---------------------------------------------------------------------------
+ *  An opt-in, zero-overhead-when-off set of instruments for chasing memory
+ *  corruption and codegen miscompiles in carts running on the VM. Every probe
+ *  is gated at COMPILE time by CVM_DIAG (so production builds carry none of it)
+ *  and selected at RUN time by an environment variable (so one debug build
+ *  serves every probe). All output goes to stderr, prefixed by the probe name.
+ *
+ *  This toolkit cracked the Exult `Usecode_internal::run()` spilled-alloca
+ *  corruption (a 1.4M-element relocate over-walking the heap from a garbage
+ *  near-NULL vector `this`); docs/debugging.md has the full worked example.
+ *
+ *  Probes (see docs/debugging.md for the complete reference):
+ *    CVM_REDZONE=1        Bounds-checking allocator shadow: hook the cart's
+ *                         malloc/free/realloc/calloc (FUNCS slots via
+ *                         CVM_RZ_MALLOC/FREE/REALLOC/CALLOC=<slot>) and TRAP on
+ *                         the first store landing outside any live allocation,
+ *                         with a heuristic backtrace, holder scan, register
+ *                         dump, a stack-frame window, and the ring/trip
+ *                         captures (CVM_RING_A/B, CVM_TRIP_PC) below.
+ *    CVM_PCDUMP=<pc>      Dump R[a/b/c]+SP+args + 16 bytes at R[b] when pc is
+ *                         reached; filters CVM_PCDUMP_RB / _R1 / _SP=<val>.
+ *    CVM_WADDR=<addr>     Log every store overlapping addr (with pc+func).
+ *    CVM_WVAL=<val>       Log every 4-byte store of val (with addr+pc+func).
+ *    CVM_MISP=<1|2>       Flag a store/memcpy writing a MISALIGNED in-heap ptr
+ *                         into a 4-aligned heap slot; CVM_MISP_TARGET=<val>
+ *                         watches one value over stw+memcpy; _FUNC / _AND3 filter.
+ *    CVM_RING_A/B=<addr>  Ring buffer of the last RING_N writes (pc, old->new)
+ *                         to a watched slot; dumped at the redzone trap (used to
+ *                         reconstruct a loop cursor's full history without
+ *                         drowning in millions of global writes).
+ *    CVM_TRIP_PC=<pc>     Capture R[b] at pc (CVM_TRIP_SP=<sp> filters by frame);
+ *                         reported at the redzone trap with the field's last
+ *                         writer (pins who wrote a corrupt pointer to an object).
+ *  A per-word last-writer-PC map over [heap_start, mem_size) backs the holder
+ *  scan and the trip report (active whenever CVM_REDZONE is set).
+ * =========================================================================== */
+#if defined(CVM_DIAG)
+#include <stdlib.h>
+#include <stdio.h>
+static long     g_dg_pc   = -2;
+static uint32_t g_dg_wa   = 0;
+static int      g_dg_won  = -1;
+static long     g_dg_wval = -2;   /* CVM_WVAL: log any store of this 32-bit value */
+static long     g_dg_rb   = -2;   /* CVM_PCDUMP_RB: only dump when R[b]==this */
+static long     g_dg_r1   = -2;   /* CVM_PCDUMP_R1: only dump when R[1]==this */
+static long     g_dg_sp   = -2;   /* CVM_PCDUMP_SP: only dump when SP==this */
+/* CVM_MISP: catch the first store that puts a MISALIGNED (&3!=0) in-heap pointer
+ * into a 4-aligned heap slot. mode 1 = only when the slot previously held an
+ * ALIGNED in-heap pointer (a __begin_-style field going bad); mode 2 = any. */
+static int      g_misp   = -2;
+static int      g_misp_n = 0;
+static long     g_misp_target = -1;   /* CVM_MISP_TARGET: watch this exact value (stw+memcpy) */
+static long     g_misp_func   = -1;   /* CVM_MISP_FUNC: only log this dg_enc func */
+static int      g_misp_and3   = -1;   /* CVM_MISP_AND3: only log when new&3 == this */
+static uint32_t g_hs = 0, g_he = 0;   /* heap [start,end) for misp (CVM_REDZONE-independent) */
+/* Ring buffers: the last RING_N writes (pc, old->new) to up to two watched
+ * stack slots, dumped at the redzone trap — reconstructs a cursor slot's full
+ * write history (init + every +20 advance + the wild write) without drowning
+ * in ~700k global writes. CVM_RING_A / CVM_RING_B = the slot addresses. */
+#define RING_N 256u   /* power of two */
+static uint32_t ring_a = 0xffffffffu, ring_b = 0xffffffffu;
+static uint32_t ring_a_pc[RING_N], ring_a_old[RING_N], ring_a_new[RING_N];
+static uint32_t ring_b_pc[RING_N], ring_b_old[RING_N], ring_b_new[RING_N];
+static uint32_t ring_a_i = 0, ring_b_i = 0;
+/* Trip-wire: at CVM_TRIP_PC capture R[b] (e.g. the vector `this` in a LDW
+ * [Rb]); reported at the redzone trap with its first heap word + that field's
+ * last writer — i.e. who wrote the corrupt misaligned __begin_. */
+static uint32_t trip_pc = 0xffffffffu, trip_rb = 0, trip_sp = 0;
+static void dg_init(void) {
+    if (g_misp == -2) { const char *e = getenv("CVM_MISP"); g_misp = e ? atoi(e) : 0;
+                        const char *t = getenv("CVM_MISP_TARGET");
+                        if (t) { g_misp_target = (long)(uint32_t)strtoul(t, 0, 0); if (g_misp <= 0) g_misp = 3; }
+                        const char *f = getenv("CVM_MISP_FUNC"); if (f) g_misp_func = strtol(f, 0, 0);
+                        const char *a = getenv("CVM_MISP_AND3"); if (a) g_misp_and3 = atoi(a); }
+    if (g_dg_pc == -2) { const char *e = getenv("CVM_PCDUMP"); g_dg_pc = e ? strtol(e, 0, 0) : -1; }
+    if (g_dg_won < 0)  { const char *e = getenv("CVM_WADDR");
+                         if (e) { g_dg_wa = (uint32_t)strtoul(e, 0, 0); g_dg_won = 1; } else g_dg_won = 0; }
+    if (g_dg_wval == -2) { const char *e = getenv("CVM_WVAL");
+                           g_dg_wval = e ? (long)(uint32_t)strtoul(e, 0, 0) : -1; }
+    if (g_dg_rb == -2) { const char *e = getenv("CVM_PCDUMP_RB");
+                         g_dg_rb = e ? (long)(uint32_t)strtoul(e, 0, 0) : -1; }
+    if (g_dg_r1 == -2) { const char *e = getenv("CVM_PCDUMP_R1");
+                         g_dg_r1 = e ? (long)(uint32_t)strtoul(e, 0, 0) : -1; }
+    if (g_dg_sp == -2) { const char *e = getenv("CVM_PCDUMP_SP");
+                         g_dg_sp = e ? (long)(uint32_t)strtoul(e, 0, 0) : -1; }
+    { const char *e = getenv("CVM_RING_A"); if (e) ring_a = (uint32_t)strtoul(e, 0, 0); }
+    { const char *e = getenv("CVM_RING_B"); if (e) ring_b = (uint32_t)strtoul(e, 0, 0); }
+    { const char *e = getenv("CVM_TRIP_PC"); if (e) trip_pc = (uint32_t)strtoul(e, 0, 0); }
+    { const char *e = getenv("CVM_TRIP_SP"); if (e) trip_sp = (uint32_t)strtoul(e, 0, 0); }
+}
+static uint32_t dg_enc(uint32_t pc, const uint32_t *fo, uint32_t fc) {
+    uint32_t best = 0, e = 0;
+    for (uint32_t i = 1; i < fc; i++) if (fo[i] <= pc && fo[i] >= best) { best = fo[i]; e = i; }
+    return e;
+}
+/* Per-stack-word last-writer-PC map (CVM_DIAG): records the pc of the last
+ * store to each 4-byte stack slot so the redzone trap can NAME who wrote a
+ * wild relocate cursor. Covers [lw_base, lw_base + lw_words*4) = the stack. */
+static uint32_t *lw_pc   = NULL;
+static uint32_t  lw_base = 0, lw_words = 0;
+static void lw_rec(uint32_t pc, uint32_t addr, uint32_t sz) {
+    if (!lw_pc) return;
+    uint32_t w = addr & ~3u, end = addr + sz;
+    for (; w < end; w += 4u) {
+        if (w < lw_base) continue;
+        uint32_t i = (w - lw_base) >> 2;
+        if (i < lw_words) lw_pc[i] = pc;
+    }
+}
+static uint32_t lw_get(uint32_t addr) {
+    if (!lw_pc || (addr & 3u) || addr < lw_base) return 0;
+    uint32_t i = (addr - lw_base) >> 2;
+    return i < lw_words ? lw_pc[i] : 0;
+}
+/* Record one 4-byte store to a watched ring slot (old read from heap = value
+ * BEFORE the store, since DG_W runs before the heap memcpy). */
+static void ring_rec(uint32_t pc, uint32_t addr, uint32_t sz, uint32_t nv,
+                     const uint8_t *heap) {
+    if (sz != 4u) return;
+    if (addr == ring_a) { uint32_t ov; memcpy(&ov, heap + addr, 4);
+        uint32_t i = ring_a_i++ & (RING_N - 1u);
+        ring_a_pc[i] = pc; ring_a_old[i] = ov; ring_a_new[i] = nv; }
+    if (addr == ring_b) { uint32_t ov; memcpy(&ov, heap + addr, 4);
+        uint32_t i = ring_b_i++ & (RING_N - 1u);
+        ring_b_pc[i] = pc; ring_b_old[i] = ov; ring_b_new[i] = nv; }
+}
+static void ring_dump(const char *nm, uint32_t addr, const uint32_t *rpc,
+                      const uint32_t *rold, const uint32_t *rnew, uint32_t cnt,
+                      const uint32_t *fo, uint32_t fc) {
+    if (addr == 0xffffffffu) return;
+    uint32_t n = cnt < RING_N ? cnt : RING_N;
+    fprintf(stderr, "[RING-%s] @0x%08x last %u writes (oldest->newest):\n", nm, addr, n);
+    for (uint32_t k = 0; k < n; k++) {
+        uint32_t i = (cnt - n + k) & (RING_N - 1u);
+        fprintf(stderr, "    pc=%u f=%u  0x%08x -> 0x%08x\n",
+                rpc[i], dg_enc(rpc[i], fo, fc), rold[i], rnew[i]);
+    }
+    fflush(stderr);
+}
+static void dg_pcdump(uint32_t pc, uint8_t op, uint8_t a, uint8_t b, uint8_t c,
+                      const int32_t *R, uint32_t sp_reg,
+                      const uint8_t *heap, uint32_t mem_size) {
+    fprintf(stderr, "[PCDUMP] pc=%u op=%u a=%u R[a]=0x%08x b=%u R[b]=0x%08x "
+            "c=%u R[c]=0x%08x SP=0x%08x\n", pc, op, a, (uint32_t)R[a], b,
+            (uint32_t)R[b], c, (uint32_t)R[c], sp_reg);
+    /* Dump 16 bytes at R[b] (e.g. a std::string object: cap/size/data words). */
+    uint32_t s = (uint32_t)R[b];
+    if (s + 16u <= mem_size) {
+        fprintf(stderr, "       [R[b]] words: %08x %08x %08x %08x  bytes:",
+                ((const uint32_t *)(heap + s))[0], ((const uint32_t *)(heap + s))[1],
+                ((const uint32_t *)(heap + s))[2], ((const uint32_t *)(heap + s))[3]);
+        for (int i = 0; i < 16; i++) fprintf(stderr, " %02x", heap[s + i]);
+        fprintf(stderr, "\n");
+    }
+    /* args R0/R1 + the word at SP (= return PC at a function entry) + R8..R40. */
+    uint32_t spv = (uint32_t)R[CVM_REG_SP];
+    uint32_t retpc = (spv + 4u <= mem_size) ? *((const uint32_t *)(heap + spv)) : 0;
+    fprintf(stderr, "       R0=0x%08x R1=0x%08x [SP]=ret_pc=%u\n",
+            (uint32_t)R[0], (uint32_t)R[1], retpc);
+    fprintf(stderr, "       regs:");
+    for (int i = 8; i <= 40; i++) fprintf(stderr, " R%d=0x%08x", i, (uint32_t)R[i]);
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+static void dg_wlog(uint32_t pc, uint32_t addr, uint32_t sz, uint32_t val,
+                    const uint32_t *fo, uint32_t fc) {
+    lw_rec(pc, addr, sz);
+    if (g_dg_won && addr < g_dg_wa + 4u && addr + sz > g_dg_wa)
+        fprintf(stderr, "[WADDR] store @0x%08x sz=%u val=0x%08x pc=%u func=%u\n",
+                addr, sz, val, pc, dg_enc(pc, fo, fc));
+    if (g_dg_wval >= 0 && val == (uint32_t)g_dg_wval && sz == 4u)
+        fprintf(stderr, "[WVAL] val=0x%08x stored @0x%08x pc=%u func=%u\n",
+                val, addr, pc, dg_enc(pc, fo, fc));
+}
+/* One 4-aligned heap word transition old->new (kind: 0=stw scalar, 1=memcpy). */
+static void misp_word(uint32_t pc, uint32_t addr, uint32_t oldv, uint32_t newv,
+                      int kind, const uint32_t *fo, uint32_t fc) {
+    if (g_misp <= 0 || g_misp_n >= 400) return;
+    uint32_t f = 0;
+    if (g_misp_target >= 0) {                       /* target mode: exact value, any kind */
+        if (newv != (uint32_t)g_misp_target) return;
+    } else {
+        if ((addr & 3u) || addr < g_hs || addr >= g_he) return;        /* aligned heap slot */
+        if (!(newv >= g_hs && newv < g_he && (newv & 3u))) return;      /* new = misaligned in-heap ptr */
+        if (g_misp == 1 && !(oldv >= g_hs && oldv < g_he && (oldv & 3u) == 0))
+            return;                                                    /* mode 1: old = aligned in-heap ptr */
+        if (g_misp_and3 >= 0 && (int)(newv & 3u) != g_misp_and3) return;
+    }
+    f = dg_enc(pc, fo, fc);
+    if (g_misp_func >= 0 && (long)f != g_misp_func) return;
+    fprintf(stderr, "[MISP#%d] @0x%08x old=0x%08x new=0x%08x pc=%u func=%u kind=%s\n",
+            g_misp_n++, addr, oldv, newv, pc, f, kind ? "cpy" : "stw");
+    fflush(stderr);
+}
+/* Scan a pending MEMCPY/MEMMOVE for misaligned-pointer words about to land in
+ * aligned heap slots (the begin-propagation path). Call BEFORE the copy. */
+static void misp_scan(uint32_t pc, uint32_t dst, uint32_t src, uint32_t len,
+                      const uint8_t *heap, uint32_t mem, const uint32_t *fo, uint32_t fc) {
+    if (g_misp <= 0) return;
+    for (uint32_t i = 0; i + 4u <= len; i += 4u) {
+        uint32_t d = dst + i; if (d & 3u) continue;
+        if (src + i + 4u > mem || d + 4u > mem) continue;
+        uint32_t nv, ov; memcpy(&nv, heap + src + i, 4); memcpy(&ov, heap + d, 4);
+        misp_word(pc, d, ov, nv, 1, fo, fc);
+    }
+}
+/* ---- redzone / bounds-checking allocator (CVM_REDZONE) -------------------
+ * Hook the cart's malloc/free/realloc/calloc (FUNCS slots via env), keep a
+ * per-heap-byte shadow (1 = live user allocation, 0 = redzone/free/metadata),
+ * skip checks while inside the allocator, and TRAP on the first cart store
+ * landing on a 0 byte → the original out-of-bounds heap write. */
+static int      rz_on    = -1;
+static uint8_t *rz_shadow = NULL;
+static uint32_t rz_hs = 0, rz_he = 0;             /* heap [start,end) */
+static uint32_t rz_malloc, rz_free, rz_realloc, rz_calloc;   /* FUNCS slots */
+#define RZ_MAPN 0x100000u                          /* ptr->size open-addr map */
+static uint32_t *rz_key, *rz_val;
+static int       rz_depth = 0, rz_ad = -1, rz_kind = 0;      /* call depth / in-alloc depth / kind */
+static uint32_t  rz_a0 = 0, rz_a1 = 0;
+static void rz_minit(void) {
+    rz_key = (uint32_t *)calloc(RZ_MAPN, 4);
+    rz_val = (uint32_t *)calloc(RZ_MAPN, 4);
+}
+static void rz_put(uint32_t p, uint32_t s) {
+    if (!p) return;
+    uint32_t h = (p >> 3) & (RZ_MAPN - 1);
+    for (uint32_t i = 0; i < RZ_MAPN; i++) {
+        uint32_t j = (h + i) & (RZ_MAPN - 1);
+        if (rz_key[j] == 0 || rz_key[j] == p) { rz_key[j] = p; rz_val[j] = s; return; }
+    }
+}
+static uint32_t rz_get(uint32_t p) {
+    uint32_t h = (p >> 3) & (RZ_MAPN - 1);
+    for (uint32_t i = 0; i < RZ_MAPN; i++) {
+        uint32_t j = (h + i) & (RZ_MAPN - 1);
+        if (rz_key[j] == 0) return 0;
+        if (rz_key[j] == p) return rz_val[j];
+    }
+    return 0;
+}
+static void rz_del(uint32_t p) {
+    uint32_t h = (p >> 3) & (RZ_MAPN - 1);
+    for (uint32_t i = 0; i < RZ_MAPN; i++) {
+        uint32_t j = (h + i) & (RZ_MAPN - 1);
+        if (rz_key[j] == 0) return;
+        if (rz_key[j] == p) { rz_key[j] = 0; rz_val[j] = 0; return; }
+    }
+}
+static void rz_mark(uint32_t a, uint32_t s, uint8_t v) {
+    if (!rz_shadow || a < rz_hs) return;
+    uint32_t end = a + s; if (end > rz_he) end = rz_he; if (a >= end) return;
+    memset(rz_shadow + (a - rz_hs), v, end - a);
+}
+static void rz_setup(uint32_t hs, uint32_t he, const uint32_t *fo, uint32_t fc) {
+    if (rz_on >= 0) return;
+    const char *e = getenv("CVM_REDZONE");
+    if (!e) { rz_on = 0; return; }
+    rz_on = 1; rz_hs = hs; rz_he = he;
+    rz_shadow = (uint8_t *)calloc(he - hs, 1);
+    rz_minit();
+    /* slots from env (idx*2); 0 = unhooked. */
+    const char *m = getenv("CVM_RZ_MALLOC"), *f = getenv("CVM_RZ_FREE");
+    const char *r = getenv("CVM_RZ_REALLOC"), *c = getenv("CVM_RZ_CALLOC");
+    rz_malloc  = m ? (uint32_t)strtoul(m, 0, 0) : 0;
+    rz_free    = f ? (uint32_t)strtoul(f, 0, 0) : 0;
+    rz_realloc = r ? (uint32_t)strtoul(r, 0, 0) : 0;
+    rz_calloc  = c ? (uint32_t)strtoul(c, 0, 0) : 0;
+    fprintf(stderr, "[RZ] on heap=[0x%08x,0x%08x) malloc=%u free=%u realloc=%u calloc=%u\n",
+            hs, he, rz_malloc, rz_free, rz_realloc, rz_calloc);
+    fflush(stderr); (void)fo; (void)fc;
+}
+static void rz_call(uint32_t fid, const int32_t *R) {
+    if (rz_on != 1) return;
+    rz_depth++;
+    if (rz_ad >= 0) return;                         /* already inside an allocator */
+    int k = 0;
+    if      (fid == rz_malloc)  k = 1;
+    else if (fid == rz_calloc)  k = 2;
+    else if (fid == rz_realloc) k = 3;
+    else if (fid == rz_free)    k = 4;
+    if (!k) return;
+    rz_ad = rz_depth; rz_kind = k;
+    rz_a0 = (uint32_t)R[0]; rz_a1 = (uint32_t)R[1];
+}
+static void rz_ret(const int32_t *R, uint32_t pc, const uint32_t *fo, uint32_t fc) {
+    if (rz_on != 1) { return; }
+    if (rz_ad == rz_depth) {                        /* returning from the allocator */
+        uint32_t res = (uint32_t)R[0];
+        if (rz_kind == 1) { if (res) { rz_mark(res, rz_a0, 1); rz_put(res, rz_a0); } }
+        else if (rz_kind == 2) { uint32_t s = rz_a0 * rz_a1; if (res) { rz_mark(res, s, 1); rz_put(res, s); } }
+        else if (rz_kind == 4) { if (rz_a0) { rz_mark(rz_a0, rz_get(rz_a0), 0); rz_del(rz_a0); } }
+        else if (rz_kind == 3) {                    /* realloc(old=a0,newsize=a1)->res */
+            uint32_t os = rz_get(rz_a0);
+            if (res && res != rz_a0) {
+                if (rz_a0) { rz_mark(rz_a0, os, 0); rz_del(rz_a0); }
+                rz_mark(res, rz_a1, 1); rz_put(res, rz_a1);
+            } else if (res) {
+                if (rz_a1 > os) rz_mark(rz_a0 + os, rz_a1 - os, 1);
+                else            rz_mark(rz_a0 + rz_a1, os - rz_a1, 0);
+                rz_put(res, rz_a1);
+            }
+        }
+        rz_ad = -1; rz_kind = 0;
+    }
+    if (rz_depth > 0) rz_depth--;
+    (void)pc; (void)fo; (void)fc;
+}
+static void rz_check(uint32_t addr, uint32_t sz, uint32_t pc, const int32_t *R,
+                     const uint32_t *fo, uint32_t fc,
+                     const uint8_t *heap, uint32_t mem_size) {
+    if (rz_on != 1 || rz_ad >= 0 || !rz_shadow) return;
+    if (addr < rz_hs || addr >= rz_he) return;
+    uint32_t end = addr + sz; if (end > rz_he) end = rz_he;
+    for (uint32_t p = addr; p < end; p++)
+        if (rz_shadow[p - rz_hs] == 0) {
+            fprintf(stderr, "[RZ-TRAP] OOB heap store @0x%08x sz=%u pc=%u func=%u "
+                    "R[c]=0x%08x (first bad byte 0x%08x)\n",
+                    addr, sz, pc, dg_enc(pc, fo, fc), (uint32_t)R[2], p);
+            /* Heuristic backtrace: scan the stack from SP for words that are
+             * valid code PCs sitting just after a CALL (return addresses). */
+            uint32_t sp = (uint32_t)R[CVM_REG_SP];
+            fprintf(stderr, "[RZ-BT] func chain (outer->):");
+            int shown = 0;
+            for (uint32_t s = sp; s + 4u <= mem_size && shown < 24; s += 4) {
+                uint32_t w; memcpy(&w, heap + s, 4);
+                if (w > 0 && w < mem_size && w < 16000000u) {  /* plausible code pc */
+                    uint32_t f = dg_enc(w, fo, fc);
+                    if (f) { fprintf(stderr, " %u@pc%u", f, w); shown++; }
+                }
+            }
+            fprintf(stderr, "\n");
+            /* Registers at the trap: capture dest/source/begin cursors. */
+            fprintf(stderr, "[RZ-REGS]");
+            for (int i = 0; i <= 40; i++) fprintf(stderr, " R%d=0x%08x", i, (uint32_t)R[i]);
+            fprintf(stderr, " R255(SP)=0x%08x\n", sp);
+            /* Scan all memory for words == the OOB address / source cursor and
+             * report each holder slot + the pc/func that LAST WROTE it (= who
+             * wrote the wild relocate cursor). */
+            uint32_t want2 = addr - 4u;   /* the misaligned source object (other) */
+            fprintf(stderr, "[RZ-HOLDERS] words == 0x%08x (oob addr) at:", addr);
+            int hn = 0;
+            for (uint32_t s = 0; s + 4u <= mem_size && hn < 40; s += 4) {
+                uint32_t w; memcpy(&w, heap + s, 4);
+                if (w == addr) { uint32_t lw = lw_get(s);
+                    fprintf(stderr, " 0x%08x(W %u@f%u)", s, lw, lw ? dg_enc(lw, fo, fc) : 0); hn++; }
+            }
+            fprintf(stderr, "\n[RZ-HOLDERS2] words == 0x%08x (source cursor) at:", want2);
+            hn = 0;
+            for (uint32_t s = 0; s + 4u <= mem_size && hn < 40; s += 4) {
+                uint32_t w; memcpy(&w, heap + s, 4);
+                if (w == want2) { uint32_t lw = lw_get(s);
+                    fprintf(stderr, " 0x%08x(W %u@f%u)", s, lw, lw ? dg_enc(lw, fo, fc) : 0); hn++; }
+            }
+            fprintf(stderr, "\n");
+            /* Frame window from SP upward: annotate code-PCs (return addresses),
+             * in-heap (mis)aligned pointers, and each slot's last writer. This
+             * exposes the nested emplace frame + its cursor slots in one shot. */
+            fprintf(stderr, "[RZ-FRAME] window from sp=0x%08x:\n", sp);
+            for (uint32_t i = 0; i < 1024u; i++) {
+                uint32_t s = sp + i * 4u; if (s + 4u > mem_size) break;
+                uint32_t w; memcpy(&w, heap + s, 4);
+                const char *tag = NULL; char tb[48];
+                if (w > 0 && w < 16000000u) { uint32_t f = dg_enc(w, fo, fc);
+                    if (f) { snprintf(tb, sizeof tb, "ret %u@pc%u", f, w); tag = tb; } }
+                if (!tag && w >= rz_hs && w < rz_he) {
+                    snprintf(tb, sizeof tb, "heapptr%s", (w & 3u) ? " *MISALIGNED*" : ""); tag = tb; }
+                uint32_t lw = lw_get(s);
+                if (tag || lw)
+                    fprintf(stderr, "  [0x%08x]=0x%08x  %-22s lastW=%u@f%u\n",
+                            s, w, tag ? tag : "", lw, lw ? dg_enc(lw, fo, fc) : 0);
+            }
+            ring_dump("A", ring_a, ring_a_pc, ring_a_old, ring_a_new, ring_a_i, fo, fc);
+            ring_dump("B", ring_b, ring_b_pc, ring_b_old, ring_b_new, ring_b_i, fo, fc);
+            if (trip_rb) {     /* trip captured the vector `this` (R8 at CVM_TRIP_PC) */
+                uint32_t bf = 0; if (trip_rb + 4u <= mem_size) memcpy(&bf, heap + trip_rb, 4);
+                uint32_t end = 0; if (trip_rb + 8u <= mem_size) memcpy(&end, heap + trip_rb + 4u, 4);
+                uint32_t cap = 0; if (trip_rb + 12u <= mem_size) memcpy(&cap, heap + trip_rb + 8u, 4);
+                uint32_t w = lw_get(trip_rb);
+                fprintf(stderr, "[RZ-TRIP] vec this=0x%08x  __begin_=0x%08x%s __end_=0x%08x __cap_=0x%08x"
+                        "  beginFieldLastW=%u@f%u\n", trip_rb, bf,
+                        (bf >= rz_hs && bf < rz_he && (bf & 3u)) ? " *MISALIGNED*" : "",
+                        end, cap, w, w ? dg_enc(w, fo, fc) : 0);
+            }
+            fflush(stderr);
+            rz_on = 2;                              /* one-shot: report once */
+            return;
+        }
+}
+#  define RZ_CALL(fid)        do { if (rz_on == 1) rz_call((fid), R); } while (0)
+#  define RZ_RET()            do { if (rz_on == 1) rz_ret(R, pc, func_offsets, func_count); } while (0)
+#  define RZ_CHECK(addr, sz)  do { if (rz_on == 1) rz_check((addr), (sz), (pc) - 1u, R, func_offsets, func_count, heap, mem_size); } while (0)
+#  define DG_W(addr, sz, val) do { dg_wlog((pc) - 1u, (addr), (sz), (uint32_t)(val), func_offsets, func_count); \
+                                    ring_rec((pc) - 1u, (addr), (sz), (uint32_t)(val), heap); \
+                                    RZ_CHECK((addr), (sz)); \
+                                    if (g_misp > 0 && (sz) == 4u) { uint32_t _mo; memcpy(&_mo, heap + (addr), 4); \
+                                        misp_word((pc) - 1u, (addr), _mo, (uint32_t)(val), 0, func_offsets, func_count); } } while (0)
+#  define MISP_SCAN(dst, src, len) do { if (g_misp > 0) misp_scan((pc) - 1u, (dst), (src), (len), heap, mem_size, func_offsets, func_count); } while (0)
+#  define DG_HOOK() do { if (g_dg_pc >= 0 && (long)((pc) - 1u) == g_dg_pc \
+                            && (g_dg_rb < 0 || (uint32_t)R[b] == (uint32_t)g_dg_rb) \
+                            && (g_dg_r1 < 0 || (uint32_t)R[1] == (uint32_t)g_dg_r1) \
+                            && (g_dg_sp < 0 || (uint32_t)R[CVM_REG_SP] == (uint32_t)g_dg_sp)) \
+                            dg_pcdump((pc) - 1u, op, a, b, c, R, (uint32_t)R[CVM_REG_SP], heap, mem_size); \
+                          if (trip_pc != 0xffffffffu && (pc) - 1u == trip_pc \
+                              && (trip_sp == 0 || (uint32_t)R[CVM_REG_SP] == trip_sp)) \
+                              trip_rb = (uint32_t)R[b]; } while (0)
+#else
+#  define DG_W(addr, sz, val) ((void)0)
+#  define MISP_SCAN(dst, src, len) ((void)0)
+#  define DG_HOOK()           ((void)0)
+#  define RZ_CALL(fid)        ((void)0)
+#  define RZ_RET()            ((void)0)
+#  define RZ_CHECK(addr, sz)  ((void)0)
+#endif
+
 static int cvm_exec_at(struct cvm_image *img,
                        uint32_t          start_pc,
                        const int32_t    *args, uint32_t arg_count,
@@ -791,6 +1207,21 @@ static int cvm_exec_at(struct cvm_image *img,
     const uint32_t *func_offsets = img->func_offsets;
     const uint32_t  func_count   = img->func_count;
     uint32_t        pc           = start_pc;
+#if defined(CVM_DIAG)
+    dg_init();
+    { static int once = 0; if (!once) { once = 1;
+        fprintf(stderr, "[DIAG] mem_size=0x%08x heap_size=0x%08x reserve=0x%08x heap_start=0x%08x\n",
+                img->mem_size, img->heap_size, img->reserve_size,
+                (uint32_t)(img->heap_size - img->reserve_size)); fflush(stderr); } }
+    rz_setup((uint32_t)(img->heap_size - img->reserve_size), img->heap_size,
+             img->func_offsets, img->func_count);
+    g_hs = (uint32_t)(img->heap_size - img->reserve_size); g_he = img->heap_size;
+    if (getenv("CVM_REDZONE") && !lw_pc) {       /* cover heap+stack = [heap_start, mem_size) */
+        lw_base  = (uint32_t)(img->heap_size - img->reserve_size);
+        lw_words = (img->mem_size - lw_base) >> 2;
+        lw_pc    = (uint32_t *)calloc(lw_words ? lw_words : 1u, 4);
+    }
+#endif
 
 #ifdef CVM_PROFILE
 #  define CVM_PROF_DEPTH 8192u
@@ -892,6 +1323,7 @@ static int cvm_exec_at(struct cvm_image *img,
         a  = (uint8_t)((inst >>  8) & 0xFFu);              \
         b  = (uint8_t)((inst >> 16) & 0xFFu);              \
         c  = (uint8_t)((inst >> 24) & 0xFFu);              \
+        DG_HOOK();                                         \
         if (!jt[op]) return CVM_E_BAD_OPCODE;              \
         goto *jt[op];                                      \
     } while (0)
@@ -928,6 +1360,7 @@ static int cvm_exec_at(struct cvm_image *img,
         uint32_t addr = (uint32_t)R[b];
         if (addr > mem_size || mem_size - addr < 4u) return CVM_E_BAD_ADDR;
         int32_t v = R[c];
+        DG_W(addr, 4u, v);
         memcpy(heap + addr, &v, 4);
         DISPATCH();
     }
@@ -997,6 +1430,7 @@ static int cvm_exec_at(struct cvm_image *img,
         R[CVM_REG_SP] = (int32_t)sp;
         pc = func_offsets[fid];
         PROF_CALL(fid);
+        RZ_CALL(fid);
         DISPATCH();
     }
     L_RET: {
@@ -1010,6 +1444,7 @@ static int cvm_exec_at(struct cvm_image *img,
             return CVM_OK;
         }
         pc = ret_pc;
+        RZ_RET();
         PROF_RET();
         DISPATCH();
     }
@@ -1024,6 +1459,7 @@ static int cvm_exec_at(struct cvm_image *img,
         R[CVM_REG_SP] = (int32_t)sp;
         pc = func_offsets[fid];
         PROF_CALL(fid);
+        RZ_CALL(fid);
         DISPATCH();
     }
     L_LDB: {
@@ -1035,6 +1471,7 @@ static int cvm_exec_at(struct cvm_image *img,
     L_STB: {
         uint32_t addr = (uint32_t)R[b];
         if (addr >= mem_size) return CVM_E_BAD_ADDR;
+        DG_W(addr, 1u, (uint32_t)R[c] & 0xFFu);
         heap[addr] = (uint8_t)((uint32_t)R[c] & 0xFFu);
         DISPATCH();
     }
@@ -1050,6 +1487,7 @@ static int cvm_exec_at(struct cvm_image *img,
         uint32_t addr = (uint32_t)R[b];
         if (addr > mem_size || mem_size - addr < 2u) return CVM_E_BAD_ADDR;
         uint16_t v = (uint16_t)((uint32_t)R[c] & 0xFFFFu);
+        DG_W(addr, 2u, v);
         memcpy(heap + addr, &v, 2);
         DISPATCH();
     }
@@ -1065,6 +1503,8 @@ static int cvm_exec_at(struct cvm_image *img,
         if (len) {
             if (dst > mem_size || mem_size - dst < len) return CVM_E_BAD_ADDR;
             if (src > mem_size || mem_size - src < len) return CVM_E_BAD_ADDR;
+            DG_W(dst, len, src);
+            MISP_SCAN(dst, src, len);
             memcpy(heap + dst, heap + src, len);
         }
         DISPATCH();
@@ -1074,6 +1514,7 @@ static int cvm_exec_at(struct cvm_image *img,
         uint32_t len = (uint32_t)R[c];
         if (len) {
             if (dst > mem_size || mem_size - dst < len) return CVM_E_BAD_ADDR;
+            DG_W(dst, len, (uint32_t)R[b] & 0xFFu);
             memset(heap + dst, (int)((uint32_t)R[b] & 0xFFu), len);
         }
         DISPATCH();
@@ -1085,6 +1526,8 @@ static int cvm_exec_at(struct cvm_image *img,
         if (len) {
             if (dst > mem_size || mem_size - dst < len) return CVM_E_BAD_ADDR;
             if (src > mem_size || mem_size - src < len) return CVM_E_BAD_ADDR;
+            DG_W(dst, len, src);
+            MISP_SCAN(dst, src, len);
             memmove(heap + dst, heap + src, len);
         }
         DISPATCH();

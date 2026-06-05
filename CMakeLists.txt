@@ -61,6 +61,18 @@ target_compile_definitions(cvm PUBLIC
     CVM_VERSION_STRING="${PROJECT_VERSION}"
 )
 
+# --- VM diagnostics subsystem (docs/debugging.md) -------------------------
+# Opt-in, compile-gated, env-var-driven memory-corruption / miscompile
+# instruments (redzone allocator, write/value watchpoints, misaligned-ptr
+# detector, slot ring buffers, trip-wires, last-writer map). OFF by default:
+# production carts must carry none of the overhead. Turn on with
+# `cmake -DCVM_DIAG=ON`. PRIVATE — the probes live entirely inside cvm.c and
+# touch neither the public ABI nor cvm.h, so consumers needn't see the flag.
+option(CVM_DIAG "Build the VM diagnostics subsystem (docs/debugging.md)" OFF)
+if(CVM_DIAG)
+    target_compile_definitions(cvm PRIVATE CVM_DIAG)
+endif()
+
 # --- Cortex-M cross-compile sanity mode -----------------------------------
 # When `cmake/toolchains/thumbv7m-none-eabi.cmake` is in use it sets
 # CVM_EMBEDDED_SANITY_BUILD. In that mode the host-side test
