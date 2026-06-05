@@ -10,6 +10,28 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **`cvm-dis` — a bytecode disassembler (`tools/cvm-dis/`).** Decodes the CODE
+  section of a `.crom`/`.bin` image into readable instructions and labels function
+  entry points and `CALL` targets via the optional `<image>.sym` sidecar (written by
+  cvm-translate under `CVM_SYMS`). Modes: `--func N` (a symbol index), `--pc PC N`,
+  `--around PC B A`, or no arg to list functions. Pure C, no LLVM dependency; built +
+  installed alongside `cvm-cc`. Reads `include/cvm.h` for the opcode/section enums so
+  it stays in sync with the ISA. (FUNCS slots are `(symidx)<<1`, so a runtime
+  call-target slot maps to `.sym` index `slot/2`.) Used to localise a translator/
+  runtime fault back to its source function.
+- **Conformance: C++ exception-unwind + allocator-alignment fixtures.**
+  `conf_pico_cpp_exc_unwind` (a throw propagated through MANY frames each owning
+  non-trivial STL locals — `std::set<unsigned>`/`std::string` cleanup landingpads —
+  past intermediate non-matching `try`s, caught by `std::exception&`, with a combined
+  cleanup+catch frame); `conf_pico_cpp_exc_ctor` (a throw FROM a constructor,
+  verifying the EH cleanup destroys ONLY the already-constructed members); and
+  `conf_pico_cpp_align` (`operator new` / array-new / `std::vector` buffer + element
+  addresses are 4-aligned across reallocation growth); and `conf_pico_cpp_alloca_spill`
+  (many distinct stack-variable addresses kept live across a pressure point so a batch
+  of `alloca` pointers spill, then read back through their reloaded pointers — guards
+  the spilled-alloca-pointer fix). All differential vs clang++; they extend the EH
+  corpus beyond `conf_cpp_exc`'s shallow surface and add allocator alignment +
+  spilled-alloca-pointer coverage.
 - **Translator: fixed-vector `load`/`store` (memory copy) + vector arithmetic,
   and pointer-element vectors `<N x ptr>`.** The vector legaliser previously
   handled only libc++'s num_get *movemask* idiom (insertelement / shufflevector /
@@ -194,6 +216,36 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Fixed
 
+- **Translator: a SPILLED `alloca` pointer is now written to its value-spill slot
+  (the real Exult egg bug).** When the register file is exhausted (a function whose
+  live-SSA count reaches `CG_MAX_SSA_REG` — only giant functions such as Exult's
+  `Usecode_internal::run()`), an `alloca`'s pointer value spills to a value-spill
+  slot like any scalar. Two defects left that slot holding stale garbage: (1) the
+  prologue alloca-pointer materialisation did `ADD dst, SP, off` with
+  `dst = regs[idx]`, but for a spilled alloca `regs[idx]` is the `CG_REG_SPILLED`
+  sentinel (register R0, a syscall scratch) → the address was computed into R0 and
+  never stored to the slot; (2) the `LLVMAlloca` body case was a no-op, so the
+  generic spilled-result store persisted its UNINITIALISED `def_reg` (a stale
+  scratch register) to the slot, clobbering it. Every later reload of the pointer
+  then read a wild address — surfaced as `Usecode_value::add_values` being called
+  with `this == 0x1`, corrupting a `std::vector<Usecode_value>` and crashing later
+  in an unrelated `std::set` destructor. Fixed: the prologue skips spilled allocas
+  (their dead `ADD R0` is dropped), and the `LLVMAlloca` body case computes
+  `ADD def_reg, SP, off` (offset via the new `cg_alloca_offset_of`) so the generic
+  store persists the real alloca address. Guard: `conf_pico_cpp_alloca_spill` (260
+  stack-variable addresses kept live across a pressure point so a batch of alloca
+  pointers spill, each read back through its reloaded pointer; bisected to a sharp
+  threshold — one spilled alloca passed by luck, two miscompiled). DOOM/Quake
+  unaffected (no function spills an alloca pointer).
+- **Translator: global data layout now honours a global's EXPLICIT `align`, not
+  just its type's ABI alignment.** clang lowers a C++ class with an anonymous union
+  of non-trivial members as a PACKED struct (`<{ ... }>`, ABI alignment 1) yet still
+  emits the global with the higher `align N` its members need. The layout pass used
+  `LLVMABIAlignmentOfType` alone, placing such globals 1-byte-aligned at misaligned
+  offsets (Exult's `Usecode_value no_ret` / the `zval` statics → misaligned
+  reads/writes that smashed adjacent objects). Fixed: `align = max(ABI alignment,
+  LLVMGetAlignment(gv))`. Found via `cvm-dis` + an alignment trap while hunting the
+  egg bug; a genuine independent layout bug.
 - **C++ runtime: an uncaught exception now HALTs cleanly instead of spinning the
   CPU forever.** `cvm_cxxrt.cpp`'s last-resort terminate path (`__cvm_eh_terminate`,
   the no-handler tail of `eh_unwind`, `__cxa_pure_virtual`,

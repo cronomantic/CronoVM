@@ -186,7 +186,11 @@ the gap is what's still being implemented:
   used as operands (`select i1 _, ptr @add, ptr @sub`) lower to
   `MOVI Rd, func_index`
 - `alloca`: static-size, entry-block-only — the prologue materialises
-  each alloca pointer as `SP + offset`
+  each alloca pointer as `SP + offset` into its assigned register. If the
+  pointer value SPILLS (the register file is exhausted, as in a very large
+  function), the prologue skips it and the `alloca` body case instead computes
+  `SP + offset` into the spilled-result `def_reg`, so the generic spilled-DEF
+  store persists the real address to the value-spill slot.
 
 Function values stored in DATA-section globals (e.g. a `static const
 fn_t ops[N] = { f0, f1, ... };` dispatch table) are also supported:

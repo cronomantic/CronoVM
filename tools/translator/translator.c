@@ -745,7 +745,18 @@ static int cg_collect_globals(struct cg_globals *g, LLVMModuleRef mod) {
         }
 
         uint32_t size  = (uint32_t)LLVMABISizeOfType(g->td, ty);
-        uint32_t align = (uint32_t)LLVMABIAlignmentOfType(g->td, ty);
+        /* Honor the global's EXPLICIT alignment, not just the type's ABI
+         * alignment. A PACKED struct type (e.g. clang lowers a class with an
+         * anonymous union of non-trivial members as `<{ ... }>`) has ABI
+         * alignment 1, but clang still emits the global with a correct, higher
+         * `align N` attribute (the real alignment its members need). Using the
+         * type ABI alignment alone placed such globals misaligned, corrupting
+         * everything derived from them (e.g. Exult's `Usecode_value no_ret` /
+         * the `zval` statics → 1-byte-aligned → misaligned reads/writes that
+         * smashed adjacent heap objects). Take the max of the two. */
+        uint32_t align   = (uint32_t)LLVMABIAlignmentOfType(g->td, ty);
+        uint32_t gvalign = LLVMGetAlignment(gv);
+        if (gvalign > align) align = gvalign;
         if (align == 0) align = 1;
         cursor = (cursor + align - 1) & ~(align - 1);
 
@@ -3324,6 +3335,14 @@ static int cg_collect_allocas(struct cg *cg, LLVMValueRef fn) {
     return 0;
 }
 
+/* Byte offset (from SP after prologue) of the entry-block alloca `v`, or -1 if
+ * `v` is not a tracked alloca. Linear scan — alloca_count is small per function. */
+static int32_t cg_alloca_offset_of(struct cg *cg, LLVMValueRef v) {
+    for (int k = 0; k < cg->alloca_count; ++k)
+        if (cg->allocas[k].value == v) return (int32_t)cg->allocas[k].offset;
+    return -1;
+}
+
 /* True if every use of `v` is by a non-phi instruction in the same basic
  * block as `v`'s def. Such values are truly block-local: their lifetime
  * starts and ends inside that block, with no cross-edge escape (no phi
@@ -4646,9 +4665,11 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
     }
     cg->funcs[func_idx].frame_size = cg->frame_bytes;
     if (getenv("CVM_SPILL_DEBUG"))
-        fprintf(stderr, "[spill] %s: ssa_high=%d val_spills=%d caller_save=%d\n",
+        fprintf(stderr, "[spill] %s: ssa_high=%d val_spills=%d caller_save=%d "
+                "alloca_bytes=%u(0x%x) spill_bytes=%u val_spill_bytes=%u frame=%u(0x%x)\n",
                 cg->fn_name, cg->ssa_reg_high, cg->val_spill_count,
-                cg->spill_slot_count);
+                cg->spill_slot_count, cg->alloca_bytes, cg->alloca_bytes,
+                cg->spill_bytes, cg->val_spill_bytes, cg->frame_bytes, cg->frame_bytes);
 
     /* Prologue: SUB SP, SP, frame. */
     if (cg_sp_sub(cg, cg->frame_bytes)) return 1;
@@ -4739,6 +4760,14 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
         uint8_t dst = cg->regs[idx];
         int32_t off = (int32_t)cg->allocas[k].offset;
         if (cg_movi_scratch(cg, off)) return 1;
+        /* A REGISTER-allocated alloca pointer is materialised here once and held
+         * for the whole function (caller-saved across calls). A SPILLED alloca
+         * pointer (regs[idx] == CG_REG_SPILLED, register file exhausted by a huge
+         * function such as Usecode_internal::run) cannot live in a register: its
+         * value-spill slot is written instead by the LLVMAlloca body case via the
+         * generic spilled-DEF store. The ADD into the CG_REG_SPILLED sentinel (R0)
+         * below is then a harmless dead write — skip it for spilled allocas. */
+        if (dst == (uint8_t)CG_REG_SPILLED) continue;
         cg_emit(cg, enc_r(CVM_OP_ADD, dst,
                                       (uint8_t)CG_REG_SP,
                                       (uint8_t)CG_REG_SCRATCH));
@@ -5831,9 +5860,25 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
             }
 
             case LLVMAlloca:
-                /* No code here: the alloca pointer was materialised in the
-                 * prologue. cg_collect_allocas validated that the alloca is
-                 * static-size and lives in the entry block. */
+                /* A REGISTER-allocated alloca pointer was already materialised in
+                 * the prologue (ADD reg, SP, off) and needs no body code. A
+                 * SPILLED alloca pointer instead relies on the generic
+                 * spilled-DEF store below (which persists def_reg to the value
+                 * slot): compute its address SP+off into def_reg so the persisted
+                 * value is the real alloca address, not the uninitialised
+                 * def_reg scratch (which would clobber the slot — the second half
+                 * of the spilled-alloca egg bug). */
+                if (result_spilled) {
+                    int32_t aoff = cg_alloca_offset_of(cg, i);
+                    if (aoff < 0) {
+                        ERR(cg->fn_name, "internal: spilled alloca not tracked");
+                        cg->had_error = 1; break;
+                    }
+                    if (cg_movi_scratch(cg, aoff)) { cg->had_error = 1; break; }
+                    cg_emit(cg, enc_r(CVM_OP_ADD, def_reg,
+                                                  (uint8_t)CG_REG_SP,
+                                                  (uint8_t)CG_REG_SCRATCH));
+                }
                 break;
 
             case LLVMLoad: {

@@ -121,6 +121,7 @@ macOS, plus bare-metal sanity builds for `thumbv6m`, `thumbv7m` and `rv32imc`.
 | Interpreter | `src/cvm.c` → `cvm` static lib | Loads and runs `.bin` images; the only thing a host links against |
 | Translator | `tools/translator/` → `cvm-translate` | LLVM bitcode → CronoVM bytecode (build-time only) |
 | Compiler driver | `tools/cvm-cc/` → `cvm-cc` | One-command `clang \| llvm-link \| cvm-translate` for C/C++ |
+| Disassembler | `tools/cvm-dis/` → `cvm-dis` | Decodes a `.crom`/`.bin` CODE section; labels funcs + `CALL` targets via the `<image>.sym` sidecar |
 | C library | `external/picolibc` + `runtime/lib/build_picolibc.sh` | picolibc compiled to a reusable bitcode module |
 | C++ ABI + STL glue | `runtime/lib/cvm_cxxrt.cpp`, `cvm_cxxstl.cpp` | `operator new`/`__cxa_*`, exceptions, RTTI; the out-of-line std exception + shared-ptr surface |
 | Soft runtimes | `runtime/lib/cvm_{int64,float64}_rt.c`, `*.h` | 64-bit integer and `double` arithmetic; intrinsics (MULH, FSQRT, …) |

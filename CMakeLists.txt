@@ -144,6 +144,9 @@ add_subdirectory(tools/translator)
 # --- cvm-cc: thin driver, no LLVM dependency. Always built. -----------
 add_subdirectory(tools/cvm-cc)
 
+# --- cvm-dis: bytecode disassembler, no LLVM dependency. Always built. -
+add_subdirectory(tools/cvm-dis)
+
 # --- examples/embedder consumer test ----------------------------------
 # Validates the canonical "add_subdirectory(deps/CronoVM)" consumer
 # pattern by configuring + building + running examples/embedder/ as a
@@ -191,7 +194,7 @@ if(CRONOVM_INSTALL)
 
     # cvm-translate is conditional on llvm-config being available; only
     # add it to the install set if the target was actually defined.
-    set(_cvm_install_targets cvm cvm-cc)
+    set(_cvm_install_targets cvm cvm-cc cvm-dis)
     if(TARGET cvm-translate)
         list(APPEND _cvm_install_targets cvm-translate)
     endif()
