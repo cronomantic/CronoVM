@@ -239,19 +239,23 @@ static int type_in_subset(LLVMTypeRef t, char *err, size_t errlen) {
         return 1;
     }
     case LLVMVectorTypeKind: {
-        /* Fixed vectors of integer elements are legalised by scalarisation:
-         * the value lives in N consecutive 32-bit frame slots (one lane each),
-         * each vector op lowered to per-lane scalar ops. Only what libc++'s
-         * num_get movemask idiom needs is actually lowered (insertelement /
-         * shufflevector-splat / vector-icmp / bitcast<Nxi1>->iN); any other
-         * vector op ERRs loudly in cg_emit_vec_def. Element must be an integer
-         * i1..i32 (the lane fits a register); float/double lanes are out. */
-        LLVMTypeRef et = LLVMGetElementType(t);
-        if (LLVMGetTypeKind(et) != LLVMIntegerTypeKind
-            || LLVMGetIntTypeWidth(et) > 32) {
+        /* Fixed vectors of integer (or pointer) elements are legalised by
+         * scalarisation: the value lives in N consecutive 32-bit frame slots
+         * (one lane each), each vector op lowered to per-lane scalar ops. Two
+         * idioms are lowered: (1) libc++'s num_get movemask (insertelement /
+         * shufflevector-splat / vector-icmp / bitcast<Nxi1>->iN); (2) a vector
+         * load/store memory copy — clang's -O2+ vectoriser turns a small
+         * struct/union copy into e.g. `load/store <2 x ptr>`. Any other vector
+         * op ERRs loudly in cg_emit_vec_def. An element must be an integer
+         * i1..i32 OR a pointer (both fit one 32-bit lane); float/double lanes
+         * and wider integers are out. */
+        LLVMTypeRef  et = LLVMGetElementType(t);
+        LLVMTypeKind ek = LLVMGetTypeKind(et);
+        if (!((ek == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(et) <= 32)
+              || ek == LLVMPointerTypeKind)) {
             snprintf(err, errlen,
-                     "only fixed integer vectors (i1..i32 elements) are in the "
-                     "subset");
+                     "only fixed integer (i1..i32) or pointer vectors are in "
+                     "the subset");
             return 0;
         }
         unsigned lanes = LLVMGetVectorSize(t);
@@ -2273,14 +2277,37 @@ static int32_t cg_val_slot_off(struct cg *cg, uint16_t slot) {
  * element type / lane count, so this is the same predicate.) */
 static int cg_type_is_vector(LLVMTypeRef t) {
     if (LLVMGetTypeKind(t) != LLVMVectorTypeKind) return 0;
-    LLVMTypeRef et = LLVMGetElementType(t);
-    return LLVMGetTypeKind(et) == LLVMIntegerTypeKind
-        && LLVMGetIntTypeWidth(et) <= 32;
+    LLVMTypeRef  et = LLVMGetElementType(t);
+    LLVMTypeKind ek = LLVMGetTypeKind(et);
+    return (ek == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(et) <= 32)
+        || ek == LLVMPointerTypeKind;   /* pointer lane = one 32-bit slot */
 }
 
 static unsigned cg_vec_lanes(LLVMTypeRef t)     { return LLVMGetVectorSize(t); }
 static unsigned cg_vec_elem_bits(LLVMTypeRef t) {
-    return LLVMGetIntTypeWidth(LLVMGetElementType(t));
+    LLVMTypeRef et = LLVMGetElementType(t);
+    /* Pointer lanes are pointer-width (32-bit); only integer lanes carry an
+     * explicit width. */
+    return LLVMGetTypeKind(et) == LLVMIntegerTypeKind
+        ? LLVMGetIntTypeWidth(et) : 32u;
+}
+
+/* Per-lane memory access for a fixed vector with element type `et`: the load /
+ * store opcode and the byte stride between lanes in memory. Pointer lanes are
+ * pointer-width (4 bytes / one word). Returns 0 for an out-of-subset element. */
+static int cg_vec_lane_mem(LLVMTypeRef et, uint8_t *ld, uint8_t *st,
+                           int32_t *bytes) {
+    LLVMTypeKind k = LLVMGetTypeKind(et);
+    if (k == LLVMPointerTypeKind) {
+        *ld = CVM_OP_LDW; *st = CVM_OP_STW; *bytes = 4; return 1;
+    }
+    if (k == LLVMIntegerTypeKind) {
+        unsigned w = LLVMGetIntTypeWidth(et);
+        if (w == 1 || w == 8) { *ld = CVM_OP_LDB; *st = CVM_OP_STB; *bytes = 1; return 1; }
+        if (w == 16)          { *ld = CVM_OP_LDH; *st = CVM_OP_STH; *bytes = 2; return 1; }
+        if (w == 32)          { *ld = CVM_OP_LDW; *st = CVM_OP_STW; *bytes = 4; return 1; }
+    }
+    return 0;
 }
 
 /* Read lane `lane` of vector value `v` into a fresh register. Handles undef /
@@ -2461,10 +2488,81 @@ static void cg_emit_vec_def(struct cg *cg, LLVMValueRef i, LLVMOpcode op) {
         }
         break;
     }
+    case LLVMAdd:  case LLVMSub:  case LLVMMul:
+    case LLVMAnd:  case LLVMOr:   case LLVMXor:
+    case LLVMShl:  case LLVMLShr: case LLVMAShr: {
+        /* per-lane scalar binary op. The low-(element-width) bits of each result
+         * lane are correct; higher bits may carry garbage (consumers re-normalise
+         * to the element width), EXACTLY as the scalar binop path. The one
+         * exception is the shiftee of a NARROW right-shift, which must be
+         * normalised to the element width FIRST (lshr: zero-extend; ashr:
+         * sign-extend) — see the scalar LShr/AShr fixup. clang's -O2 vectoriser
+         * emits these (e.g. the f64 soft-float runtime's `<N x i32> xor`). */
+        uint8_t cv;
+        switch (op) {
+        case LLVMAdd:  cv = CVM_OP_ADD; break;
+        case LLVMSub:  cv = CVM_OP_SUB; break;
+        case LLVMMul:  cv = CVM_OP_MUL; break;
+        case LLVMAnd:  cv = CVM_OP_AND; break;
+        case LLVMOr:   cv = CVM_OP_OR;  break;
+        case LLVMXor:  cv = CVM_OP_XOR; break;
+        case LLVMShl:  cv = CVM_OP_SHL; break;
+        case LLVMLShr: cv = CVM_OP_SHR; break;
+        default:       cv = CVM_OP_SAR; break;   /* LLVMAShr */
+        }
+        unsigned ew = cg_vec_elem_bits(LLVMTypeOf(i));
+        LLVMValueRef o0 = LLVMGetOperand(i, 0);
+        LLVMValueRef o1 = LLVMGetOperand(i, 1);
+        for (unsigned l = 0; l < N; ++l) {
+            cg->next_reg = saved;
+            uint8_t a = cg_vec_read_lane(cg, o0, l); if (cg->had_error) return;
+            uint8_t b = cg_vec_read_lane(cg, o1, l); if (cg->had_error) return;
+            if (ew < 32 && op == LLVMLShr) a = cg_norm_reg_width(cg, a, ew, 0);
+            else if (ew < 32 && op == LLVMAShr) a = cg_norm_reg_width(cg, a, ew, 1);
+            if (cg->had_error) return;
+            uint8_t d = cg_alloc_reg(cg); if (cg->had_error) return;
+            cg_emit(cg, enc_r(cv, d, a, b));
+            cg_vec_write_lane(cg, ridx, l, d);
+            if (cg->had_error) return;
+        }
+        break;
+    }
+    case LLVMLoad: {
+        /* Vector load: read N element-sized lanes from [addr + lane*bytes] into
+         * the result's N frame slots. clang's -O2+ vectoriser emits these as
+         * the read half of a memory-to-memory copy (e.g. a `<2 x ptr>` struct/
+         * union copy feeding a matching vector store). Address computed once;
+         * the per-lane scratch cursor is rewound to keep it live (and bound
+         * register pressure regardless of lane count, like the ops above). */
+        LLVMValueRef ptr_v = LLVMGetOperand(i, 0);
+        uint8_t ldop, stop; int32_t bytes;
+        if (!cg_vec_lane_mem(LLVMGetElementType(LLVMTypeOf(i)), &ldop, &stop, &bytes)) {
+            ERR(cg->fn_name, "vector load: unsupported element type");
+            cg->had_error = 1; return;
+        }
+        (void)stop;
+        uint8_t addr = cg_reg_for(cg, ptr_v); if (cg->had_error) return;
+        unsigned after = (unsigned)cg->next_reg;
+        for (unsigned l = 0; l < N; ++l) {
+            cg->next_reg = after;
+            uint8_t r = cg_alloc_reg(cg); if (cg->had_error) return;
+            uint8_t a = addr;
+            if (l != 0) {
+                cg_movi_scratch(cg, (int32_t)l * bytes);
+                a = cg_alloc_reg(cg); if (cg->had_error) return;
+                cg_emit(cg, enc_r(CVM_OP_ADD, a, addr, (uint8_t)CG_REG_SCRATCH));
+            }
+            cg_emit(cg, enc_r(ldop, r, a, 0));
+            cg_vec_write_lane(cg, ridx, l, r);
+            if (cg->had_error) return;
+        }
+        break;
+    }
     default:
         ERR(cg->fn_name,
-            "vector op '%s' not supported (only the num_get movemask idiom: "
-            "insertelement / shufflevector / icmp / sext / zext / trunc)",
+            "vector op '%s' not supported (only insertelement / shufflevector / "
+            "icmp / add / sub / mul / and / or / xor / shl / lshr / ashr / "
+            "sext / zext / trunc / load)",
             opcode_name(op));
         cg->had_error = 1;
         return;
@@ -5781,6 +5879,39 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 LLVMValueRef val_v = LLVMGetOperand(i, 0);
                 LLVMTypeRef  vty   = LLVMTypeOf(val_v);
                 LLVMTypeKind vk    = LLVMGetTypeKind(vty);
+
+                /* Vector store: write N element-sized lanes from the value's
+                 * frame slots to [addr + lane*bytes]. The write half of clang's
+                 * -O2+ memory-copy idiom (pairs with the vector load in
+                 * cg_emit_vec_def). Value may be an SSA vector (in slots) or a
+                 * constant (zeroinitializer / data vector) — cg_vec_read_lane
+                 * handles both. */
+                if (cg_type_is_vector(vty)) {
+                    uint8_t ldop, stop; int32_t bytes;
+                    if (!cg_vec_lane_mem(LLVMGetElementType(vty), &ldop, &stop, &bytes)) {
+                        ERR(cg->fn_name, "vector store: unsupported element type");
+                        cg->had_error = 1; break;
+                    }
+                    (void)ldop;
+                    uint8_t addr = cg_reg_for(cg, LLVMGetOperand(i, 1));
+                    if (cg->had_error) break;
+                    unsigned N = cg_vec_lanes(vty);
+                    unsigned after = (unsigned)cg->next_reg;
+                    for (unsigned l = 0; l < N; ++l) {
+                        cg->next_reg = after;
+                        uint8_t v = cg_vec_read_lane(cg, val_v, l);
+                        if (cg->had_error) break;
+                        uint8_t a = addr;
+                        if (l != 0) {
+                            cg_movi_scratch(cg, (int32_t)l * bytes);
+                            a = cg_alloc_reg(cg); if (cg->had_error) break;
+                            cg_emit(cg, enc_r(CVM_OP_ADD, a, addr,
+                                              (uint8_t)CG_REG_SCRATCH));
+                        }
+                        cg_emit(cg, enc_r(stop, 0, a, v));
+                    }
+                    break;
+                }
 
                 /* A 64-bit store splits into two 32-bit word stores at addr
                  * and addr+4. The value is either a constant (clang lowers

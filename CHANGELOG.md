@@ -10,6 +10,25 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **Translator: fixed-vector `load`/`store` (memory copy) + vector arithmetic,
+  and pointer-element vectors `<N x ptr>`.** The vector legaliser previously
+  handled only libc++'s num_get *movemask* idiom (insertelement / shufflevector /
+  vector-icmp / sext|zext|trunc / `bitcast <N x i1>→iN`). clang's `-O2`+
+  auto-vectoriser also emits, for ordinary code, (1) a vector **memory copy** —
+  a small struct/union copy becomes `load`/`store <2 x ptr>` (the Exult
+  `Usecode_value` union-copy case) — and (2) vector **arithmetic** — the
+  soft-float `i64`→`f64` runtime (`__cvm_f_from_i64`) becomes a `<N x i32> xor`.
+  Both are now lowered per-lane: `load`/`store` move N element-sized lanes
+  (`LDB`/`LDH`/`LDW` by element width; a pointer lane is pointer-width = `LDW`)
+  between memory and the value's frame slots; `add`/`sub`/`mul`/`and`/`or`/`xor`/
+  `shl`/`lshr`/`ashr` run per lane (narrow right-shifts normalise the shiftee
+  first, as the scalar path). `<N x ptr>` is now in the subset (a pointer lane is
+  one 32-bit slot). Net effect: a `-O2`/`-O3` C++ cart translates, not just an
+  `-O1` one. New differential fixtures `conf_vector_ops` (explicit `vector_size`
+  load/store/arith across i8/i16/i32 lanes — built at the suite's `-O1`, so it
+  exercises the paths deterministically) and `conf_pico_cpp_variant_vector` (a
+  tagged-union-of-non-trivials in a `std::vector`, the Exult `Usecode_value`
+  pattern). Suite 36 → 38. C carts (no vectors) unaffected.
 - **Vendored libc++ `std::filesystem` library → a SEPARATE `cxxfs.bc`.** The
   `llvmorg-22.1.6` filesystem `src/` subset (`operations`/`directory_iterator`/
   `directory_entry`/`path`/`filesystem_error`/`filesystem_clock` + the private

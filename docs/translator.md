@@ -96,8 +96,8 @@ builds with `-gline-tables-only`), e.g.
 | ---- | ------ |
 | integers wider than `i65` | not in the subset (`i33`..`i65` are legalised; see below) |
 | `half`, `fp128`, `x86_fp80`, etc. (`float` and `double` excepted) | not in the subset (`float` is first-class; `double` is legalised) |
-| fixed integer vectors `<N x iM>` (`M ≤ 32`) | legalised by per-lane scalarisation (see below); function-local only |
-| floating-point / scalable vectors | not in the subset |
+| fixed integer/pointer vectors `<N x iM>` (`M ≤ 32`) / `<N x ptr>` | legalised by per-lane scalarisation (see below); function-local only |
+| floating/double-element or scalable vectors | not in the subset |
 | address spaces other than 0 | not supported |
 | `token`, `x86_amx`, target_ext | not in the subset |
 
@@ -261,13 +261,15 @@ The i64 surface is complete.
 ### Fixed integer vector legalisation (scalarisation)
 
 The same "value lives in N consecutive frame slots" idea legalises **fixed
-integer vectors** `<N x iM>` (`M ≤ 32`). Each lane occupies one slot
+integer/pointer vectors** `<N x iM>` (`M ≤ 32`) and `<N x ptr>` (a pointer lane
+is pointer-width = one 32-bit slot). Each lane occupies one slot
 (`vec_slot[idx]` .. `+ N - 1`); a vector value never occupies a register and is
 invisible to the spill machinery (it already lives in memory). Every vector op
 is lowered to per-lane scalar ops, rewinding the emit-scratch cursor before each
 lane so register pressure is bounded regardless of `N`.
 
-This exists for the SIMD *movemask* idiom clang emits for libc++
+Two clang code patterns are covered. The first is the SIMD *movemask* idiom for
+libc++
 `std::char_traits<char>::find` — which `std::num_get` uses to scan the digit
 atoms when parsing a number from a stream — **even though the target has no
 SIMD**: a scalar splat (`insertelement` lane 0 + `shufflevector` with an
@@ -286,6 +288,22 @@ index. Lowered vector operations:
 - **element-wise `sext`/`zext`/`trunc`** between same-lane-count integer vectors
 - **`bitcast <N x i1> → iN`** — the **movemask**: OR each lane's low bit shifted
   to its position (`lane k → bit k`)
+
+The second pattern is what clang's **`-O2`+ auto-vectoriser** emits for ordinary
+code: a vector **memory copy** and vector **arithmetic** (e.g. a small struct/
+union copy becomes `load`/`store <2 x ptr>` — the Exult `Usecode_value` case —
+and the soft-float `i64`→`f64` runtime becomes a `<N x i32> xor`). These are
+lowered the same per-lane way (so a `-O2`/`-O3` C++ cart translates, not just an
+`-O1` one):
+
+- **`load`** — read N element-sized lanes (`LDB`/`LDH`/`LDW` by element width;
+  pointer/`i32` = `LDW`) from `[addr + lane·bytes]` into the result's N slots
+- **`store`** — the inverse: read N lanes from the value's slots and write each
+  element-sized to `[addr + lane·bytes]`
+- **`add`/`sub`/`mul`/`and`/`or`/`xor`/`shl`/`lshr`/`ashr`** — per-lane scalar
+  binary op. Low-(element-width) bits are correct; higher bits may carry garbage
+  (consumers re-normalise), except a NARROW right-shift's shiftee, normalised to
+  the element width first (`lshr` zero-, `ashr` sign-extend) — as the scalar path
 
 Vectors are **function-local only** — they have no calling-convention encoding,
 so a vector parameter or return is rejected. Any vector op outside the list
