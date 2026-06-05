@@ -86,3 +86,25 @@ cvm_i64 __cvm_smod64(cvm_i64 a, cvm_i64 b) {
 cvm_i64 __cvm_shl64(cvm_i64 x, cvm_i64 n) { return cvm_u64_shl(x, n.lo); }
 cvm_i64 __cvm_shr64(cvm_i64 x, cvm_i64 n) { return cvm_u64_shr(x, n.lo); }
 cvm_i64 __cvm_sar64(cvm_i64 x, cvm_i64 n) { return cvm_i64_sar(x, n.lo); }
+
+/* --- 64-bit funnel shifts (llvm.fshl.i64 / llvm.fshr.i64) --------------- *
+ * fshl(a,b,c): the top 64 bits of the 128-bit (a:b) shifted left by c%64.
+ * fshr(a,b,c): the bottom 64 bits of (a:b) shifted right by c%64.
+ * (clang canonicalises a 64-bit rotate to fshl with a==b.) The shift amount is
+ * taken mod 64; for s==0 the result is the identity operand (a for fshl, b for
+ * fshr). cvm-cc compiles the runtime scalar (-fno-slp-vectorize), so the simple
+ * branchful form is fine. */
+cvm_i64 __cvm_fshl64(cvm_i64 a, cvm_i64 b, cvm_i64 c) {
+    uint32_t s = c.lo & 63u;
+    if (s == 0) return a;
+    cvm_i64 hi = cvm_u64_shl(a, s);
+    cvm_i64 lo = cvm_u64_shr(b, 64u - s);
+    return cvm_i64_from_parts(hi.lo | lo.lo, hi.hi | lo.hi);
+}
+cvm_i64 __cvm_fshr64(cvm_i64 a, cvm_i64 b, cvm_i64 c) {
+    uint32_t s = c.lo & 63u;
+    if (s == 0) return b;
+    cvm_i64 hi = cvm_u64_shl(a, 64u - s);
+    cvm_i64 lo = cvm_u64_shr(b, s);
+    return cvm_i64_from_parts(hi.lo | lo.lo, hi.hi | lo.hi);
+}

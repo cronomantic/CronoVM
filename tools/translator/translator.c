@@ -7012,6 +7012,27 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                         cg->had_error = 1;
                         break;
                     }
+                    /* i64 funnel shift (what clang canonicalises a 64-bit rotate
+                     * to) is too wide to open-code: lower to a soft runtime call
+                     * into cvm_int64_rt (__cvm_fshl64/__cvm_fshr64, sret i64),
+                     * exactly like i64 div/rem and variable shifts. The result is
+                     * i64, so it lands in the value's i64 frame slot. */
+                    if (fbits == 64) {
+                        int ridx = cg_lookup(cg, i);
+                        if (ridx < 0 || cg->i64_slot[ridx] == CG_NO_SLOT) {
+                            ERR(cg->fn_name, "%s: i64 result without a frame slot",
+                                name);
+                            cg->had_error = 1;
+                            break;
+                        }
+                        const char *rt = is_fshr ? "__cvm_fshr64" : "__cvm_fshl64";
+                        LLVMValueRef a3[3] = { LLVMGetOperand(i, 0),
+                                               LLVMGetOperand(i, 1),
+                                               LLVMGetOperand(i, 2) };
+                        cg_emit_runtime_call(cg, i, rt, a3, 3, NULL,
+                                             (int)cg->i64_slot[ridx], 0, 0);
+                        break;
+                    }
                     if (fbits <= 0 || fbits > 32) {
                         ERR(cg->fn_name, "%s width %d unsupported", name, fbits);
                         cg->had_error = 1;
@@ -8276,6 +8297,24 @@ static int module_runtime_needs(LLVMModuleRef mod) {
                 if ((op == LLVMUDiv || op == LLVMSDiv ||
                      op == LLVMURem || op == LLVMSRem) &&
                     cg_type_is_i64(LLVMTypeOf(i)))
+                    need |= CVM_PROBE_I64;
+                /* i64 funnel shift (llvm.fshl.i64/fshr.i64 — clang's 64-bit
+                 * rotate) also lowers to a cvm_int64_rt call (__cvm_fshl64/
+                 * __cvm_fshr64); detect the intrinsic call so cvm-cc links it. */
+                if (op == LLVMCall && cg_type_is_i64(LLVMTypeOf(i))) {
+                    LLVMValueRef cf = LLVMGetCalledValue(i);
+                    const char *cn = cf ? LLVMGetValueName(cf) : NULL;
+                    if (cn && (strncmp(cn, "llvm.fshl.i64", 13) == 0 ||
+                               strncmp(cn, "llvm.fshr.i64", 13) == 0))
+                        need |= CVM_PROBE_I64;
+                }
+                /* A VARIABLE-amount i64 shift also lowers to a cvm_int64_rt call
+                 * (__cvm_shl64/__cvm_shr64/__cvm_sar64) — only a CONSTANT amount
+                 * is inline. Detect the variable form so cvm-cc links the runtime
+                 * (a constant amount needs no runtime, so don't flag it). */
+                if ((op == LLVMShl || op == LLVMLShr || op == LLVMAShr) &&
+                    cg_type_is_i64(LLVMTypeOf(i)) &&
+                    !LLVMIsAConstantInt(LLVMGetOperand(i, 1)))
                     need |= CVM_PROBE_I64;
                 if (cg_type_is_f64(LLVMTypeOf(i))) { need |= CVM_PROBE_F64; continue; }
                 unsigned n = LLVMGetNumOperands(i);

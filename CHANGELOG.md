@@ -10,6 +10,16 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **Translator: `llvm.fshl.i64` / `llvm.fshr.i64` (64-bit funnel shift / rotate).**
+  clang canonicalises a 64-bit rotate to these; the funnel-shift handler previously
+  capped at `fbits <= 32` and rejected i64. They now lower to a soft-runtime call
+  into `cvm_int64_rt` (`__cvm_fshl64` / `__cvm_fshr64`, sret i64), exactly like i64
+  div/rem and variable shifts; the `--probe-runtime` scan flags the intrinsic so
+  cvm-cc auto-links the i64 runtime. cvm-cc now compiles the hand-written soft
+  runtime TUs scalar (`-fno-vectorize -fno-slp-vectorize`): at `-O2`/`-O3` clang
+  would otherwise auto-vectorise the helpers into vector `phi`/`select` ops the
+  legaliser doesn't accept (user TUs keep vectorisation). Guard: `conf_fshl_i64`.
+  (Found by the differential corpus — it was the last open `--no-rot64` gap.)
 - **Differential test corpus — `cvm-fuzz` generator + `run_corpus.sh`
   (`tools/cvm-fuzz/`, `tests/corpus/`, `docs/corpus.md`).** A seed-reproducible
   generator emits broad, randomised, **UB-free** C programs (each exporting

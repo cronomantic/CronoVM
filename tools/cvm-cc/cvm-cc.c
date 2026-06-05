@@ -584,7 +584,8 @@ static int parse_argv(int argc, char **argv, struct cli *cli) {
  * freestanding (no hosted libc, and clang emits the i32-length mem intrinsics
  * the VM expects, not the i64 ones it picks in hosted mode) + -emit-llvm. */
 static proc_t compile_c_to_bc_spawn(const struct cli *cli, const char *clang,
-                                    const char *input, const char *bc_out) {
+                                    const char *input, const char *bc_out,
+                                    int no_vectorize) {
     char optflag[8];
     snprintf(optflag, sizeof optflag, "-O%s", cli->opt_level);
     char rtinc[1024];
@@ -647,6 +648,15 @@ static proc_t compile_c_to_bc_spawn(const struct cli *cli, const char *clang,
      * translator emits VM bytecode), minimal bitcode/compile overhead. */
     cargv[n++] = (char *)"-gline-tables-only";
     cargv[n++] = optflag;
+    /* The hand-written soft-int/float runtime TUs are scalar by design; auto-
+     * vectorising them at -O2/-O3 produces vector phi/select ops the translator
+     * legaliser doesn't accept (it covers the user-code vector idioms, not the
+     * runtime). Keep them scalar. (User TUs keep vectorisation — the translator
+     * handles the idioms clang emits there.) */
+    if (no_vectorize) {
+        cargv[n++] = (char *)"-fno-vectorize";
+        cargv[n++] = (char *)"-fno-slp-vectorize";
+    }
     cargv[n++] = rtinc;
     for (int k = 0; k < cli->include_count; ++k) {
         cargv[n++] = (char *)"-I";
@@ -675,7 +685,9 @@ static proc_t compile_c_to_bc_spawn(const struct cli *cli, const char *clang,
 /* Serial compile (spawn + wait): used for the few auto-linked runtime TUs. */
 static int compile_c_to_bc(const struct cli *cli, const char *clang,
                            const char *input, const char *bc_out) {
-    proc_t h = compile_c_to_bc_spawn(cli, clang, input, bc_out);
+    /* compile_c_to_bc is the serial path, used only for the auto-linked soft
+     * runtime TUs -> compile them WITHOUT auto-vectorisation (see the spawn). */
+    proc_t h = compile_c_to_bc_spawn(cli, clang, input, bc_out, /*no_vectorize=*/1);
     if (h == PROC_INVALID) return -1;
     int crc = wait_proc(h);
     if (crc != 0)
@@ -760,7 +772,8 @@ int main(int argc, char **argv) {
             int launched = 0;
             for (int k = 0; k < cnt; ++k) {
                 proc_t p = compile_c_to_bc_spawn(&cli, clang, cjobs[base + k].in,
-                                                 cjobs[base + k].bc);
+                                                 cjobs[base + k].bc,
+                                                 /*no_vectorize=*/0);
                 if (p == PROC_INVALID) { fail = 1; break; }
                 h[launched]  = p;
                 hj[launched] = base + k;
