@@ -6779,14 +6779,35 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                 /* llvm.fabs.f32(x) = clear the sign bit. Floats share the
                  * integer register file (bitcast f32<->i32 is free), so fabs is
                  * just AND with 0x7FFFFFFF. clang emits it from fabsf/fabs on
-                 * float (e.g. the SDK math.h fabsf). */
-                if (strcmp(name, "llvm.fabs.f32") == 0) {
+                 * float (e.g. the SDK math.h fabsf). The bare `fabsf` libcall
+                 * (libc++ <cmath> std::fabs(float) at -O1, with no math errno to
+                 * fold it to the intrinsic) lowers the same way. */
+                if (strcmp(name, "llvm.fabs.f32") == 0 || strcmp(name, "fabsf") == 0) {
                     uint8_t x    = cg_reg_for(cg, LLVMGetOperand(i, 0));
                     uint8_t dst  = cg->regs[cg_lookup(cg, i)];
                     uint8_t mask = cg_alloc_reg(cg);
                     if (cg->had_error) break;
                     cg_emit_load_const32(cg, mask, 0x7FFFFFFF);
                     cg_emit(cg, enc_r(CVM_OP_AND, dst, x, mask));
+                    break;
+                }
+
+                /* sqrtf / llvm.sqrt.f32(x) -> the FSQRT opcode (host sqrtf). The
+                 * f64 sqrt legalises via the soft-float runtime (handled on the
+                 * wide path); for f32 the named `sqrtf` libcall and the intrinsic
+                 * both map to the single native opcode. (cvm_intrin_fsqrt below is
+                 * the same opcode reached via the explicit runtime intrinsic.) */
+                if (strcmp(name, "llvm.sqrt.f32") == 0 || strcmp(name, "sqrtf") == 0) {
+                    if (LLVMGetNumArgOperands(i) != 1) {
+                        ERR(cg->fn_name, "%s expects 1 arg, got %u", name,
+                            LLVMGetNumArgOperands(i));
+                        cg->had_error = 1;
+                        break;
+                    }
+                    uint8_t x   = cg_reg_for(cg, LLVMGetOperand(i, 0));
+                    uint8_t dst = cg->regs[cg_lookup(cg, i)];
+                    if (cg->had_error) break;
+                    cg_emit(cg, enc_r(CVM_OP_FSQRT, dst, x, 0));
                     break;
                 }
 
@@ -6799,9 +6820,12 @@ static int cg_function(struct cg *cg, LLVMValueRef fn, int func_idx) {
                  * FontManager. (f64 variants legalise via the soft-float
                  * runtime instead and are handled on the wide path.) */
                 {
-                    int rnd_op = (strcmp(name, "llvm.floor.f32") == 0) ? CVM_OP_FFLOOR
-                               : (strcmp(name, "llvm.ceil.f32")  == 0) ? CVM_OP_FCEIL
-                               : (strcmp(name, "llvm.trunc.f32") == 0) ? CVM_OP_FTRUNC
+                    int rnd_op = (strcmp(name, "llvm.floor.f32") == 0 ||
+                                  strcmp(name, "floorf") == 0)        ? CVM_OP_FFLOOR
+                               : (strcmp(name, "llvm.ceil.f32")  == 0 ||
+                                  strcmp(name, "ceilf")  == 0)        ? CVM_OP_FCEIL
+                               : (strcmp(name, "llvm.trunc.f32") == 0 ||
+                                  strcmp(name, "truncf") == 0)        ? CVM_OP_FTRUNC
                                                                        : -1;
                     if (rnd_op >= 0) {
                         if (LLVMGetNumArgOperands(i) != 1) {

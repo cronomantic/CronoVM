@@ -10,6 +10,17 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **Translator: named float libm libcalls `sqrtf` / `fabsf` / `floorf` / `ceilf` /
+  `truncf` lower to the VM opcodes** (FSQRT / fabs-AND / FFLOOR / FCEIL / FTRUNC),
+  alongside the `llvm.*.f32` intrinsics already handled. libc++ `<cmath>` on float
+  (e.g. `std::sqrt(float)` at -O1, no math-errno folding) emits these as NAMED
+  libcalls; the translator previously rejected them ("callee has no definition") —
+  and had no f32 `sqrt` path at all (only the explicit `cvm_intrin_fsqrt` and the
+  f64 soft path). Now both the intrinsic and the named form map to the single
+  native opcode. Guard: `conf_float_libcall` (extern-declared named calls; GAPs
+  without the lowering). (Transcendental float libm — `sinf`/`cosf`/`powf`/`logf` —
+  has no single opcode and still needs picolibc's float `sf_*` libm; added
+  separately when reached.)
 - **Translator: `llvm.fshl.i64` / `llvm.fshr.i64` (64-bit funnel shift / rotate).**
   clang canonicalises a 64-bit rotate to these; the funnel-shift handler previously
   capped at `fbits <= 32` and rejected i64. They now lower to a soft-runtime call
