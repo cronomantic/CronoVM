@@ -110,6 +110,22 @@ SOURCES=(
   ../libm/common/exp_data ../libm/common/log_data
   ../libm/common/math_err_oflow ../libm/common/math_err_uflow
   ../libm/common/math_err_invalid ../libm/common/math_err_divzero
+  # libm (float/single precision) — the transcendentals Exult's actors.cc reaches
+  # (and generally useful). fdlibm sf_pow/sf_log are self-contained (inline
+  # constants, no log2/exp2 data tables); sinf/cosf use the modern
+  # range-reduction-free sincosf (sincosf_data table). Deps: scalbnf (sf_pow) +
+  # the float error helpers (__math_*f). f32 lowers directly to VM opcodes (no
+  # soft-float runtime). Mirrors the double set above. See no-engine-specific.
+  ../libm/math/sf_pow ../libm/math/sf_log
+  ../libm/common/sf_pow_log2_data ../libm/common/sf_exp2_data ../libm/common/sf_log_data
+  ../libm/common/sinf ../libm/common/cosf
+  ../libm/common/sincosf ../libm/common/sincosf_data
+  ../libm/common/sf_scalbn
+  # the float error helpers (__math_*f). They call __isnanf; that classifier is
+  # added with --with-locale (the fp-classification block below) and, for the
+  # no-locale profile, by the WITH_LOCALE-gated sf_isnan fallback further down.
+  ../libm/common/math_errf_oflowf ../libm/common/math_errf_uflowf
+  ../libm/common/math_errf_invalidf ../libm/common/math_errf_divzerof
 )
 
 # The malloc family is OPTIONAL (see --no-malloc). When included, picolibc owns
@@ -167,6 +183,10 @@ if [ "$WITH_LOCALE" = 1 ]; then
     # (picolibc keeps strto*_l under stdio/ alongside its dtoa engine, not stdlib/).
     stdio/strtod_l stdio/strtof_l stdio/strtold_l
     stdio/strtod stdio/strtof stdio/strtold
+    # atof: a thin strtod wrapper (Exult's XMidiFile config-gamma parse). Lives
+    # with strtod (its only dep) — strtod itself needs the dtoa/atod engine
+    # (--with-stdio), so co-locating here keeps atof's deps satisfied.
+    stdlib/atof
     # collation + time formatting `*_l` the locale facets reference. strftime
     # pulls the time tables (timedata) + the tz name/info globals (tzvars: GMT
     # defaults); tzset() is a no-op in the machine port (no TZ env on the VM), so
@@ -189,6 +209,15 @@ if [ "$WITH_LOCALE" = 1 ]; then
     # omitted above. The embedder supplies strerror_r (pico_machine.c for the
     # conformance fixture; cron_sys.c for a real cart), like strerror.
   )
+fi
+
+# __isnanf for the no-locale profile: the float libm error helpers (__math_*f,
+# added unconditionally above) call __isnanf. With --with-locale the fp-class
+# block already pulls sf_isnan; without it, add sf_isnan here so the float libm
+# is self-contained. Gated to avoid the 'isnanf multiply defined' clash with the
+# WITH_LOCALE copy.
+if [ "$WITH_LOCALE" != 1 ]; then
+  SOURCES+=( ../libm/common/sf_isnan )
 fi
 
 WORK="$(mktemp -d)"

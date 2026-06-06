@@ -210,6 +210,19 @@ bad_function_call::~bad_function_call() noexcept {}
 #if _LIBCPP_AVAILABILITY_HAS_BAD_FUNCTION_CALL_GOOD_WHAT_MESSAGE
 const char* bad_function_call::what() const noexcept { return "std::bad_function_call"; }
 #endif
+
+/* std::recursive_mutex out-of-line members (versioned std::__1). Normally in
+ * libc++'s mutex.cpp (the dylib we don't vendor); the headers only declare them.
+ * The VM is cooperative (no preemption) and libc++'s <__external_threading>
+ * already maps __libcpp_recursive_mutex_* to no-ops, so lock/unlock are genuinely
+ * no-ops here and the mutex object (__libcpp_recursive_mutex_t == int) is inert.
+ * Defining them lets any cart that uses std::recursive_mutex (e.g. XMidiRecyclable
+ * in Exult's audio engine) translate + link. Generic runtime, not engine-specific. */
+recursive_mutex::recursive_mutex() {}
+recursive_mutex::~recursive_mutex() {}
+void recursive_mutex::lock() {}
+bool recursive_mutex::try_lock() noexcept { return true; }
+void recursive_mutex::unlock() noexcept {}
 _LIBCPP_END_NAMESPACE_STD
 
 /* ---- libc++ <string> / <chrono> library functions ------------------------

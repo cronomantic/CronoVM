@@ -10,6 +10,25 @@ version bump; breaks are called out explicitly under **Breaking**.
 
 ### Added
 
+- **Runtime libc++ (`cvm_cxxstl`): `std::recursive_mutex` out-of-line members**
+  (ctor / dtor / `lock` / `try_lock` / `unlock`). Normally in libc++'s `mutex.cpp`
+  (the dylib CronoVM does not vendor — the headers only declare them); the VM is
+  cooperative and `<__external_threading>` already maps `__libcpp_recursive_mutex_*`
+  to no-ops, so these are genuine no-ops and the mutex object is inert. Lets any
+  cart that uses `std::recursive_mutex` (e.g. Exult's `XMidiRecyclable` free-list)
+  translate + link.
+- **picolibc.bc: float transcendentals `sinf` / `cosf` / `powf` / `logf`** (the
+  pending float libm the named-libcall lowering below flagged). fdlibm `sf_pow` /
+  `sf_log` (with their `sf_pow_log2_data` / `sf_exp2_data` / `sf_log_data` tables) +
+  the modern range-reduction-free `sinf` / `cosf` (`sincosf` + `sincosf_data`) +
+  `scalbnf` + the float error helpers (`__math_*f`). `__isnanf` (the classifier the
+  error helpers call) ships with `--with-locale`; a `WITH_LOCALE`-gated `sf_isnan`
+  fallback covers the no-locale profile without the `isnanf` multiply-defined clash.
+  Guard: `conf_pico_float_transcendental` (tolerance-count, differential-safe across
+  the VM=picolibc vs native=host-libm ULP gap). f32 ops lower to VM opcodes.
+- **picolibc.bc: `atof`** (`stdlib/atof`, a thin `strtod` wrapper), co-located with
+  `strtod` under `--with-locale` (its only dependency). Surfaced by Exult's
+  `XMidiFile` config-gamma parse.
 - **Translator: named float libm libcalls `sqrtf` / `fabsf` / `floorf` / `ceilf` /
   `truncf` lower to the VM opcodes** (FSQRT / fabs-AND / FFLOOR / FCEIL / FTRUNC),
   alongside the `llvm.*.f32` intrinsics already handled. libc++ `<cmath>` on float
