@@ -58,19 +58,35 @@ void cvm_profile_reset(uint32_t func_count) {
  * All three vanish when CVM_PROFILE is undefined. They reference locals
  * declared inside cvm_exec_at, so they only ever expand there. */
 #ifdef CVM_PROFILE
-#  define PROF_TICK()    do { if (prof_cur < cvm_prof_len) cvm_prof_counts[prof_cur]++; \
-                              cvm_prof_total++; \
-                              if (cvm_prof_cap && cvm_prof_total >= cvm_prof_cap) return CVM_OK; \
-                            } while (0)
-#  define PROF_CALL(fid) do { if (prof_sp < CVM_PROF_DEPTH) prof_stack[prof_sp++] = prof_cur; \
-                              if ((uint32_t)(fid) == cvm_prof_watch && prof_cur < cvm_prof_len) \
-                                  cvm_prof_caller[prof_cur]++; \
-                              prof_cur = (uint32_t)(fid); } while (0)
-#  define PROF_RET()     do { if (prof_sp > 0) prof_cur = prof_stack[--prof_sp]; } while (0)
+/* Charge this instruction to the function whose [entry,next) range holds pc. The
+ * range is cached in [prof_lo,prof_hi); only re-bsearch on a boundary crossing. */
+#  define PROF_TICK()    do { \
+        if (pc < prof_lo || pc >= prof_hi) { \
+            /* User function symidx s lives at FUNCS slot s<<1 (odd slots are dup/aux); \
+             * binary-search the symidx whose entry func_offsets[s<<1] is the greatest \
+             * <= pc, so prof_cur == the .sym index (= cvm-translate's k+1). */ \
+            uint32_t _ns = func_count >> 1, _lo = 1, _hi = _ns, _ans = 0; \
+            while (_lo < _hi) { uint32_t _m = (_lo + _hi) >> 1; \
+                if (func_offsets[_m << 1] <= pc) { _ans = _m; _lo = _m + 1; } else _hi = _m; } \
+            prof_cur = _ans; \
+            prof_lo  = _ans ? func_offsets[_ans << 1] : 0u; \
+            prof_hi  = (_ans + 1u < _ns) ? func_offsets[(_ans + 1u) << 1] : code_count; \
+        } \
+        if (prof_cur < cvm_prof_len) cvm_prof_counts[prof_cur]++; \
+        cvm_prof_total++; \
+        if (cvm_prof_cap && cvm_prof_total >= cvm_prof_cap) return CVM_OK; \
+    } while (0)
+/* Caller-attribution for the watched fid: at the call, pc is still in the caller,
+ * so the pc-derived prof_cur already names the caller. No shadow stack needed. */
+#  define PROF_CALL(fid) do { if ((uint32_t)(fid) == cvm_prof_watch && prof_cur < cvm_prof_len) \
+                                  cvm_prof_caller[prof_cur]++; } while (0)
+#  define PROF_RET()        ((void)0)
+#  define PROF_LONGJMP(jsp) ((void)0)
 #else
 #  define PROF_TICK()    ((void)0)
 #  define PROF_CALL(fid) ((void)0)
 #  define PROF_RET()     ((void)0)
+#  define PROF_LONGJMP(jsp) ((void)0)
 #endif
 
 static uint32_t read_u32_le(const uint8_t *p) {
@@ -1224,12 +1240,15 @@ static int cvm_exec_at(struct cvm_image *img,
 #endif
 
 #ifdef CVM_PROFILE
-#  define CVM_PROF_DEPTH 8192u
-    uint32_t prof_stack[CVM_PROF_DEPTH];
-    uint32_t prof_sp  = 0;
-    uint32_t prof_cur = 0;              /* FUNCS index of start_pc, if known */
-    for (uint32_t fi = 1; fi < func_count; ++fi)
-        if (func_offsets[fi] == start_pc) { prof_cur = fi; break; }
+    /* Self-time attribution by the CURRENT PC (not a shadow call stack). The fid
+     * is the function whose [entry, next-entry) range contains pc, found by binary
+     * search over the ascending func_offsets and cached in [prof_lo, prof_hi) so the
+     * search only runs when execution crosses a function boundary. This is immune to
+     * non-local control flow — longjmp (C++ throw) and coro_swap just move pc, and
+     * the next tick re-derives the right fid — which the old shadow stack could not
+     * track (it desynced on every throw and coroutine switch, sticking prof_cur on a
+     * fixed wrong fid). */
+    uint32_t prof_cur = 0, prof_lo = 0, prof_hi = 0;  /* current fid + its pc range */
 #endif
 
     /* Set up SP at the very top of memory and push the run-completion
@@ -1633,6 +1652,7 @@ static int cvm_exec_at(struct cvm_image *img,
         R[jdst]       = (v != 0) ? v : 1;      /* longjmp(env,0) appears as 1 */
         R[CVM_REG_SP] = (int32_t)jsp;
         pc            = jpc;
+        PROF_LONGJMP(jsp);
         DISPATCH();
     }
     L_CORO_SWAP: {
@@ -1970,6 +1990,7 @@ static int cvm_exec_at(struct cvm_image *img,
             R[jdst]       = (v != 0) ? v : 1;
             R[CVM_REG_SP] = (int32_t)jsp;
             pc            = jpc;
+            PROF_LONGJMP(jsp);
             break;
         }
         case CVM_OP_CORO_SWAP: {
